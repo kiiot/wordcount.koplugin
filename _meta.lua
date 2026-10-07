@@ -1,0 +1,1811 @@
+local _ = require("gettext")
+return {
+    fullname = _("字数与阅读速度"),
+    description = _([[统计当前书籍总字数、实际已读字数和平均阅读速度，并提供跨书籍的日/周/月/年阅读统计页面。]]),
+    -- 交付版本标识：用于在设备上确认「装的是哪一版」。
+    -- 版本演进：
+    --   16-fix1-gettext-shadow  修掉 `for _, item` 遮蔽 gettext 导致的统计页崩溃
+    --                           （crash.log 报 statistics_page.lua:1132
+    --                            attempt to call local '_'）
+    --   17-diag                 加 18 处 logger.info 诊断打点
+    --   17-diag2                加【屏幕诊断提示】——每走一步在屏幕上弹一行提示，
+    --                           不用拷日志就能看出卡在哪。可在
+    --                           设置→字数与阅读速度→「诊断：屏幕提示」里关闭。
+    --   18-notify-fix           ★ 修掉真正的元凶：`Notification:notify(...)` 在
+    --                           **模块表**上冒号调用时，`self.notify_source` 是 nil，
+    --                           于是 upstream 的 `if source and ...` 直接判假 →
+    --                           **通知被静默丢弃，屏幕上什么都不弹**。
+    --                           29 处用户提示（含全部屏幕诊断）都因此失效。
+    --                           改为统一走 `notifyUser()`（显式
+    --                           `UIManager:show(Notification:new{...})`）。
+    --                           用上游真源码在 _verify/notify_source.lua 里断言死了。
+    --   19-prepare-doc          ★ 修掉「页数=0，无法统计」：
+    --                           `DocumentRegistry:openDocument(path)` 对 epub
+    --                           **只创建对象、不加载内容**（credocument.lua:177-180
+    --                           注释明说 loadDocument 要延后）。
+    --                           `Document:getPageCount()` 读的是
+    --                           `info.number_of_pages`，该字段要
+    --                           setupDefaultView + loadDocument + render 之后才有值。
+    --                           新增 `prepareDocument()` / `openPreparedDocument()`，
+    --                           三处打开文档的地方全部改走它。
+    --   20-flicker-fix          ★ 修掉「进度条一动整屏闪」：
+    --                           两个原因叠加 ——
+    --                           (1) 上游 progressbardialog.lua:74 里
+    --                               `self.dimen = Screen:getSize()`，modal 的 dimen
+    --                               就是**整屏**；而 `setDirty(widget, ...)` 不传
+    --                               region 时，uimanager.lua:684 会把 refreshtype
+    --                               包成 lambda，_repaint 执行时拿 widget.dimen
+    --                               当 region ⇒ **整屏**。再走
+    --                               _refresh("ui", 全屏) → Screen.refreshUI
+    --                               ⇒ e-ink 全屏糊屏。
+    --                           (2) 扫描 tick 0.08s ≈ 12.5 次/秒；Kindle 走
+    --                               libs/libkoreader-input 的 timerfd backend
+    --                               （setTimer/clearTimer 已确认导出），
+    --                               scheduleIn 由内核精确唤醒，**不会被
+    --                               INPUT_TIMEOUT 的 200ms 伞吃掉**，
+    --                               所以是货真价实的每秒 12.5 次全屏刷。
+    --                           对策：每次 setDirty 显式传**最小 region**
+    --                           （_refreshRegion），加 **MIN_REDRAW_INTERVAL=0.5s**
+    --                           时间节流，扫描循环加 **PROGRESS_REPORT_INTERVAL=0.8s**
+    --                           时间闸门，百分比量化到 5% 一档；
+    --                           并覆写掉上游会 forceRePaint 的
+    --                           redrawProgressbar(IfNeeded)。
+    --   20b-geom-region         ★ 修掉「读完页数就闪退」（crash (4).log）：
+    --                           `_refreshRegion()` 上一版返回的是**普通 table**
+    --                           `{x=,y=,w=,h=}`，而 UIManager._refresh 会调
+    --                           `region:openIntersectWith(...)` → `rect:area()`
+    --                           （uimanager.lua:1179 / geometry.lua:217）。
+    --                           裸 table 没有元方法 ⇒
+    --                              attempt to call method 'area' (a nil value)
+    --                           直接崩在读页数之后、开扫之前。
+    --                           改为 `Geom:new{...}`（并 require ui/geometry）。
+    --                           另：把排查期加的一堆屏幕诊断（diagNotify /
+    --                           诊断菜单项 / WordCount[19] 日志前缀）**全部删除**，
+    --                           恢复干净日志。
+    --                           flicker_fix 测试新增 K 组断言：所有传出去的
+    --                           region 必须能通过 area()/openIntersectWith()，
+    --                           并做了负向对照（改回裸 table 必红）。
+    --   21-region-center        ★★★ 修掉「一直弹窗报告进度，但进度条没有任何变化」：
+    --                           **刷新区域算错了位置**。
+    --                           上游 progressbardialog.lua:67 把
+    --                           `self.dimen = Screen:getSize()`（整屏，x=0,y=0），
+    --                           而 InputContainer:paintTo（inputcontainer.lua:85-90）
+    --                           把内容**居中**画：
+    --                               x = x + floor((self.dimen.w - content_size.w)/2)
+    --                               y = y + floor((self.dimen.h - content_size.h)/2)
+    --                           所以对话框实际出现在屏幕正中（约 300, 600）。
+    --                           20b 的 `_refreshRegion()` 却返回
+    --                               {x = self.dimen.x (=0), y = self.dimen.y (=0), ...}
+    --                           —— 每次 setDirty 刷的都是**屏幕左上角**那一小块，
+    --                           对话框根本不在刷新区域里 ⇒ 进度条/文字
+    --                           **从始至终一次都没被重绘过**。
+    --                           而 Notification 是独立 widget、位置算得对，
+    --                           所以弹窗照常出现 —— 表现就是
+    --                           「弹窗不停报进度、进度条一动不动」。
+    --                           对策：region 必须加上居中偏移
+    --                               cx = dx + floor((dw - w)/2)
+    --                               cy = dy + floor((dh - h)/2)
+    --                           并夹到屏幕范围内、保持 w/h > 0。
+    --                           顺带把通知降噪：有了能动的进度条，通知改为
+    --                           仅在**没有进度对话框**时兜底；判据从
+    --                           `job.page >= next_notice` 改成 `done >= next_notice`
+    --                           （job.page 已 +1 越过本 tick，会报出比进度条
+    --                           更靠后的数字，两个数字打架）。
+    --                           flicker_fix 新增 M 组（region 必须覆盖对话框
+    --                           实际绘制位置，负向对照已验证能抓到旧 bug —— 旧写法
+    --                           覆盖率 0.0%）与 N 组（通知降噪）断言。
+    --   22-progress-only       ★ 按用户要求「要进度条显示，不要弹窗显示进度」：
+    --                           把扫描路径上的弹窗**全部移除** ——
+    --                           ① 开始时的「已触发…正在检查文档…」
+    --                           ② 每 25% 一次的「正在统计全书：x / y 页」
+    --                           ③ 开始时的「正在统计全书：0 / N 页」
+    --                           ④ 完成时的「统计完成：全书约 N 个阅读单位」
+    --                             （改为写进对话框 + 显示 3 秒后自动关）
+    --                           进度信息只有一个出口：对话框的进度条 + 副标题文字。
+    --                           ★ 省电：
+    --                             · PAGES_PER_TICK 16 → 32（tick 数砍半）
+    --                             · SCAN_TICK_DELAY 0.08s → 0.25s（唤醒 12.5/秒 → 4/秒）
+    --                             · PROGRESS_REPORT_INTERVAL 0.8s → 1.5s（刷屏减半）
+    --                             · READ_FLUSH_EVERY 3 → 8（落盘次数减少）
+    --                             · 每 20 个 tick 插 1 秒 CPU 空闲（CHUNK_TICKS/REST_DELAY）
+    --                               让内核有机会进 deeper idle
+    --   23-accurate-count      ★★ 提高字数统计准确性（page_text.extractWholeBook）：
+    --                           原来「逐页 XPointer 拼接」有**结构性误差** ——
+    --                           crengine 的 getPageXPointer 会把页边界**吸附到
+    --                           元素/文本节点边界**，相邻页于是重复计数或漏计数，
+    --                           误差随页数**线性累积**（实测每页多吸一个文本节点
+    --                           ≈ 膨胀 2.3%）。
+    --                           改为在第一个 tick 先试「整书一次取文本」
+    --                           （getTextFromXPointers(首页, 末尾)）：
+    --                             · 整书没有页边界 → 计数**精确**；
+    --                             · 取失败自动回落逐页路径，功能不退化；
+    --                             · 「已读字数」需要的每页归属，改为按宽度均分
+    --                               （总字数精确，页间分配是估算）。
+    --   24-cache-reuse         ★★★ 修掉「统计完还要每次重新统计」：
+    --                           根因 —— `startCount` / `startCountForPath`
+    --                           **从不查缓存**，点一次就从头扫一遍。
+    --                           缓存键（KEY_COUNT/KEY_MTIME/KEY_SIZE）其实一直在写，
+    --                           但只有 showSavedStats（「查看字数与阅读速度」）
+    --                           会读它，统计入口全都不看。
+    --                           修法：
+    --                             · 新增全局缓存表 KEY_CACHE（G_reader_settings
+    --                               里，键 = 文件路径，值 = {count,mtime,size,at}）
+    --                               —— 单文件、无 sidecar 多候选歧义，
+    --                               「写过一定读得到」；
+    --                             · `readCachedCount(path)` 用**文件指纹**
+    --                               （mtime + size）判有效性；
+    --                             · 两个入口（菜单 / Bookshelf 点单本）都先查缓存，
+    --                               命中就直接显示结果，**根本不启动扫描**；
+    --                             · 批量里对有缓存的书直接跳过（连文档都不用打开）；
+    --                             · 新增「重新统计（忽略缓存）」菜单项 +
+    --                               确认框，让用户能强制重扫；
+    --                             · 缓存有 500 条上限，按写入时间淘汰最旧的。
+    --
+    -- 25-cache-perf —— 性能 bug 修复（用户问「是否还有 bug」时系统排查发现的）：
+    --   (1) ★★ 整书快路径成功后，把总字数「按页均分」的那个循环
+    --       **每页**都调 `self:_pageKey(scan_doc, p)`，而 `_pageKey` 内部会执行
+    --       `doc:getPageXPointer(p)` —— crengine 的跨 C 层查询。
+    --       1000 页书 = 1000 次这种查询，且整段是**同步**跑完的
+    --       （不在 tick 循环里，`scheduleIn` 在它之后）⇒
+    --         · 界面完全冻结，用户感觉「卡死」
+    --         · CPU 全速跑，绕过了 CHUNK_TICKS 的休息机制 ⇒ 费电
+    --       修复：只查**首页一次**取到 xpointer 模板，其余页用「模板 + 页号」
+    --       构造 key ⇒ 调用次数 O(1)，与页数无关。
+    --   (2) ★ 模板构造的正则一开始写成 `gsub("(%[)%d+(%])", ...)`，它会替换
+    --       **第一个** `[数字]` —— 也就是固定的 `DocFragment[1]`！
+    --       结果每页被指向「不同的文档分片」，语义全错。
+    --       修复：锚定 `([Pp]%[)(%d+)(%])`，只换页号位置的 `p[n]` / `P[n]`；
+    --       匹配不到则回落到纯页号 key `p:<n>`。
+    --   (3) `startCountFromMenu` 的错误兜底里还残留
+    --       `pcall(Notification.notify, Notification, message)` ——
+    --       在**类表**上点调用，`notify_source` 为 nil ⇒ 静默丢弃。
+    --       修复：改成构造 Notification 实例后 `UIManager:show`。
+    --
+    -- 26-sample-popup —— 本轮三件事（用户提的需求 + 我排查出的真 bug）：
+    --
+    --   (1) ★★★ 抽页统计（sample-estimate）—— 用户说
+    --       「不要设置限制，如果太耗电就只统计前一百，可以进行翻页查看」。
+    --       · 新增可选模式：完整扫描（默认，精确） / 抽页估算（只扫前 100 页）。
+    --         默认仍是**完整扫描** —— 用户要「不限制」，所以估算要他主动开。
+    --       · 抽页按「有文本页的均值 × 全书页数」外推到全书，结果标「约」，
+    --         并在缓存里记 KEY_ESTIMATED / KEY_SAMPLED_PAGES。
+    --       · 菜单加「统计模式」开关。
+    --
+    --   (2) ★★★ 修掉改 (1) 时**自己引入**的真 bug（实测抓住的）：
+    --       `job.page_count` 语义被改成「本次扫描上限（=100）」，
+    --       但有两处仍把它当「全书页数」用 ——
+    --         `self:_ensureReadState(scan_doc, path, job.page_count)`
+    --         `ReadingStats.isValidForFile(read_state, job.page_count, ...)`
+    --       后果（1000 页的书用抽页模式统计一次）：
+    --         · read_state.page_count 被写成 100
+    --         · 页数校验对不上 → 每次打开都判「失效 → 重建」，阅读进度全丢
+    --         · 已读百分比按 100 算 → 读到第 500 页 = 500%
+    --       修复：这两处改用全书页数 `job.total_pages`；
+    --             并新增 `sampled_run` 守卫 —— 抽页模式下**不覆盖**
+    --             已有真实逐页字数（那 100 条是均分出来的假数据）。
+    --
+    --   (3) ★★★ 「阅读统计」从全屏页改成居中浮窗（用户要求：
+    --       「这个页面能不能弹窗显示而不是进入页面」+ 参考官方
+    --       reading insights popup 的形态）。
+    --       · `StatisticsPage` 基类 InputContainer → FocusManager{modal=true}
+    --       · 根节点 `CenterContainer{dimen=Screen:getSize(), popup_frame}`
+    --         ⇒ 白底圆角卡片居中，四周露出底层 ⇒ 「背后能看到书」
+    --       · 尺寸收窄到屏宽 92% / 屏高 90% 并留 margin；内容超高时内部滚动
+    --       · 点卡片外空白关闭；实体返回键关闭
+    --
+    --   (4) ★ 「阅读字数」「阅读速度」两张卡片挪到卡片网格的**最前面**
+    --       （用户澄清：「放到其他同级卡片的最前面，不是所有的最前面」）。
+    --       之前误做成了「页面最开头另起一块高亮区」，已删除那段
+    --       buildTopHighlight / buildHighlightColumn。
+    --
+    --   (5) ★ 批量统计进度条显示「第 X / N 本」（用户要求）。
+    --       · `batch.index` 用**独立计数器**（不能由 #paths 反推 —— paths
+    --         正在被 table.remove 吃掉，反推会得到倒序）
+    --       · 序号在 `table.remove` 之后自增，成功/跳过/失败都占号 ⇒ 严格单调
+    --       · 复用同一个对话框，所以标题用 `setBatchInfo()` 每次重写；
+    --         并让 `configureProgress()` 事后补回（否则被标题覆盖掉）
+    --
+    -- 27-scroll-header —— 本轮两件事（用户提的需求 + 审计出的 3 个真 bug）：
+    --
+    --   (1) ★★★ 修掉审计发现的**最严重** bug：抽页模式下整书快路径导致
+    --       字数虚高约 total_pages/100 倍。
+    --       · 整书快路径 `PageText.extractWholeBook(scan_doc)` 取的是**整本**
+    --         文本（与 job.page_count = 扫描上限 100 无关）；而收尾外推仍按
+    --         `sample_total / eff * total_pages` 放大 ⇒ 1000 页的书虚高 **10 倍**，
+    --         还会写进 DocSettings + 全局缓存，并显示成「约」。
+    --         更讽刺的是：抽页本为省电，走整书路径反而把整本读了一遍。
+    --       · 修复①（根因）：整书快路径准入条件加 `not job.sampled`
+    --         ⇒ 抽页模式强制走逐页，只扫前 100 页。
+    --       · 修复②（兜底）：收尾处 `if job.whole_book == true then sampled = false`
+    --         ⇒ 整书口径本身即全书，禁止再放大（防将来有人误放开准入）。
+    --
+    --   (2) ★★ 修掉审计发现的 bug：关浮窗时**整屏糊屏**（e-ink 闪一下）。
+    --       · `StatisticsPage:onCloseWidget` 原来传 `self.dimen` 当刷新区域，
+    --         而浮窗化后 `self.dimen` 是**整屏**（它是「点外面关闭」的命中区）
+    --         ⇒ `setDirty(self, "ui", 整屏)` = 全屏重绘。
+    --         上游 uimanager 注释明确点名「ui over the full viewport」是最糟用例。
+    --       · 修复：改用 `self.popup_frame.dimen`（只刷浮窗那一块），
+    --         `popup_frame` 拿不到时才退回 `self.dimen` 兜底。
+    --
+    --   (3) ★★ 修掉审计发现的 bug：xpointer 含两处 `p[...]` 时扫描崩溃。
+    --       · `k1:gsub("([Pp]%[)(%d+)(%])", "%1%%d%3")` 原来**替换全部**匹配，
+    --         若 xpointer 有两处 `p[...]`，stem 里就有两个 `%d`，
+    --         而 `stem:format(p)` 只传一个参数 ⇒ `string.format` 抛错。
+    --         该错误发生在 `scheduleIn` 调起的 step 里、外层无 pcall
+    --         ⇒ **整个扫描崩掉**（表现「点了没反应」）。
+    --       · 修复：gsub 加次数上限 `, 1)`（stem 至多一个 %d）；
+    --         并把 format 包进 `pcall`，失败退回 `"p:"..p` 页号 key。
+    --
+    --   (4) ★ 顶部标题栏随滚动一起消失（用户要求：
+    --       「顶部那一条能不能也随着下滑一起消失？就保留中间那个滚动的区域」）。
+    --       · 原来 title_bar 钉在浮窗顶部（不参与滚动），现在挪进滚动 body
+    --         当第一行 ⇒ 下滑时一起滚走，浮窗最上方就只剩滚动区。
+    --       · `available_h` 不再扣标题栏高度（它已在滚动内容里）。
+    --
+    --   (5) ★ 底部加「退出」按钮（用户要求：「下面加上一个退出的选项」）。
+    --       · 放滚动内容的**末尾**（不是钉死的底栏 —— 那会跟 (4) 冲突），
+    --         滑到底就能点，功能等同点空白 / 按返回键。
+    --
+    -- 28-kpw4-tuning —— 面向 KPW4（2018 年，单核 1GHz / 512MB，电池老化）的省电调优。
+    --   起因：用户问「这些对阅读器 cpu 的要求高吗，以及耗电问题，因为我的是 kpw4，
+    --   已经很老了」。实测开销：日常命中缓存 ≈ 0；抽页 100 页 ≈ 1 秒；
+    --   完整扫描 1000 页 ≈ 9.4 秒；Bookshelf 批量 50 本完整扫描 ≈ 3-8 分钟
+    --   （持续跑满 CPU，机身明显发烫）。据此做四项调整：
+    --
+    --   (1) ★★★ 默认统计模式 full → sample。
+    --       理由：KPW4 上「1 秒出约数」远好过「9 秒出精确值」。
+    --       ★ 精确统计没被剥夺：菜单开关还在，切一次会被永久记住。
+    --       ★ 老用户不受影响：只要他选过模式，settings 里就有值，读到的就是他的选择。
+    --
+    --   (2) ★★★ 批量自动降级：本批 ≥ 5 本时自动切抽页。
+    --       否则一次选 50 本会把老机器跑烫好几分钟。
+    --       ★ 关键：这是**临时**降级（batch_forced_sample 标记），
+    --         不写 G_reader_settings —— 否则批量一次就把用户的全局偏好改掉了。
+    --       ★ 降级时会弹提示告诉用户（否则拿到一堆「约」会以为精确统计坏了）。
+    --
+    --   (3) ★★ 休息更频繁：CHUNK_TICKS 20→10、CHUNK_REST_DELAY 1.0→1.2。
+    --       每 ~2.5 秒就歇 1.2 秒，给 SoC 更多降频/进 idle 的窗口。
+    --       代价：1000 页完整扫描 9.4s → 约 12s（但默认已是抽页模式，
+    --       只扫 100 页 = 1 秒，根本吃不到这个休息机制）。
+    --
+    --   (4) ★ 去掉每 tick 的闭包分配：时间源从
+    --       `pcall(function() now_t = require("ui/time").now() end)`（每 tick 一次，
+    --       每次分配闭包 + 走 require 查表）改成模块级 `_now` 缓存一次。
+    --       GC 压力在 KPW4 上是实打实的卡顿源。
+    --
+    -- 29-kpw4-tuning-fix —— 28 交付后的复查（用户要求「排除bug」），修了 28 自己引入/遗留的两处：
+    --
+    --   (1) ★★ `_now` 的作用域 bug（**静默失效**，最难发现的那种）：
+    --       28 里把 `local _now` 定义在文件中部（原 CHUNK_TICKS 附近），
+    --       但第一个使用者 `LiveProgressDialog:_redraw` 在它**之前**。
+    --       Lua 的 local 作用域**从定义行之后才生效** ⇒ `_redraw` 里读到的
+    --       `_now` 是 nil ⇒ `_now and _now() or os.time()` 永远走 os.time() 分支。
+    --       不报错、不崩溃，只是优化白做了 —— 这类 bug 静态检查也查不出
+    --       （它只看语法，不看作用域顺序）。
+    --       修复：把 `_now` 上移到 MIN_REDRAW_INTERVAL 之后（第一个使用者之前），
+    --             并顺手把 `_redraw` 里那段**双层 pcall + 闭包**的旧写法也改掉
+    --             （它比扫描 tick 里那处还浪费一层）。
+    --       防回归：sample_estimate.lua 新增 I14-I18，用**位置比对**钉死
+    --             「_now 定义必须在第一个使用点之前」（已反向验证：把定义挪到
+    --             文件末尾时断言立刻失败）。
+    --
+    --   (2) ★ 三处注释与代码自相矛盾（会误导后续维护）：
+    --       · `cycleScanMode` 上方还写「默认仍然是完整扫描，估算要他主动开」
+    --         —— 而 28 已把默认改成 sample。已改写为正确说明。
+    --       · `job.tick_count` 初始化处的注释写「每 20 个 tick」（28 已改 10）。
+    --       · 扫描主循环里的注释写「每 20 个 tick（约 5 秒）插一次 1 秒」
+    --         （28 已改 10 / 1.2 秒）。
+    --       防回归：新增 A8/A9 —— cycleScanMode 上方注释不得再出现
+    --             「默认是完整扫描」这类说法（已反向验证）。
+    --
+    --   ★ 复查中还核实了（结论：无误，不修）：
+    --     · 批量降级**不会**误伤单本 —— 单本路径 `startCountForPath` 有
+    --       `if self._job or self._batch then return` 守卫，`self._batch` 恒为 nil。
+    --     · 降级**不会**污染全局设置 —— `batch_forced_sample` 只存在 job 表里，
+    --       全文件所有 saveSetting 调用都查过，没有一处写它。
+    --     · 抽页 + 不足 100 页的书 `sampled=false`，不会误标「约」。
+    --     · `_startNextBatch` 缓存命中分支的序号严格单调，不会错乱。
+    --     · CHUNK_TICKS / CHUNK_REST_DELAY 改动没有别处硬编码旧值。
+    --
+    -- 30-estimate-shadow-fix —— 29 交付后的又一次「还有没有bug」复查，
+    --   修了 4 处（含 1 处**会永久污染阅读统计**的严重 bug）：
+    --
+    --   (1) ★★★ 抽页估算的「假均值」**永久遮蔽**真实逐页字数（最严重）：
+    --       抽页模式下 applySampledPageUnits 会给前 SAMPLE_PAGES 页垫一份
+    --       **样本均值**（因为整段文本无法反推每页归属）。旧逻辑的判据是
+    --       「state.page_units 是否为空」，而 `_ensureReadState` 在**文件指纹
+    --       变化**（换版本、改过文件、KOReader 重排页）时会 newState **重建
+    --       空 state** ⇒ 判据判为「空」⇒ 垫假均值。
+    --       之后 `_getPageUnits` 的老短路 `if state.page_units[key] ~= nil then
+    --       return` 会**直接返回假均值**，于是用户真读到第 5 页时看到的仍是
+    --       平均字数 —— 真实逐页字数再也提不出来（extract 被跳过），
+    --       且会被反复保存，**永久遮蔽**。
+    --       修复（两层）：
+    --         · ReadingStats 新增 `page_units_estimated` 集合 +
+    --           `setEstimatedPageUnits` / `isEstimatedPageUnit`：
+    --           垫进来的值打标记；setPageUnits 写真实值时自动摘标记。
+    --         · `_getPageUnits` 遇「估算值」**不再短路**，照常 extract 并覆盖。
+    --           ⇒ 已读页的精度会随着真实阅读逐步「自愈」回真值。
+    --         · 垫数据判据收紧为「page_units **且** page_seconds 同时为空」
+    --           （只有确属「从无真实数据」的书才垫）。
+    --
+    --   (2) ★ `KEY_SAMPLED_PAGES` 记的是「扫描上限」而非「外推分母」：
+    --       收尾存的是 job.page_count（=前 100 页），但外推的**分母**其实是
+    --       有文本的页数（job.pages_with_text，例如只有 80 页有字）。
+    --       缓存提示文案「依据：前 100 页抽页推算」会**夸大样本量**，
+    --       让用户低估估算误差。改为存真正分母，文案同步改为
+    --       「前 N 页中有文本的页抽页推算」。
+    --
+    --   (3) ★ `_startNextBatch` 里 `if self._job then return end` 会**静默停摆整批**：
+    --       那一句在 scheduleIn 回调里、startCount 之前。若此刻 self._job 非空
+    --       （上一本异步收尾尚未跑完的瞬时态），直接 return 的后果是
+    --       **doc 不关、本批也不再推进** —— 不报错、不结束，进度条永远不动。
+    --       修复：改成**有界延后重试**（最多 20 次 × 0.25s），仍不让路则把这一本
+    --       计入 skipped 并推进下一本，保证整批绝不卡死。
+    --
+    --   (4) ★ 收尾/失败/跳过分支推进下一本时**未校验批次身份**（跨批串号）：
+    --       job 现在记住自己所属的 `job.batch`，所有推进点改用
+    --       `self:_batchAlive(job)`（只认「自己那批仍是当前批」）。
+    --       防的是「批量 A 进行中 → 取消（self._batch=nil）→ 立刻发起批量 B」：
+    --       旧写法 `if self._batch then` 会看到 B 非 nil 而错误推进 B
+    --       ⇒ 跳号 / 两个批量流程同时跑。收尾的 `in_batch` 判断同样修正。
+    --
+    --   ★ 复查中**核实为「不可达 / 无 bug」**（结论：不修）：
+    --     · 生命周期：`onCloseDocument` 不清 `_job`/`_batch` —— 对照批量入口
+    --       （仅 FileManager actions 与 Bookshelf 插件，**均在非阅读界面发起**，
+    --       此时没有打开的文档）⇒ 不可达，且注释明说这是**故意设计**
+    --       （job 可在书架继续）。**故不加「取消扫描」的清理，以免破坏设计。**
+    --     · `GlobalStats.upsertBook` 是赋值替换非累加，完整→抽页重扫同 path
+    --       不产生两份。
+    --     · `_startNextBatch` 缓存命中分支 `return self:_startNextBatch()` 是
+    --       **严格尾调用**，Lua 尾调用优化下 50 层递归不爆栈。
+    --
+    -- 31-huge-book-guard —— 用户报「一本亿字的书，统计时卡死然后自动重启，
+    --   重试又重启」（追问确认：EPUB、**几万页以上**、直接打开阅读能看，
+    --   卡死表现是「进度条不动、整机没反应，很久后自己重启」）。
+    --
+    --   根因是**两处「随书规模增长」的资源消耗**，都会把 KPW4（512MB）打爆：
+    --
+    --   (1) ★★★ `prepareDocument` 里的 `doc:render()`。
+    --       crengine 的 `renderDocument()` 是**整本一次性排版**，同步跑在
+    --       主进程。KOReader 上游注释（readerrolling.lua:1918-1925）说得很明白：
+    --         「a big book and KOReader taking 120 MB, the subprocess would
+    --           additionally use ... **130 MB when doing a full load+render**」
+    --       几万页的书 ⇒ 额外 ~130MB ⇒ **OOM** ⇒ OOM killer 杀进程
+    --       ⇒ 用户看到的「自动重启」。render 期间主线程卡在 C 层
+    --       ⇒ 「进度条不动、整机没反应」。
+    --       修复（三层）：
+    --         · **拆开 loadDocument 与 renderDocument**：CRE 文档在
+    --           loadDocument 之后往往已知页数（`CreDocument:getPageCount()`
+    --           是 `getPages()` 实时查询），**查到就跳过 renderDocument**；
+    --         · 查不到、又必须 render 时，按**文件大小**硬保护：
+    --           超过阈值一律不 render，返回 `huge_document`；
+    --           **epub 是压缩包**，同样体积解压后文本大得多 ⇒ 阈值更严
+    --           （`HUGE_FILE_BYTES_EPUB` 12MB vs 一般 24MB）。
+    --         · 最坏是「这本书统计不了」，但**绝不至于把设备搞重启**
+    --           —— 重启会打断用户正在读的书，代价远大于功能不可用。
+    --
+    --   (2) ★★ 整书快路径 `extractWholeBook` 一次性把全本文本读成 Lua 字符串，
+    --       几万页 ⇒ 几十~几百 MB ⇒ 同样 OOM。
+    --       修复：加 `WHOLE_BOOK_MAX_PAGES` 页数闸门，超限就不走整书路径，
+    --       老老实实逐页扫（分 tick，内存峰值只与单页大小相关）。
+    --       代价：精度退回「页边界近似」，但不会崩。
+    --
+    --   (3) ★ 逐页循环里 `Counter.addPage(text)` 之后又 `Counter.count(text)`
+    --       —— 把**同一段文本遍历了两遍**只为拿本页字数。
+    --       修复：`addPage` 的返回值补上「本页增量」，一次遍历两用。
+    --       （顺带更准：跨页字母串不再被重复算成一个新词。）
+    --
+    --   防回归：新增测试文件 `_verify/huge_book_guard.lua`（42 条断言，含
+    --   「跳过 render 的早退必须在 render 之前」「文件大小闸门必须在 render
+    --   之前」「整书页数闸门必须在 extractWholeBook 之前」等**位置比对**，
+    --   以及 addPage 增量语义的行为等价验证）。
+    --
+    -- 32-nav-style —— 用户在设备上看了 31 版之后，一口气提了 6 条**视觉/布局**
+    --   的否定意见（原话照抄，逐条对应）：
+    --
+    --   (1) 「阅读统计的导航，我要的是不选中有边框（不要填充颜色），选中的区别开」
+    --       原来：未选中 = **浅灰填充**、选中 = 白底 —— 两者都是「填色」，
+    --       在白底浮窗上对比很弱，e-ink 上尤其难分辨。
+    --       改：未选中 = **纯白 + 黑描边**；选中 = **黑底反白**。
+    --       涉及的四处导航/标签：buildViewTabs / buildTabs /
+    --       buildUnitsPage 的排序行 / buildMetricLegend 的指标行。
+    --       顺带把外层的 LIGHT_GRAY 底也去了（用户明确说不要灰）。
+    --
+    --   (2) 「怎么还是有进度条啊，不能固定框吗」
+    --       这不是统计进度，是 `ScrollableContainer` 右侧那根**竖直滚动条**
+    --       （`VerticalScrollBar`）。只要内容装不下它就出现，且上游在
+    --       `paintTo()` 里**无条件**画出来，没有任何开关。
+    --       改：新增 `NoBarScrollable = ScrollableContainer:extend{}`，
+    --       在 `initState()` 里先调父类（保证滚动状态照常算好），
+    --       再把 `_v_scroll_bar` / `_h_scroll_bar` 置 nil，
+    --       并把 `_crop_w` / `_crop_h` 补回整尺寸（否则右侧空出一条白边）。
+    --       ⇒ 照样能滑动，但一根滚动条都不画。
+    --
+    --   (3) 「总览页面的卡片我说了可以一行不止两个，可以多放」
+    --       原来写死两列。改：`CARD_MAX_COLS = 3` + 按可用宽度反解列数
+    --       （每张卡至少 CARD_MIN_W 才放得下大数字），窄屏自动退回 2 列。
+    --       最后一行不足时用空占位补齐，保证与上面几行右边界对齐。
+    --
+    --   (4) 「字体放大一点你也没听」
+    --       faces() 整体上调 2~4px（value_big 28→32、tab 19→21、
+    --       section 22→24 ……），`VALUE_SIZE_PAIRS` 降级档位同步上移。
+    --
+    --   (5) 「尽量不要有灰色字」
+    --       卡片标签行图标原来 `dim = true`（= 灰化）⇒ 去掉；
+    --       趋势图柱子原来「选中黑 / 其余中灰」⇒ 改成「选中实心黑 /
+    --       其余空心黑描边」；图表虚线的稀疏度加大，观感不再灰扑扑。
+    --
+    --   (6) 「为什么还多了一个返回，那个返回我让你做过这个功能吗」
+    --       指 26-scroll-header 那轮我**自己加**的「退出」按钮（当时的理由
+    --       是「点空白/按返回键属于隐藏操作」）—— 用户从没要求过。
+    --       改：`buildExitButton` 整个删除。关窗仍有三条正当途径：
+    --       点浮窗外空白 / 按实体返回键 / 标题栏右上角关闭图标。
+    --
+    --   防回归：新增测试文件 `_verify/style_32.lua`（55 条）。
+    --   这个文件刻意**不只查字符串存在**（那是 31 轮的教训：`if false and`
+    --   能骗过纯存在性断言），而是四类断言齐上：
+    --     · 位置（抹除必须在父类 initState 之后）
+    --     · 数值范围（CARD_MAX_COLS >= 3、value_big >= 30）
+    --     · 反例（禁 LIGHT_GRAY 填充、禁 `if false and`、禁「退出」文案）
+    --     · **行为等价验证**（把「挑列数」「挑配色」抽成纯函数直接喂输入）
+    --   并做了 4 组反向注入验证（列数改回 2 / 灰填充回归 / if false and
+    --   屏蔽抹除 / 加回退出按钮），确认每类断言都真的会变红。
+    --
+    -- 33-perf-cards —— 用户在设备上跑 32 版后，报了两个**真机稳定性**问题
+    --   和一条布局微调要求。重点在性能/耗电（用户原话：「在阅读页面时间久
+    --   kindle 直接重启了」「亿字的会卡顿然后重启」「修复耗电与 bug」，
+    --   并强调设备是 KPW4 —— 单核 1GHz / 512MB / 电池老化）。
+    --
+    --   【诊断】靠用户给的 crash.log（D:/chrome/crash (5).log，6958 行）定位：
+    --   每次 `opening file <大 EPUB>` → `Inhibiting user input`（PAUSE）
+    --   → 27~55 秒无 RESUME → 直接 `WordCount: plugin init start`（全量重初始化）
+    --   = **看门狗超时把整机重启**。当天启动 47 次，12:43~13:07 密集到约 1 分钟一次，
+    --   开的都是「男强/」目录里的大 EPUB（宿命之环/诡秘/道诡异仙/轮回乐园…）。
+    --
+    --   (A) 阅读页久待重启 —— 三个热路径元凶（每次翻页/pos 更新都会中招）：
+    --     · `_startPageTimer` / `_trackPageUpdate` 每次翻页都调
+    --       `doc:getPageXPointer(page)`（跨 FFI 进 crengine C++）。
+    --       改：热路径判重改用 `_pageKeyFast`（= `"p:"..page`，零开销），
+    --       精确 xpointer key 只在真正落盘时算一次。
+    --     · `onReaderReady` 在开书同步尾巴里连做三件重 I/O
+    --       （`_ensureReadState` / `_syncGlobalBook` / `_syncNotes`）。
+    --       改：整块推迟到 `UIManager:nextTick`，只同步启动当前页计时。
+    --     · `_bookInfo` / `_ensureReadState` 每次翻页都可能 `DocSettings:open`
+    --       （要遍历 sidecar 的 11 个候选位置，磁盘 I/O 昂贵）。
+    --       改：`cachedDocSettings(path)` 按 path 缓存实例。
+    --
+    --   (B) 亿字大书卡死重启 —— 逐页扫描路径（25-cache-perf 当时只修了整书
+    --     路径，**逐页路径漏掉**）：
+    --     · 每页调一次 `_pageKey`（跨层）→ 几万页 = 几万次跨层调用。
+    --       改：`_pageKeyTemplate(doc)` 只查首页 xpointer 一次，转成模板
+    --       （`gsub` 把 `[P96]` 换成 `[%d]`，**限次 1**，且不碰 `DocFragment`），
+    --       其余页用 `string.format(stem, page)` 构造，`pcall` 兜底。
+    --     · `page_units` 每页一条 entry（键是完整 xpointer 字符串）→ 几 MB
+    --       内存 + 落盘序列化 → OOM。
+    --       改：`_recordPageUnits` 加 `MAX_TRACKED_PAGES = 50000` 容量闸门，
+    --       超限整体跳过（宁可不统计也不 OOM 重启）。
+    --
+    --   (C) 「总览卡片每一行可以多一点」—— `CARD_MIN_W` 150→118、
+    --     `CARD_MAX_COLS` 3→4，最小列数从 2 放宽到 1（极窄窗兜底）。
+    --     安全性：`buildValueRow` 会从大到小递减字号直到塞进 inner_w，
+    --     卡片变窄只会让大数字小一号，不会溢出。
+    --     ⇒ 竖屏 KPW4 排到 3 列、横屏可到 4 列，比 32 版多放。
+    --
+    --   耗电：以上三处都在**阅读热路径**上，减少的正是「翻页时常驻 CPU 忙等」
+    --   和「无谓跨层调用」。热路径省下的 CPU 周期直接换成续航。
+    --
+    --   防回归：新增 `_verify/read_page_perf.lua` + `_verify/style_33.lua`，
+    --   断言「热路径不得出现 `_pageKey(`」「扫描循环不得出现 `_pageKey(`」
+    --   「`CARD_MAX_COLS >= 4`」「`CARD_MIN_W <= 120`」「`MAX_TRACKED_PAGES` 存在」
+    --   等**否定式/数值式**条件（纯存在性断言骗不过 `if false and`）。
+    --
+    -- ★★★ 34-nav-style：用户本轮四条需求
+    --   1) 下钻页也要**悬浮**（原来 KeyValuePage 是全屏非 modal，被主浮窗永久压住
+    --      ⇒「在页面下一层，都看不到」）→ 新增同级 modal 浮窗 `DrillDownPopup`；
+    --   2) 阅读字数页改**左右翻页**、**不用上下滑动**、行间**点线**分隔
+    --      → `UNIT_PAGE_SIZE` / `unit_page` / `pageUnits(delta)`、
+    --        `buildUnitsPage` 重写（去 ScrollableContainer、加 ‹ › 屏上按钮）；
+    --   3) 总览卡片**每行三个** + **多套可切换样式**（含「中间只用一条线连接
+    --      两张卡」）→ `CARD_DEFAULT_COLS = 3`、`CARD_STYLES`（box/grid/
+    --      hairline/plate，4 种）、`buildCardStyleRow` 切换入口、
+    --      grid 样式用 `VRule` 补网格线；
+    --   4) 整体 UI 微调。
+    --
+    -- ★★★ 35-forward-local-fix（**设备崩溃修复，必读**）
+    --   用户截图报错：
+    --     main.lua:743: attempt to call global 'fmtCount' (a nil value)
+    --   病因：Lua 的 `local function f` **只从声明处往后可见**。
+    --     `notifyCached`（定义在前）调用了 `fmtCount`（定义在后），
+    --     Lua 把 `fmtCount` 解析成**全局**、全局为 nil ⇒ 调用即崩。
+    --     `notifyUser` 同理（定义在 1066 行，被前面的 notifyCached 调用）。
+    --   修法：把 `notifyUser` / `fmtCount` 两个定义**上移到 `notifyCached` 之前**。
+    --   ⚠ luaparser 静态检查**查不出**这类前向引用（非语法错，是作用域/运行期），
+    --     已补 `_verify/no_forward_local.lua` 专项回归。
+    --
+    -- ★★★ 36-count-once-fix（用户一次提 7 条，逐条对应）
+    --   用户原话：
+    --     「不能设置成只有打开阅读统计的时候开始一次吗，其他的时候几乎不统计
+    --       阅读统计里卡片样式标签koreader闪退，卡片在读书籍删掉吧，卡片点击
+    --       进去的显示框比阅读统计要小一点，另外切换下一页上一页也是通过图标
+    --       不是滑动，阅读统计总览页面为什么还是可以左右上下滑动。
+    --       统计字数为什么显示已使用缓存估算，我的统计字数功能实现呢，进度条呢」
+    --
+    --   (1) ★★★ 修「标签」卡片样式**闪退**（最严重 —— 用户点一下就崩）
+    --       病因：`wrapCard` 的 `plate`（标签）分支，左侧竖条原来是
+    --           `FixedBox:new{ FrameContainer:new{ background=黑, 无子控件 } }`。
+    --       上游 `FrameContainer:getSize()` 第一行就是 `self[1]:getSize()`
+    --       —— 没有子控件 ⇒ `self[1]` 为 nil ⇒
+    --           `attempt to index a nil value` **必崩**。
+    --       （上游同款陷阱：`FrameContainer:paintTo` 也只是 `self[1]:paintTo(...)`，
+    --        所以就算 getSize 侥幸过了，paint 一样崩。）
+    --       修法：新增自造控件 `SolidRect`（只按 width/height 画实心矩形，
+    --             完全不依赖子控件），替换该处。
+    --       防回归：新增 `_verify/card_styles.lua`（25 条）—— **真的把四种
+    --             样式各执行一遍**（构建 + getSize + paintTo），并用**照抄
+    --             上游语义**的 FrameContainer 存根跑；同时带**反证**
+    --             （空 FrameContainer:getSize 必须崩），证明测试有鉴别力，
+    --             不是「源码里搜不到坏模式」那种静态假绿。
+    --
+    --   (2) ★★ 总览页**禁止左右上下滑动**（用户问「为什么还是可以滑动」）
+    --       原来主内容容器是 `NoBarScrollable`（只去掉滚动条，仍可拖动）。
+    --       修法：新增 `FixedPane = ScrollableContainer:extend{}`，在 `init()`
+    --             里设 `self.ignore_events = {touch,swipe,hold,hold_pan,
+    --             hold_release,pan,pan_release}`。
+    --       ⚠ 关键坑：上游 `ScrollableContainer:init()` **只认
+    --         `self.ignore_events`**（字符串数组），不认 `self.ignore` ——
+    --         写成后者会静默失效、仍然能滑。
+    --       ⚠ 代价：内容超屏会被裁掉（没滚动条也没滚动），所以各视图必须
+    --         自己保证放得下 —— 阅读字数页已改成**按可用高度自适应每页行数**、
+    --         总览卡片按屏高收敛、趋势图固定行数。
+    --       配套：`initState()` 里清掉 `_v_scroll_bar`/`_h_scroll_bar` 并
+    --             补回 `_crop_w`/`_crop_h`（否则右侧/底部空出一条白边）。
+    --
+    --   (3) ★★ 阅读字数页**图标翻页**而非滑动
+    --       用户原话：「切换下一页上一页也是通过图标不是滑动」。
+    --       `buildUnitsPage` 从 ScrollableContainer 改成纯 VerticalGroup +
+    --       ‹ / › 屏上按钮（`pageUnits(delta)` 改 `unit_page` 并重建）。
+    --       每页行数由可用高度反解（`rows_per_page`，上限 `UNIT_PAGE_SIZE_MAX=12`、
+    --       下限 3），不再写死 10 行 —— 这样「禁止滑动」也不会把内容裁掉。
+    --
+    --   (4) ★★ 下钻浮窗比主浮窗**明显小一圈**
+    --       用户原话：「卡片点击进去的显示框比阅读统计要小一点」。
+    --       主浮窗：0.92 宽 / 0.90 高；下钻浮窗：`DRILL_MAX_WIDTH_RATIO=0.80`
+    --       / `DRILL_MAX_HEIGHT_RATIO=0.72` ⇒ 四周露出主浮窗，一眼看出是上层。
+    --
+    --   (5) ★ 删掉「在读书籍」卡片（用户原话：「卡片在读书籍删掉吧」）
+    --       `buildCardGrid` 的 specs 里整块 `id = "books_in_progress"` 删除。
+    --
+    --   (6) ★★ 「统计页只统计一次」（用户原话：「不能设置成只有打开阅读统计
+    --       的时候开始一次吗，其他的时候几乎不统计」）
+    --       先核实：`statistics_page.lua` 里**没有任何定时器/轮询**
+    --       （`scheduleIn` / `nextTick` / `addToMainLoop` 搜索结果为空），
+    --       所以不存在「后台一直在算」；真正的重复开销是**同一次打开里
+    --       每切换一次 tab/周期/指标就重算一遍**。
+    --       修法：加 `statMemoKey(plugin, period, anchor, metric)` +
+    --             `memoGet`/`memoSet` —— 键含数据版本号
+    --             `plugin._global_stats_rev`，所以**数据变了才失效**，
+    --             同页内来回切换直接命中内存缓存。
+    --       配套：`_globalStore()` 初始化 `_global_stats_rev`，
+    --             `_saveGlobalStats()` 写后自增 ⇒ 统计页缓存自动失效。
+    --
+    --   (7) ★★★ 「统计字数」默认改回**精确完整扫描**（用户原话：「为什么显示
+    --       已使用缓存估算，我的统计字数功能实现呢，进度条呢」）
+    --       病因：28-kpw4-tuning 把默认从 full 改成 sample（抽页估算），
+    --             于是缓存里存的是**估算值**，再点只提示「已使用缓存（估算）」、
+    --             **不跑进度条** —— 用户以为「统计功能没实现、进度条也没了」。
+    --       修法（按用户明确选择「默认改成精确完整扫描（带进度条）」）：
+    --             `countMode()` 默认从 `MODE_SAMPLE` 改回 `MODE_FULL`。
+    --       ★ 抽页估算**没有被剥夺**：菜单开关还在，切一次永久记住；
+    --         批量 ≥5 本仍会自动临时降级（那是另一条省电路径，不冲突）。
+    --       ★ 取舍说明：KPW4 上完整扫描 1000 页约 9~12 秒 —— 用户已明确
+    --         表示要「真的统计一次、看得见进度条、给精确数字」，所以默认走精确。
+    --
+    --   防回归：`run_tests.py` 新增交付标记（`SolidRect` / `_global_stats_rev` /
+    --     `statMemoKey` / `FixedPane` / `ignore_events` / `rows_per_page` /
+    --     `UNIT_PAGE_SIZE_MAX` / `DRILL_MAX_*_RATIO`），并把
+    --     `"books_in_progress"` 加进**必须消失**清单；`card_styles` 纳入测试套件。
+    --
+    -- ★★★ 37-nav-cycle（用户在设备上跑 36 版后的复查 + 追加意见）
+    --   用户原话（照抄，逐条对应）：
+    --     「为什么我重置设置为默认后的书籍统计的字数消失了，以及再次点击统计后
+    --       字数依旧不显示，点击统计的时候显示正在读取缓存，但是没有任何显示」
+    --     「阅读统计，上一页下一页按钮只显示图标啊，上一页图标 第1/10页 下一页
+    --       图标，类似于这种的」
+    --     「店家阅读趋势的时候，下方的阅读时间阅读字数阅读速度阅读时长没必要
+    --       放在那啊，能不能重构一下年月日那个导航栏，我要是想看去年12月1日
+    --       的怎么办」
+    --     「打开阅读统计的时候不给个进度条提示统计打开进度吗」
+    --     「阅读总览页面累计读过已读和总数只要数字（可能有单位），不需要已读和
+    --       总数的文字」
+    --     「上一页图标 第1/10页 下一页图标，这个要离得近一点，不要站在两端」
+    --
+    --   (1) ★★★「重置设置后字数消失 / 再点统计还是不显示」（最严重 —— 看似数据没了）
+    --       病因：KOReader 的「重置为默认」会**清空 G_reader_settings**，而字数的
+    --             两个缓存层都在里面 ——
+    --               · 全局缓存表 KEY_CACHE（路径 → {count,mtime,size,at}）
+    --               · 聚合统计 KEY_GLOBAL_STATS
+    --             再加上每本书的 DocSettings 也被清 ⇒ 统计页读到全 0，
+    --             用户以为「我的字数被删了」。
+    --       修法：打开统计页时**先查当前书有没有缓存字数**；没有就**先起一次扫描**
+    --             （走进度条），扫完自动掀开统计页。
+    --             · `showStatisticsDashboard` 里用 `readCachedCount` 判 cache miss，
+    --               miss 则记 `_stat_open_pending` 并 `startCountFromMenu(false)`。
+    --             · 扫描收尾（写 KEY_COUNT 缓存**之后**）调
+    --               `_maybeOpenStatisticsAfterScan()` → 延迟 0.4s 打开统计页。
+    --             · `cancelCount` 清 `_stat_open_pending`（取消后不弹）。
+    --             · `startCountFromMenu` 改为返回 true/false（调用方靠它判断要不要等）。
+    --       ★ 关键顺序：`_maybeOpenStatisticsAfterScan()` 必须在
+    --         `settings:saveSetting(KEY_COUNT, total)` **之后** —— 否则统计页在
+    --         数据还没落地时打开，用户又看到「0」。测试用位置比对钉死（D7b/D7c）。
+    --
+    --   (2) ★★「打开阅读统计时不给个进度条吗」
+    --       就是 (1) 的同一条路径：无缓存 → 起扫描 = 出现进度条 → 扫完自动开页。
+    --       用户不再需要「先点统计字数、再点阅读统计」两步。
+    --
+    --   (3) ★ 阅读趋势页底部那行「阅读时间/阅读字数/阅读速度/阅读时长」删掉
+    --       用户原话：「下方的…没必要放在那啊」。
+    --       修法：`buildTrendSection` 里去掉 `buildMetricLegend` 调用
+    --             （函数定义保留，总览页仍可能用）。
+    --       ★ 取舍：删掉后只能看**当前指标** —— 这是用户的明确选择
+    --         （AskUserQuestion 选「直接删掉，只能看当前指标」）。
+    --
+    --   (4) ★★「重构年月日导航栏，我要看去年12月1日怎么办」
+    --       旧形态：‹ › 只能按当前粒度一格格翻，想看去年某天要点很多次。
+    --       修法（按用户选择「标题本身可点，循环切换年→月→日」）：
+    --             · `buildPeriodNav` 的标题包 `TapBox`，点一下调
+    --               `cyclePeriodGranularity()`。
+    --             · 粒度循环 ORDER = {year, month, day, week, total}，
+    --               取模回绕（`ORDER[(idx % #ORDER) + 1]`）。
+    --             · ★★★ 切换粒度时 **anchor 保持不变**（`anchor = self.anchor`）
+    --               —— 所以「2025年」→点标题→「2025年12月」→点标题→
+    --               「2025年12月01日」一路精准下钻，不用一格格翻。
+    --               绝不把 anchor 重置成 os.time()（那会丢掉用户选的日子）。
+    --             · 标题文字缀一个提示符「▸」，示意可点。
+    --             · `‹ ›` 仍按当前粒度 shiftAnchor（年±1年/月±1月/日±1天/周±1周）。
+    --
+    --   (5) ★ 总览页「累计读过」只显示数字（去「已读/总数」文字）
+    --       用户原话：「累计读过已读和总数只要数字（可能有单位），不需要已读和
+    --       总数的文字」。
+    --       修法：`drillRows` 与 `buildUnitsPage` 行右侧去掉「已读 %1 / 全书 %2」
+    --             这类文字，只留数字（`formatCount` / `%1 / %2`）。
+    --
+    --   (6) ★ 翻页箭头**离页码近一点**（用户追加：「不要站在两端」）
+    --       旧写法：`FixedBox{width = width - 2*arrow_w}` 当**弹簧**把两个箭头
+    --             顶到屏幕左右两端，中间一大片空白。
+    --       修法：箭头 + 页码先组成一个**包紧的内层簇**（`cluster`，auto 宽度，
+    --             箭头与页码间加固定 `gap`），外层 FixedBox 只负责**整体居中**。
+    --             `arrow_w` 72→56 更紧凑，页码用自然宽度。
+    --
+    --   防回归：新增 `_verify/nav_and_display_37.lua`（42 条，A~E 五组）：
+    --     · A：趋势页不再调 buildMetricLegend（定义仍在）
+    --     · B：标题包 TapBox + cyclePeriodGranularity + anchor 保持 + 循环回绕
+    --     · C：drillRows/buildUnitsPage 无「已读/全书」文字、仍出数字
+    --     · D：开页先查缓存 → 无则起扫描 → 扫完（写缓存**之后**）自动开页；
+    --          cancelCount 清挂起；startCountFromMenu 返回 true/false
+    --     · E：粒度循环**行为等价**（纯逻辑喂输入：year→month→…→total→year 回绕）
+    --   并由 `units_paging_and_style.lua` 新增 B6 组钉死「箭头紧簇、不再用弹簧
+    --     顶到两端」；`run_tests.py` 新增 37 的交付标记。
+    --
+    -- ★★★ 37b-nav-cycle（用户在设备上跑 37 版后的第二轮反馈）
+    --   用户原话：
+    --     「阅读统计下方的上一页下一页切换按钮没必要加边框」
+    --     「日期做成双标题，第一行标题是年，第二行是月日，第二行的内部是日切换，
+    --       外部是月切换」
+    --     「还是统计字数，依旧是显示正在读取缓存内容，但是依旧是不显示重置过
+    --       设置的书籍字数」
+    --
+    --   (1) ★★ 翻页/翻格按钮**去掉边框**
+    --       病因：边框不是我们画的 —— 是上游 `IconButton` 自带的
+    --             `FrameContainer`（bordersize=Size.border.button、白底 + 圆角），
+    --             **只要用 IconButton 就必然有框**。
+    --       修法：阅读字数页翻页栏的 `navButton` 改为「极简图标 + TapBox」——
+    --             只有箭头本身可点，不画任何边框/底色。
+    --             ★ 保留足够的**触摸命中面积**（arrow_w × nav_h 的 FixedBox 热区），
+    --               只是不把热区画成框。
+    --       防回归：units_paging_and_style.lua 新增 B7 组 —— 在 **navButton 函数体
+    --             内**断言无 bordersize / bordercolor / FrameContainer
+    --             （不能全函数搜：buildUnitsPage 里的排序行仍有边框）。
+    --
+    --   (2) ★★★ 周期导航改成**双行标题**（用户明确定义点击区域）
+    --       第一行「2026年」        → 点它切到 **年**
+    --       第二行「10月03日」      → **外侧**（左/右 1/3）切 **月**
+    --                                → **内侧**（中 1/3）  切 **日**
+    --       · 新增 `GlobalStats.navLabels(period, anchor)` 统一产出两行文字，
+    --         保证与 bounds 口径一致。
+    --       · `TapBox:onTapSelect` 升级为把**点击坐标 (x, y)** 传给 `on_tap`
+    --         （老调用点忽略多余参数，行为不变）—— 没有坐标就分不出「内外」。
+    --       · 新增 `cycleToGranularity(target)`（直接切指定粒度，不循环）；
+    --         与 cyclePeriodGranularity 一样 **anchor 保持不变**。
+    --       · ‹ › 移到第二行左右两端，仍按**当前粒度** shiftAnchor 翻一格。
+    --
+    --   (3) ★★★「统计字数仍显示读取缓存、但重置过的书字数不显示」（真 bug）
+    --       根因（两步，都是「缓存」与「聚合」两套数据脱节）：
+    --         ① 「重置为默认」清空 `G_reader_settings` —— 既有全局字数缓存
+    --            `KEY_CACHE`，也有聚合统计 `KEY_GLOBAL_STATS`。
+    --         ② 之后打开这本书 → `_syncGlobalBook` 把 `KEY_CACHE` 里这本书的
+    --            **字数**补了回来；但「统计字数」菜单**命中缓存时只弹一句
+    --            「已使用缓存结果…」就 return**，**从不往聚合统计里写**。
+    --         ⇒ 字数明明在（所以显示「读取缓存」），但阅读统计总览里这本书
+    --            依旧是 0（聚合里没有这条）。
+    --       修法：新增 `_resyncBookFromCache(path)` —— 缓存命中时顺手把这本书的
+    --             聚合记录补齐（字数取缓存值，时长/已读数取 DocSettings 的
+    --             `KEY_READ_STATS`；没有阅读状态就构造最小 state，至少让
+    --             「全书字数」回到总览）。
+    --             三处命中分支全部接上：`startCountFromMenu`（菜单）、
+    --             `startCountForPath`（书架点单本）、`showStatisticsDashboard`
+    --             （直接开统计页，命中缓存时也补写，无需先点统计字数）。
+    --             ★ 幂等：`upsertBook` 是**赋值替换**不是累加，重复调用不叠加。
+    --       防回归：nav_and_display_37.lua 新增 D4b/D12/D12a/D12b/D13 ——
+    --             含「两处缓存命中分支都调了 _resyncBookFromCache」的计数断言。
+    --
+    -- ★★★ 37c-nav-cycle（「修复bug」轮的深度排查：上面 (3) 其实还有**两个
+    --   更深的断点**，只修「命中缓存补写聚合」还不够）
+    --
+    --   用户复测后仍报「显示正在读取缓存内容、但重置过的书字数不显示」。
+    --   写了一个**行为级**回归测试 `_verify/reset_recovery_37b.lua`
+    --   （真跑 global_stats.lua 源码），才把整条链挖干净：
+    --
+    --   (3-a) ★★★ `GlobalStats.upsertBook` 的「空记录丢弃」守卫会
+    --         **连全书字数一起扔掉**：
+    --             if units<=0 and seconds<=0 and pages<=0 ... then return store end
+    --         而「重置后」的典型态正是 read_units=0（阅读状态已被清），
+    --         于是 total_units 永远进不了 store.books。
+    --         修法：守卫放行「带了 total_units>0」的记录 —— 知道这本书多少字，
+    --         就值得记一条（哪怕还没读）。
+    --         反向对照：既无阅读量、也无字数的空记录**仍然丢弃**（不塞垃圾）。
+    --
+    --   (3-b) ★★★ 两个消费端只认 `store.days`，看不见「只有字数」的书：
+    --         · `summarize` 非累计周期：books_read = countSet(days 里的书)
+    --         · `details`    非累计周期：paths 只从 days 收集
+    --         而补写的书**没有任何 day 记录**（重置后刚补写、还没读）⇒
+    --         总览的「累计读过」数字与明细列表**都**看不到它。
+    --         修法：抽出 `booksInPeriod(store, period, first, last)` 统一收口 ——
+    --           · total：store.books 全部
+    --           · 其它：days 里出现过的书 ∪ 「total_units>0 且 last_read_date
+    --             落在周期内（或没有日期）」的书
+    --         `summarize` 与 `details` **共用它** ⇒ 「数字」和「列表」口径一致，
+    --         不会出现「数字 0、点进去却有书」这种自相矛盾。
+    --
+    --   (3-c) ★★ 补写时**以缓存字数为准**（新增 `total_units_override`）：
+    --         `_bookInfo` 原本只从 DocSettings 的 KEY_COUNT 读全书字数，
+    --         而重置后那个键已经没了 ⇒ 补写进去的 total_units 是 nil。
+    --         修法：`_bookInfo(doc, total_units_override)` /
+    --               `_syncGlobalBook(state, new_page, book_path, total_units_override)`
+    --               多一个可选覆盖参数；`_resyncBookFromCache(path, cached_count)`
+    --               把 KEY_CACHE 里的 count 透传下去。
+    --
+    --   防回归：新增 `_verify/reset_recovery_37b.lua`（22 条）—— **行为级**验证：
+    --     · A：upsertBook 收「只有字数」的记录；A3 反向：空记录仍丢弃
+    --     · B：details 在 total/year/month/day **四个周期**都能看到该书的字数；
+    --          B3 反向：没有字数的书不会被兜底拉进列表
+    --     · C：源码接线（两处命中都传 cached_count、total_units_override 存在）
+    --     · D：完整链路「重置→补写→总览」：summarize(...).books_read == 1
+    --
+    -- ★★★ 37d-nav-visible（用户：「周期切换不直观」+「阅读统计翻页栏在最底下
+    --   和内容重叠了」）
+    --
+    --   (1) ★★★ 周期切换不直观 —— 病根是 37b 把「切粒度」做成了**纯文字热区**：
+    --       第一行文字中央=年、第二行文字外侧=月/内侧=日。文字长得跟普通标签
+    --       一模一样，用户根本看不出「哪里能点、点了切什么」；e-ink 触摸屏上
+    --       「看不见的可点区域」≈ 不存在。
+    --       修法：改成**显式的粒度按钮行** ——
+    --           2026年10月03日        ← 第一行：当前周期完整文字（只读）
+    --      ‹   日  周  月  年   ›     ← 第二行：4 个可见粒度按钮（当前项黑底反白）
+    --                                   + 左右翻格箭头（按当前粒度 shiftAnchor）
+    --       点粒度按钮 = cycleToGranularity（直接切，不再循环）；点箭头 = 前后翻一格。
+    --       ⇒ 每一步都有看得见的按钮，不再靠猜。anchor 仍保持不变（不跳回今天）。
+    --
+    --   (2) ★★★ 翻页栏被列表顶出屏幕 —— 病根是 `buildUnitsPage` 里
+    --       `chrome_h = Screen:scaleBySize(300)` 这个**拍脑袋估算**；
+    --       KPW4 上真实 chrome（标题栏+视图标签+粒度标签+周期导航+排序行+
+    --       状态行+翻页栏+各处 span）合计约 550px，300 严重低估 ⇒
+    --       rows_per_page 算多了 ⇒ 列表把翻页栏顶出 available_h（FixedPane
+    --       不可滚动，超出即被裁）⇒ 翻页栏看不见 / 与列表叠在一起。
+    --       修法：chrome_h 改成**按实际控件常量逐项累加**（chrome_top +
+    --       chrome_bottom，每项与构建它的代码同常量）+ 底部安全边
+    --       SCROLL_SAFETY。KPW4 实测：预算 584px、每页 9 行、留 76px 余量 ⇒
+    --       翻页栏永远可见。（代价：每页少 1 行，换来翻页栏不再消失。）
+    --
+    --   防回归：
+    --     · `_verify/nav_and_display_37.lua` B 组改成断言「4 个粒度按钮 +
+    --       选中反白 + cycleToGranularity」（57 条）
+    --     · `_verify/units_paging_and_style.lua` 新增 B8 组：断言
+    --       chrome_h 不再是 scaleBySize(300)、改成 chrome_top+bottom 累加、
+    --       NAVBAR_H 与翻页栏 nav_h=44 同口径、留 SCROLL_SAFETY（55 条）
+    --
+    -- ★★★ 37e-nav-dual-arrow（用户澄清：要的是「双行 + 每行两端箭头」的月面布局）
+    --
+    --   用户在 37d 之后澄清：不是要「粒度按钮行」，而是要回到 37c 的**双行标题
+    --   形态**，但把切换入口做成**看得见的箭头**：
+    --     · 第一行「2026年」左右两端各一个箭头 → 按**年**翻
+    --     · 第二行「10月03日」左右两端各一个箭头 → 按**月**翻
+    --     · 「月日」右边再放一个 [日] 按钮 → 切到**日**粒度
+    --
+    --   实现（buildPeriodNav 重写）：
+    --     row1 = ‹  2026年  ›            （stepArrow 固定 period="year"）
+    --     row2 = ‹  10月03日  [日]  ›     （stepArrow 固定 period="month" + [日]
+    --                                     按钮 cycleToGranularity("day")）
+    --   · 箭头「按什么粒度翻」是**固定的**（第一行永远翻年、第二行永远翻月），
+    --     不再跟着当前粒度变 —— 位置固定 ⇒ 行为可预期，用户不用猜。
+    --   · 点标题文字仍可下钻（year→month→day 循环，anchor 不变），保留 37c 手感。
+    --   · 「总」粒度：两行箭头置灰、[日] 按钮隐藏。
+    --
+    --   ⚠ 同步修正 `buildUnitsPage` 的 PERIODNAV_H 预算：nav 高度从
+    --     「line_h(32)+btn_h(36)」改成「line_h*2(32×2)」。不改就会再次
+    --     低估 chrome、把翻页栏顶出屏幕（37d 刚修过的老病根）。
+    --     KPW4 复核：chrome 577px、每页 9 行、余 83px。
+    --
+    --   防回归：`_verify/nav_and_display_37.lua` B 组改成断言「两行各一对箭头
+    --   （chevron 计数 ≥2）+ 第一行 year 翻 / 第二行 month 翻 + [日] 按钮 +
+    --   shiftAnchor」（56 条）。
+    --
+    -- ★★★ 37f-nav-six-arrows（用户继续澄清箭头数量与位置）
+    --
+    --   用户原话：「年和月的切换放到两端（远的两端），日的放到月日的附近两端，
+    --   一共六个箭头」。
+    --   ⇒ 六箭头布局（buildPeriodNav 第四次重写）：
+    --     · 第一行「2026年」  屏幕**最左/最右**各一个箭头 → 按**年**翻   （2 个）
+    --     · 第二行「10月03日」屏幕**最左/最右**各一个箭头 → 按**月**翻   （2 个）
+    --     · 第二行「月日」    **紧贴两侧**各一个箭头     → 按**日**翻   （2 个）
+    --   合计 6 个箭头；每个箭头的粒度**写死固定**，位置不变 ⇒ 不用猜。
+    --
+    --   实现要点：
+    --     · 第一行：年文字用**定宽** FixedBox（w = 行宽 - 2*arrow_w），
+    --       三块定宽拼满整行 ⇒ 两端年箭头被挤到**真正的最外端**（无需弹簧）。
+    --     · 第二行：月箭头在最外端，中间放一个定宽 FixedBox 包住
+    --       「日左箭头 + 月日 + 日右箭头」内圈簇（日箭头紧贴月日）。
+    --     · 点标题仍可下钻（年文字→月、月日→日），anchor 不变。
+    --
+    --   ⚠ PERIODNAV_H 预算同步改：line_h 32→34 ⇒ 预算是 scaleBySize(34)*2。
+    --   ⚠ 删掉了 37e/37f 中间的 `rowWithEndArrows` 占位实现（有未用变量 + 占位
+    --     span 永不重设宽度的 bug），改成直接定宽拼装。
+    --
+    --   防回归：`_verify/nav_and_display_37.lua` B 组改成断言「chevron 左右各 3
+    --   个（= 6 箭头）+ year/month/day 三种粒度都有 + shiftAnchor」（55 条）。
+    --
+    -- ★★★ 37g-insights-style（用户：「你自己看看，这很好看吗」+「就按照阅读洞察
+    --   去做，把下面的那一坨改成跟这个一样的，把年月日也改一下」）
+    --
+    --   背景：37f 的六箭头**行为**对了，但**观感**差 —— 22px 的大箭头直接裸放，
+    --   散、不像按钮。用户要求照 KOReader 官方 **Reading Insights** 浮窗的观感来。
+    --
+    --   参考源码：D:/chrome/2-reading-insights-popup02.lua
+    --     · 年导航：`IconWidget{ icon="chevron.left", width=scaleBySize(11),
+    --       alpha=true, is_icon=true }` 坐在 `Button{ bordersize=0,
+    --       background=Blitbuffer.COLOR_GRAY_E }` 上。
+    --     · 分页 navBtn：`FrameContainer{ background=COLOR_GRAY_E(enabled)/
+    --       COLOR_WHITE(disabled), color=COLOR_BLACK, bordersize=0,
+    --       radius=scaleBySize(8), padding=0, margin=0,
+    --       CenterContainer{ dimen=Geom{w=btn_w,h=btn_h}, btn_icon } }`（11px chevron）。
+    --
+    --   ⇒ 统一成「**小号 chevron（13px）+ 浅灰圆角药丸 + 无描边**」：
+    --     · buildPeriodNav 的 `stepArrow`（六个月/日/年箭头）—— 已改。
+    --     · buildUnitsPage 的 `navButton`（翻页栏 ‹ 第X/Y页 ›）—— 本轮改（"下面那一坨"）。
+    --   两处现在**同一套**参数：arrow_icon=scaleBySize(13)、arrow_pill=scaleBySize(30)、
+    --   radius=scaleBySize(8)、bordersize=0、禁用时底色白 + 图标 dim。
+    --   禁用(gray)用 `dim = true`（IconWidget 无 color 字段）；启用底灰 = COLOR_GRAY_E。
+    --
+    --   ⚠ 仍然不用 `IconButton`（它自带 FrameContainer 白底 + 边框，去不掉）；
+    --     改用 `FrameContainer{ bordersize=0 }` 手动做药丸。
+    --
+    --   版权：KOReader 为 **AGPLv3** 开源，本插件本就在其生态内，复用其 UI
+    --   语言/尺寸无版权问题（用户问过）。
+    --
+    -- ★★★ 37h-bare-arrows（用户四条追加需求）
+    --
+    --   (1)「还是正在读取缓存，不显示」—— 见下 (2)。
+    --   (2)「点击统计本书的时候自动忽略缓存重新统计」：
+    --       文件弹窗 / Bookshelf 的「统计本书字数」两个入口，以前调
+    --       `startCountForPath(file)`（默认走缓存）⇒ 点它只弹一句「已使用缓存
+    --       结果…」就 return，用户以为「没反应 / 不显示」。现在两个入口都显式传
+    --       `startCountForPath(file, true)` ⇒ **跳过缓存、直接重扫**（带进度条）。
+    --   (3)「字数与统计中的重新统计可以删掉了」：
+    --       删掉主菜单「重新统计（忽略缓存）」那一项（连带确认框）。
+    --       ☠ 注意：`_verify/cache_reuse.lua` 的 C 组原先断言该项**存在**，
+    --       本轮已反过来断言「**已删除**」+「统计本书字数自带 force_rescan」。
+    --       相关 notify 文案也一并改成「再点一次『统计本书字数』」。
+    --   (4)「月日的箭头就在月日旁边，离得近一点，箭头都不需要底色和边框，
+    --       可以适当的大一点，或者多一点其他样式的箭头」：
+    --       · **去掉药丸**（37g 加的浅灰底 FrameContainer）→ 纯裸箭头 + 透明
+    --         TapBox 热区（热区不画任何东西）；
+    --       · 箭头**放大**：13px → 默认 18px（由样式表 ARROW_STYLES 定义）；
+    --       · 日箭头 gap 从 `Size.padding.small` 收到 `Size.padding.tiny`（贴紧）；
+    --       · 新增 `ARROW_STYLES`（尖角 chevron / 双尖角 chevron.first·last /
+    --         实心箭头 back.top·back.top.rtl）+ `buildArrowStyleRow` 切换行
+    --         （总览视图里，「卡片样式」行下面一行）。
+    --       · `self.arrow_style` 存样式，`reload` 透传；buildPeriodNav 的
+    --         stepArrow 与 buildUnitsPage 的 navButton 都读它。
+    --
+    --   ⚠ 仍然是 `IconWidget`（无 color 字段）⇒ 置灰只能 `dim = true`。
+    --   ⚠ 图标可用性已核对 E:/kindle越狱/Koreader/resources/icons/mdlight/：
+    --      chevron.left/right、chevron.first/last、back.top、back.top.rtl 都在。
+    --
+    -- ★★★ 37i-huge-book-guard（用户两条追加需求）
+    --
+    --   (1)「做出来的效果为什么左边和右边的两个按钮是挨着的」
+    --       —— 用户选了**三行**方案，但指出 37h 的排布里月箭头和日箭头挤在
+    --          同一行（`月‹ 日‹ 10月03日 日› 月›`），两个左箭头挨在一起，
+    --          分不清谁翻月谁翻日。⇒ 改成**年 / 月 / 日各占一行**：
+    --            第 1 行   ‹   2026年   ›   （箭头翻年）
+    --            第 2 行   ‹   10月     ›   （箭头翻月）
+    --            第 3 行   ‹   03日     ›   （箭头翻日）
+    --          每行箭头贴着自己那行文字，两行之间不再挤压。
+    --          nav_h 同步改成 `line_h*3 + padding.tiny*2`；buildUnitsPage 的
+    --          PERIODNAV_H 预算同步 ×3（否则翻页栏又被顶掉）。
+    --       · 用户「箭头样式不是自己选择的，你做好固定的就可以」⇒ **删除**
+    --         `ARROW_STYLES` / `arrowStyleDef` / `buildArrowStyleRow` /
+    --         `self.arrow_style`，箭头写死为 18px 尖角 chevron（无底色、无边框）。
+    --
+    --   (2)「亿万字的书统计字数扫描会卡，然后就 kindle 就重启了」
+    --       —— crash (11).log 铁证：一本 93551 页 / 219MB 的书逐页扫，
+    --          crengine 内部内存 + Lua 堆无界增长（插件侧从不 collectgarbage）
+    --          → 内核 OOM Killer `Killed` → Kindle 重启。
+    --       · 新增 `PER_PAGE_SCAN_MAX_PAGES = 20000`：页数超过这个量级时，
+    --         即使模式是「全书精确」也**强制降级为抽样估算**（SAMPLE_PAGES），
+    --         并在完成提示里说明「书太大（N 页），为防卡死改用估算」。
+    --       · tick 循环里加入**主动 GC**：每 8 个 tick `collectgarbage("step")`
+    --         （增量、几乎无停顿），每个 CHUNK_TICKS 边界 `collectgarbage("collect")`，
+    --         防止 Lua 堆随扫描线性增长。
+    --       · job 带 `huge_book_forced_sample` 标记，收尾提示据此走「估算」文案。
+    --
+    --   ⚠ 仍是裸箭头（无 FrameContainer）⇒ 无底色、无边框。
+    --   ⚠ 图标仍是 `IconWidget`（无 color 字段）⇒ 置灰只能 `dim = true`。
+    --
+    -- ★★★ 37i2-two-row-six-arrows（用户看图纠正导航形状）
+    --
+    --   用户在看完 37i 的「三行」渲染图后明确否掉：「不是啊，我要的是这种效果」，
+    --   并画出目标形状：
+    --       ‹                 2026年                 ›
+    --       ‹        ‹      10月03日       ›        ›
+    --   并确认语义：最外侧一对 = 翻**年**；第二层靠外的一对 = 翻**月**；
+    --   紧贴月日的一对 = 翻**日**。
+    --
+    --   ⇒ 从 37i 的「三行（年/月/日各一行）」**改回 37f 的「两行 + 六箭头」**：
+    --     · 第 1 行：年，左右最远端各一个箭头（翻年）
+    --     · 第 2 行：月日，**三层**——月箭头(外) → 日箭头(内) → 文字 →
+    --       日箭头(内) → 月箭头(外)。左右各三个箭头，呈「由外到内」的对称梯形。
+    --   · nav_h 改回 `line_h*2 + padding.tiny`；buildUnitsPage 的 PERIODNAV_H ×2。
+    --   · 月日行中间文字宽度 = `width - 4*arrow_w`（给两侧两级箭头让位）。
+    --   ⚠ 删除 37i 的「三行」与「拆月/日两段」逻辑（不再需要）。
+    --
+    -- ★★★ 37i3-huge-count-and-version（用户三条跟进反馈）
+    --
+    --   (1)「为什么不重构版本号」—— 根因：插件从不显示版本，zip 名也一直没变，
+    --       用户装完无法确认装的是新版。⇒ ①zip 名带上变体名
+    --       `wordcount37-nav-style-<variant>.koplugin.zip`（另存一份稳定名副本）；
+    --       ②主菜单**第一行**新增「版本：xxx」，点它弹通知显示当前版本。
+    --
+    --   (2)「还是挨着的，日箭头现在还是没有挨着月日」—— 37i2 上一版的月日行把
+    --       中间文字框撑成 `width - 4*arrow_w`（几乎占满整行）并居中，于是紧贴
+    --       文字两侧的**日箭头被推到离文字很远**的地方。⇒ 改成**中间簇自紧凑**：
+    --         ‹(月,外)  [弹性]  ‹(日) [tiny] 月日 [tiny] ›(日)  [弹性]  ›(月,外)
+    --       中间簇（日‹ 月日 日›）按内容宽居中，两端用 FixedBox 剩余宽度把
+    --       月箭头顶到最外侧。这样日箭头**紧贴**月日文字（只留 padding.tiny）。
+    --
+    --   (3)「亿万字的书还是统计不成功，显示无法打开文件」—— 两个真 bug：
+    --       · **返回值丢失**：`pcall(openPreparedDocument, path)` 只取第一个返回
+    --         值，而巨书时函数返回的是 `(nil, "huge_document")` ⇒ 第二个返回值
+    --         （错误原因）被丢掉 ⇒ `doc == "huge_document"` 永不成立 ⇒ 用户
+    --         看到的是**误导性的通用文案**「无法打开文件：nil」。三处调用点
+    --         （单本 / 批量 / 后台重开）全都有这个 bug，全部修掉（接住第二个值）。
+    --       · **一刀切拒绝**：旧逻辑只要「文件 > 阈值 且 loadDocument 后仍探不到
+    --         页数」就直接拒绝统计。但日志显示**同一本 219MB 的书有时
+    --         loadDocument 后能拿到 pageCount=93551**（crengine 惰性分页不稳定）。
+    --         ⇒ 改为：巨书**重试 loadDocument 若干次**（仍**绝不 render**，render
+    --         才是吃 130MB / OOM 的那步），拿到页数就放行（startCount 会因
+    --         PER_PAGE_SCAN_MAX_PAGES 强制抽样）；反复重试仍无页数才如实拒绝。
+    --
+    -- ★★★ 37j-user-controllable-limits（用户要「完整优先 + 降级由我控制」）
+    --
+    --   用户原话：
+    --     「都按完整版来算啊，我不想要降级的，如果不够内存可以断掉避免触发重启，
+    --       或者给我选项让我采用哪种降级的以及多少开始降级计算」
+    --
+    --   ⇒ 三个用户可调设置（存 G_reader_settings，主菜单可改）：
+    --     · 「大书自动降级：关（默认）」—— 超限时**直接取消统计**，不硬跑，
+    --       提示「为避免耗尽内存导致设备重启」。用户要的「断掉」。
+    --       打开后：超限改用抽样估算。
+    --     · 「降级触发页数」—— 默认 20000，档位 5k/10k/20k/50k/100k/200k 循环。
+    --     · 「降级触发大小」—— 默认按格式（epub 12MB / 其他 24MB），
+    --       档位 12/24/50/100/200/500MB 循环，再点回绕到「按格式默认」。
+    --   ⇒ 完整模式（默认）下：规模超限 **拒绝并清掉占用**（关文档 + GC），
+    --     不再像 37i 那样悄悄降级成抽样。
+    --   ⇒ 整书精确路径（WHOLE_BOOK_MAX_PAGES）也受降级开关控制：
+    --     禁止降级时**始终走整书精确路径**（唯一无边界误差的路径）。
+    --   37j-user-controllable-limits
+    --
+    -- ★ 37k-epub-20mb（用户反馈：「能不能加到20」）
+    --
+    --   用户原话：问「为什么选的是12mb」，听完 epub 解压放大的解释后
+    --   要求把 epub 默认阈值从 12MB 放宽到 20MB。
+    --
+    --   ⇒ 默认阈值上调：
+    --     · epub：12MB → **20MB**（HUGE_FILE_BYTES_EPUB）
+    --     · 其他：24MB → **32MB**（HUGE_FILE_BYTES，等比同步放宽）
+    --   ⇒ 「降级触发大小」档位改为 8/12/20/32/50/100/200/500MB，
+    --     既能往上加也能往下收（8 和 12 保留，方便一键收回保守侧）。
+    --   ⇒ 菜单文案同步（epub 20MB / 其他 32MB）。
+    --   ⇒ 注意：放宽的只是**默认值**，不是护栏逻辑。超过 20MB 的 epub 在
+    --     KPW4 上仍属「可能 OOM」的边缘区，拒绝逻辑照旧触发；
+    --     想更保守可随时把「降级触发大小」改回 12MB 或 8MB。
+    --   37k-epub-20mb
+    --
+    -- ★ 37l-manual-threshold-input（用户反馈：「自己改指的是可以自己输入数值」）
+    --
+    --   用户原话：「那个自己改指的是可以自己输入数值，内存耗电以及bug都排查一下」
+    --   ⇒ 之前「降级触发页数 / 大小」只能**点一下加一档**循环，用户要的是
+    --     **直接用键盘敲任意数值**。
+    --
+    --   ⇒ 两个阈值入口改为 InputDialog（数字键盘）：
+    --     · 弹出输入框，当前值预填，键盘输入任意整数；
+    --     · 框内仍提供常用档位按钮（点一下填入，仍可再手改）；
+    --     · 页数合法区间 100 ~ 10,000,000，大小 1 ~ 100,000 MB；
+    --     · 大小填 0 或点「按格式默认」= 清除设置，回到 epub 20MB / 其他 32MB；
+    --     · 非法输入（非整数 / 越界）当场提示，不写设置、不关框。
+    --   ⇒ 移除 cycleDowngradePages / cycleDowngradeMb（点一下加一档的旧形态）。
+    --   37l-manual-threshold-input
+    --
+    -- ★ 37m-flush-integrity（审阅 37l 时发现的数据落盘缺口）
+    --
+    --   背景：37l 之后又做了一轮「写盘批量化」优化（saveSetting 攒到第 8 次
+    --   才执行，降低老设备 CPU/GC 抖动）。这轮审阅发现它带来两个落盘缺口：
+    --
+    --   ① `_finishPageTimer` 的 force 分支（force_flush=true、_active_page==nil）
+    --      只落盘「已读状态 + 笔记」，**漏了全局统计**
+    --      ⇒ 用户停在同一页时按电源键挂起，全局统计增量留在内存；
+    --        挂起后若被内核杀进程 ⇒ 这段阅读记录丢失。
+    --      修：补上 `_saveGlobalStats(true)`，与 onCloseDocument 三连对齐。
+    --
+    --   ② `_syncGlobalBook` 硬编码 `_saveGlobalStats(false)`，调用者无法强制落盘
+    --      ⇒ 新增第 5 个参数 `force_flush`（与 _saveReadState/_syncNotes 一致），
+    --        并把两处「必须立刻可见」的调用点改为 true：
+    --          · `_resyncBookFromCache`（重置后恢复，用户重置完就想看到）
+    --          · 扫描收尾 `_syncGlobalBook(read_state, false, path, nil, true)`
+    --        （`onReaderReady` 的存量同步保持 false —— 开书时攒批即可）
+    --
+    --   顺带保留 37l 之后的 3 处性能优化（非本次新写，属既有代码）：
+    --     · _saveGlobalStats / _saveReadState 的 saveSetting 批量化
+    --     · 整书精确路径补上 MAX_TRACKED_PAGES 容量闸门（此前只有逐页路径有）
+    --     · 整书路径释放大字符串 whole + 一次增量 GC
+    -- ★★★ 37n-threshold-dialog-and-effect（用户两条反馈，第二条是**真 bug**）
+    --
+    --   用户原话：
+    --     「设置mb限制的时候没必要给选项，只需要取消默认确定就可以了，
+    --       以及设置之后并没有生效」
+    --
+    --   (1) ★ 两个阈值输入框**去掉档位快捷按钮**
+    --       用户嫌那一排 8/12/20/32/50/100/200/500（页数那排 5k~200k）占地方。
+    --       ⇒ `editDowngradeMb` / `editDowngradePages` 只留三个按钮：
+    --           取消 = 不保存；默认 = **直接落盘**恢复默认并关框；确定 = 保存输入值。
+    --       ★ 「默认」不再是「把输入框填成 0 让用户再点确定」——那既多一步，
+    --         又容易让人以为点了没反应（就是下面 (2) 那类误判的来源）。
+    --         现在点「默认」= `applyDowngradeMb(0)` / `applyDowngradePages(DEFAULT)`
+    --         立即写设置 + 关框 + 弹提示。
+    --       ⇒ 旧常量 `DOWNGRADE_MB_STEPS_INPUT` / `DOWNGRADE_PAGE_STEPS` 一并删除。
+    --
+    --   (2) ★★★ 修「设置之后并没有生效」（根因，37j~37m 一直存在）
+    --       现象：用户在菜单里把「降级触发大小」改成别的值，再去点
+    --             「统计全书字数」，什么都没变 —— 既没按新阈值拒绝、也没降级，
+    --             只弹一句「已使用缓存结果」，看着就像设置根本没写进去。
+    --       根因：主菜单「统计全书字数」调的是 `startCountFromMenu(false)`，
+    --             而 `startCountFromMenu` 在 **`force_rescan == false` 时会先查缓存**，
+    --             命中就直接 `return`（只弹「已使用缓存结果」）。
+    --             而两个阈值的读取与判断全部在 `startCount()` 里 ——
+    --             **那个函数压根没被调用** ⇒ 改设置当然「不生效」。
+    --             这是「缓存短路」把「设置生效路径」整个吃掉的结构性问题，
+    --             不是阈值读写写错了。
+    --       修法：显式点「统计全书字数」= 用户明确要求**现在重新统计一次**
+    --             ⇒ 该菜单项改传 `startCountFromMenu(true)`，跳过缓存直接进
+    --             `startCount()`，用户设的页数/大小阈值立刻参与判断。
+    --             （与 37h 的「统计本书字数」入口口径统一 —— 那里早就是 true。）
+    --       ★ 统计页的自动起扫（`showStatisticsDashboard`）**保持 false**：
+    --         它只在 `readCachedCount` 已 miss 时才走到，缓存已 invalid，
+    --         再传 true 只是白扫一遍，没有意义。
+    --
+    --   (3) ★ 阈值**回显**（让用户能自己确认「到底生效了没」）
+    --       新增 `WordCount:downgradeMbLimitText()`：
+    --         · 有自定义值 → 「N MB（自定义）」
+    --         · 没设     → 「epub 20 MB / 其他 32 MB（按格式默认）」
+    --       三处复用：菜单标签 `downgradeMbLabel`、开关切换提示
+    --       `toggleDowngradeEnabled`（原文案只报了页数，现在两个阈值都报）。
+    --
+    --   防回归：`_verify/manual_threshold_input_37l.lua` 新增 D/E/F 三组
+    --     （D：两框都无 shortcuts / 无 setInputText；E：「统计全书字数」必须
+    --       传 true 且不得传 false、统计页那条仍为 false；F：回显函数与接线），
+    --     共 59 条断言。
+    -- ★★★ 37o-submenu-and-hard-guard-fix
+    --
+    --   用户两条反馈：
+    --     ①「单位显示、统计模式都可以进入下级页面进行选择，比点一下切换方便」
+    --     ②「我设置的是30，但还是20触发的降级」（→ **真 bug**）
+    --
+    --   (1) ★ 三个「点一下循环切换」全部改成 **radio 二级菜单选择**
+    --       · 单位显示：auto / 完整数字 / 优先万单位
+    --       · 统计模式：完整扫描 / 抽页估算
+    --       · 大书处理方式：超限直接取消 / 超限转抽样估算
+    --       另把两个阈值（页数 / 大小）收进「降级触发阈值」二级菜单，
+    --       一级菜单少占两行。
+    --       写法照上游 `common_settings_menu_table.lua:genGenericMenuEntry`：
+    --         `radio = true` + `checked_func` + `callback`。
+    --       ★ 坑：子项**不要**设 `keep_menu_open` —— touchmenu.lua:896 是
+    --         「有 checked_func 就自动 updateItems() + 保持打开」，
+    --         显式设反而走不到那条分支，勾选状态不即时更新。
+    --       被替换掉的旧函数：`cycleUnitFormat` / `cycleScanMode` /
+    --         `toggleDowngradeEnabled`（后者删除，逻辑并入子菜单 callback）。
+    --       新增：`setUnitFormat` / `setScanMode` / `unitFormatMode` /
+    --         `unitFormatSubMenu` / `scanModeSubMenu` / `downgradeModeSubMenu` /
+    --         `downgradeThresholdSubMenu` / `downgradeThresholdLabel`。
+    --
+    --   (2) ★★★ 修「降级触发大小设 30 却还是 20 触发」—— 根因是**两条阈值线不一致**：
+    --       · `startCount()` 判「拒绝/降级」用的是 `downgradeBytes()` → **读用户设置** ✅
+    --       · `prepareDocument()` 判「探不到页数就不 render」用的是
+    --         `hugeFileThreshold()` → **写死 epub 20MB** ❌
+    --       ⇒ 21~30MB 的书在 prepareDocument 就被判 huge、探不到页数直接拒绝，
+    --         连 startCount 都进不去 ⇒ 用户看到「设了跟没设一样」。
+    --       修法：新增 `hardRenderGuardBytes(path)`，硬保护线**跟随用户设置，
+    --         但封顶在按格式的默认红线**：
+    --           用户设得更小（12MB）→ 用用户的（更保守，安全）；
+    --           用户设得更大（30MB）→ 封顶 20MB（epub 默认红线不放宽）。
+    --       ★ 为什么必须封顶：那条红线对应「crengine 全量 render 多占 ~130MB、
+    --         512MB 的 KPW4 有 OOM 风险」这个物理事实，是安全边界，
+    --         不能让一个设置项把它突破 —— 否则用户调大阈值就等于把设备
+    --         推回「卡顿然后重启」。
+    --         放宽的部分交给 `startCount`：那里有用户显式打开的「超限转抽样」，
+    --         超限退到只读前 N 页，不吃 render 的 130MB。
+    --       4 处调用点改掉：prepareDocument 判定 + 三处 huge_document 提示文案
+    --         （文案必须报**实际生效**的线，否则用户看到「我设 N 它说 M」）。
+    --
+    --   防回归：
+    --     · `huge_book_guard_37i.lua` 新增 H 组（hardRenderGuardBytes 存在、
+    --       读用户设置、封顶、prepareDocument 不再直接用 hugeFileThreshold）
+    --       + I 组（**行为等价重演**：未设置/更小/更大/相等/极小 六种取值）。
+    --     · `sample_estimate.lua` G 组改钉二级菜单形态（cycleScanMode 必须消失）。
+    --     · `manual_threshold_input_37l.lua` F 组改钉降级子菜单、
+    --       并断言 toggleDowngradeEnabled 已消失。
+    -- ★★★ 37p（文件管理器顶部菜单归属）
+    --
+    --   用户反馈：「这个插件能不能放到顶部菜单第一个，就是有书籍状态和排序依据的那个」
+    --   （追问确认 → **文件管理器顶部菜单**）
+    --
+    --   ★ 机制（关键，别再踩）：插件在该菜单里的归属**不是自由坐标**，
+    --     而是由 `sorting_hint` 指定一个**已有分组名**，再由
+    --     `MenuSorter:mergeAndSort("filemanager", menu_items, order)` 按
+    --     `ui/elements/filemanager_menu_order.lua` 里声明的分组顺序摆放。
+    --     ⇒「插到某两项之间 / 排第一个」在插件侧**做不到**；
+    --        插件能做的只有**换分组**。
+    --     · 设置分组 → 与 sort_by / show_filter / reverse_sorting 同组
+    --                  ＝「排序依据」所在的那一带 ✅（本轮改到这里）
+    --     · 工具分组 → 37o 及以前的位置
+    --
+    --   本轮改动：`menu_items.word_count.sorting_hint` 由「工具」改为「设置」，
+    --     单点改动，其余不动。
+    --
+    -- ★ 1.0 → 1.1（bug 排查轮）
+    --
+    --   用户：「排除 bug」。做了一轮**行为级**排查（不再只做静态字符串匹配），
+    --   新增两个真正执行源码的测试文件，抓出并修掉两个真 bug：
+    --
+    --   (1) ★★ 单位格式化跨文件不一致（用户直接看得见）
+    --       `bookshelf_integration.lua:formatUnits` 在 wan 模式下、字数 < 1万 时
+    --       会落到 `return ...万` 分支，把 **1234 字显示成「0.1万」**；
+    --       而统计页 `statistics_page.lua:formatCount` 同条件下显示「1,234」。
+    --       ⇒ 同一本书的字数在两处显示不同。
+    --       修法：逐分支照抄 formatCount 的判定顺序，补上 n<10000 的回退分支。
+    --       防回归：新增 `unit_format_consistency_37q.lua`（把两个实现的**真实
+    --         函数体抽出来 load 执行**，26 个 (值,模式) 组合逐一比对）。
+    --
+    --   (2) ★★ 「降级触发大小」回显不诚实（又一个「设了不生效」体感来源）
+    --       用户设 30MB，回显写「30 MB（自定义）」，但 epub 的物理安全线
+    --       封顶在 20MB（hardRenderGuardBytes）——25MB 的 epub 照样被拒，
+    --       用户盯着「30 MB」完全无法理解。
+    --       修法：`downgradeMbLimitText()` 在用户值 >= epub 线时，如实附注
+    --         「epub 实际按 20 MB 安全线」。
+    --
+    --   (3) 测试基础设施升级（防止同类问题再假绿）
+    --       · 新增 `menu_radio_behavior_37q.lua`：真加载插件、实例化 WordCount、
+    --         用 touchmenu 的真实调用约定驱动菜单 —— 首次验证了 **闭包捕获正确**
+    --         （三个单位/模式回调各落盘不同值，不是 all-last 那个经典 bug）。
+    --       · `huge_book_guard_37i.lua` I 组从「手写规则副本」改为**真执行源码里的
+    --         hardRenderGuardBytes**（副本会漂移 → 假绿），并加 2 个跨格式边界。
+    --
+    --   验证：20 个测试文件 / **673 断言全绿**。
+    --
+    -- ★ 1.1 → 1.2（阈值彻底放开 + 取消按钮 + 取消清缓存）
+    --
+    --   用户三条反馈：
+    --     ①「那个阈值问题，用户设置30，生效的还是20」
+    --     ②「顺便检查一下页面的是否也是这样」
+    --     ③「统计书籍的进度条加一个取消，点击的时候中断并清除未完成的缓存，
+    --        已完成的不清除（多选 5 本，统计到第 3 本取消 → 前两本保留，
+    --        第 3 本未完成的清除缓存）」
+    --     追问确认：「完全放开，允许 render」+「未完成的缓存都清理掉」。
+    --
+    --   (1) ★★★ 阈值**彻底放开**（用户设定值不再被任何默认红线封顶）
+    --       1.0/1.1 的 `hardRenderGuardBytes` 是「跟随用户设置但**封顶**在
+    --       格式默认红线（epub 20MB）」——用户设 30 实际只生效到 20，
+    --       反复反馈「设置项像摆设」。1.2 起改为：**用户设多少就是多少**。
+    --         · 设 30 → 30 生效（21~30MB 的 epub 不再被判 huge，直接走正常
+    --           render 路径，因为用户已明确选择「允许 render」）；
+    --         · 设 0 / 未设 → 回落按格式默认（epub 20 / 其他 32）。
+    --       代价（已如实告知并获用户确认）：超过默认红线后，若 loadDocument
+    --       + 3 次重试仍拿不到页数，会**真的 render**，KPW4 512MB 有 OOM 风险。
+    --       但那只是少数情况；绝大多数书 loadDocument 后就有页数，不会 render。
+    --       ⇒ 回显文案同步改为如实提示「已放宽」+ 风险，不再说「被封顶」。
+    --
+    --   (2) 页面（statistics_page.lua）**不受影响** —— 已核查：该文件
+    --       完全不涉及阈值判定 / 进度条 / 取消逻辑，它只负责展示。
+    --       阈值判定集中在 main.lua 的 startCount / prepareDocument 两处，
+    --       1.2 已把两处统一到同一个 `hardRenderGuardBytes`。
+    --
+    --   (3) ★★★ 进度条加「取消统计」按钮 + 取消时清未完成缓存
+    --       · `LiveProgressDialog` 新增 `cancel_callback` / `cancel_text`，
+    --         在进度条下方挂一个 ButtonTable（4 个创建点全部接线）。
+    --         ⚠ 不用上游的 `dismissable`（点任意处关闭）：那只关对话框、
+    --           **不中断扫描**，且全屏误触概率极高。
+    --         ⚠ `ButtonTable:new{...}` 是方法调用语法，不能直接当表达式传
+    --           给 pcall —— 必须包一层 function（踩过，语法错误）。
+    --       · 新增 `removeCachedCount(path)`：删某本书的缓存（全局 KEY_CACHE
+    --         里删那一条 + DocSettings sidecar 三个键），**其余条目原样保留**
+    --         （绝不能整表清空 —— 那会把已完成的书也清掉）。
+    --       · `cancelCount()` 在置 nil 之前，先把「未完成的那本」的缓存清掉：
+    --         `_job.path` / `_preparing_single._wordcount_path` /
+    --         `_batch.paths[1]` / `_batch.dialog._wordcount_path` /
+    --         `_batch_preparing._wordcount_path`。
+    --         ★ 顺序很关键：wipe 必须在 `_job/_batch = nil` **之前**跑，
+    --           否则那时已拿不到 path（写了清缓存代码却一次都不执行）。
+    --       · 对话框上新增 `_wordcount_path` 字段（准备阶段与批量推进时都要更新）。
+    --
+    --   防回归：新增 `_verify/cancel_clears_incomplete_cache_12.lua`（31 断言），
+    --     **真加载插件** + 构造真实批量内景 + 调 cancelCount，断言：
+    --       已完成的两本缓存**保留**（含 count 原值）、当前未完成那本**被清除**、
+    --       未开始的无缓存、空任务取消不碰缓存、4 个对话框全有 cancel_callback。
+    --   验证：21 个测试文件 / **707 断言全绿**。
+    --
+    -- ★ 1.2 → 1.3（排 bug 轮：又挖出 4 个真 bug，其中 3 个是 1.2 引入的）
+    --
+    --   用户只说了两个字「排 bug」。于是把 1.2 新加的全部路径（阈值放开、
+    --   取消按钮、取消清缓存）连同既有路径重审了一遍，挖出 4 个真 bug：
+    --
+    --   (A) ★★ 阈值判据三处不一致（0 值会导致「降级说超大、硬保护说不大」）
+    --       `hardRenderGuardBytes` 用 `v and v > 0`，而
+    --       `downgradeBytes` 用裸 `if v`、`downgradePages` 用 `if v or DEFAULT`。
+    --       一旦设置里出现 0（手输 0 / 旧数据 / 负数）：
+    --         · downgradeBytes → **0 字节** ⇒ `size > 0` **恒真**
+    --           ⇒ 连 200KB 的小书都被判「超大」（允许降级→全变抽样；
+    --              禁止降级→**全部被拒绝统计**，整本书都统计不了）。
+    --         · 同时 guard 走的是 20MB 默认 ⇒ 两处阈值语义分裂。
+    --       三条路径统一为 `v and v > 0`。
+    --       （`applyDowngradeMb` 本来就把 0 解释成「恢复默认」并 delSetting，
+    --         所以这是纵深防御：任何来源的 0/负值都不再污染判定。）
+    --
+    --   (B) ★★★ 取消时清错书的两处（**直接违背用户需求**）
+    --       (B1) `cancelCount()` 的 wipe 无条件传 `self.ui.doc_settings` ——
+    --            那是**当前打开着的那本书**的 settings。批量扫 C 时取消、
+    --            而用户正在读 A ⇒ **删掉 A 的 count/mtime/size**（A 字数消失、
+    --            要重扫），而真正该清的 C 的 sidecar 一点没动。两个方向都错。
+    --            修：wipe 里先校验 `ui.document.file == path`；同时
+    --            `removeCachedCount` 内部再验一次 settings 的归属
+    --            （读 `settings.file`，对不上就自己 `DocSettings:open(path)`）。
+    --       (B2) ★★★ 批量分支用 `batch.paths[1]` 当「当前正在处理的那本」——
+    --            但 `_startNextBatch` 一进来就 `table.remove(batch.paths, 1)`，
+    --            所以「正在扫 C」时 `paths[1]` 其实是**下一本 D**。
+    --            ⇒ 取消会**误删 D 的缓存**（D 用户根本没碰过；若 D 有之前
+    --               统计好的有效缓存，就等于破坏了「已完成必须保留」）；
+    --               而该清的 C 只能靠 dialog 兜底才侥幸对上。
+    --            修：以 `batch.dialog._wordcount_path` 为**主**来源（它在打开文档
+    --            成功后赋成当前这本），`paths[1]` 降级为「两边都为空时才用」
+    --            的兜底（那只可能是「一本都还没开始」）。
+    --
+    --   (C) ★★ `startCount` 四条早退路径**漏关后台文档** ⇒ 反复触发会 OOM
+    --       `startCountForPath` / `_startNextBatch` 会先
+    --       `openPreparedDocument(path)` 打开一本后台文档（已 loadDocument，
+    --       KPW4 上几十~上百 MB，且是 crengine 的 FFI 内存、Lua GC 回收不及时），
+    --       再交给 `startCount(doc, path, ...)`。而四条早退路径
+    --       （已有任务 / 无路径 / 文档不支持 / 页数<1）以前只 close 对话框，
+    --       **从不 close 那本文档** ⇒ 每次早退漏一本，批量反复触发即 OOM。
+    --       修：抽出 `close_override_doc()`，四条早退路径全部调用；
+    --       判据与 `refuse_reason` 分支一致（**绝不关「用户正在读」的那本**）。
+    --
+    --   (D) ★ 阈值回显与实际的最后一点不一致（1.0/1.1 遗留的措辞）
+    --       1.2 已彻底不封顶，回显文案 OK；本轮顺带核对了
+    --       `downgradeMbLimitText` / `refuse_reason` 文案用的都是
+    --       `hardRenderGuardBytes` / `downgradePages()` 的实际生效值，无残留。
+    --
+    --   防回归（断言数 707 → **760**）：
+    --     · `huge_book_guard_37i.lua` 新增 **J 组（23 断言）**：
+    --       把**真实** `downgradeBytes` / `downgradePages` /
+    --       `hardRenderGuardBytes` 注入**同一个沙盒**执行，断言
+    --       「设 0 / 设负数 → 三者一律回落默认」且「guard 与
+    --       downgradeBytes 结果**完全相等**」——这才是「口径一致」的真实证据
+    --       （分开注入两份桩会假绿）。
+    --     · `cancel_clears_incomplete_cache_12.lua` 新增 **K 组（12 断言，共 62）**：
+    --       用可观测 DocSettings 桩复刻「正在读 A、正在扫 C」，
+    --       断言 A 的 count **没被误删**、C 的**确实被删**；
+    --       并把批量内景改成**真实语义**（paths 里第一个是「下一本」），
+    --       断言下一本的缓存**保留**（D6b/D6c —— 旧代码会误删它）。
+    --     · 同文件新增 **L 组（9 断言）**：行为验证早退时后台文档被 close、
+    --       且**不关**用户正在读的那本；源码层面断言四条早退路径都接线。
+    --   验证：21 个测试文件 / **760 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.4（用户原话：「不显示取消按钮啊，现在多选统计不生效了」+ crash (13).log）
+    --
+    --   用户拿 crash.log 报了两个**看起来无关、实际是两个独立真 bug**的问题：
+    --
+    --   bugM —「不显示取消按钮」。日志里反复出现
+    --        WARN WordCount: 取消按钮创建失败（ButtonTable 不可用）
+    --   真因：`LiveProgressDialog:init()` 里用了 `Screen:getWidth()`，但 main.lua
+    --   **从来没定义过 Screen**（也没 require device.screen）。于是
+    --        attempt to index global 'Screen' (a nil value)
+    --   抛在包裹 `ButtonTable:new{...}` 的那个 pcall 里 ⇒ 被 pcall 吞掉 ⇒
+    --   走到 else 分支 ⇒ 用户只看到「按钮没出来」，日志里也只留一句万能文案。
+    --   ★ 为什么静态扫描没抓到：check_plugin.py 把 `Screen` 当上游全局放行。
+    --   修法：① 顶部 `local Device = require("device")` + `local Screen = Device.screen`；
+    --        ② else 分支改成 `logger.warn(... .. tostring(btn_table))`，把真实异常
+    --           写进 crash.log（以后再出问题能一眼看到根因，不用猜）。
+    --   验证：cancel_clears_incomplete_cache_12.lua 新增 **M 组（12 断言，共 74）**，
+    --        在**去注释**的源码上断言 Screen 声明存在、且声明前无裸用；
+    --        断言失败日志带真实错误对象、按钮挂进 _progress_group 并清 dimen。
+    --
+    --   bugN —「多选统计不生效」。日志里 `batch_mode=true` 出现 46 次，但
+    --   `startBatchCount` / `_startNextBatch` **一次都没有** ⇒ 说明用户点的是
+    --   **Bookshelf 的 bucket 批量菜单**，而插件往那个菜单里注入的
+    --   「统计选中字数」按钮**从来没出现**（所以只能退化成一本本单独点）。
+    --   两个叠加的原因：
+    --     (a) 老代码 `pcall(require, "lib/bookshelf_bulk_actions")` 失败时
+    --         **静默 return**（`if not ok ... then return end`）—— 连一行日志都没有。
+    --         KOReader 的 PluginLoader 用 **dofile**（不是 require）加载插件，
+    --         `lib/?.lua` 是**所有插件 dofile 完之后**才追加进 package.path 的
+    --         （pluginloader.lua:283-287）；跨插件 require 的成败取决于当时的
+    --         路径状态，并不可靠。
+    --     (b) 形状判据写窄了。真实 Bookshelf（本地
+    --         E:/kindle越狱/Koreader/plugins/bookshelf.koplugin/lib/
+    --         bookshelf_bulk_actions.lua）的批量对话框是 6 行：
+    --           {collections, rating} / status_row(4) / {favorite, refresh} /
+    --           {remove_history}(单) / {reset, delete} / {cancel, apply}
+    --         单按钮行在**第 4 行**，不在第一行；老代码里那句
+    --         「#buttons[1] == 1」恰好判 false ⇒ 永远不注入。
+    --   修法（**两条腿走路**，任一条成功即可用）：
+    --     腿1 `wrapBulkActionsShow`：先查 `package.loaded["lib/bookshelf_bulk_actions"]`，
+    --         再 require；失败**必记 logger.warn**；形状判据放宽为
+    --         「>=6 行 且 存在任一单按钮行 且 末行 >=2 按钮」。
+    --     腿2 `installBulkMenuButtonPatch`：直接挂 `BookshelfWidget._openBulkMenu`，
+    --         在原生批量对话框弹出后的下一 tick 往栈顶 ButtonDialog 里补按钮。
+    --         这条路**完全不依赖 require("lib/...")**，因为 widget 那条 require
+    --         在本插件里本来就是成的（日志已证明 hasFileDialogPluginRows=true）。
+    --   验证：新增 `bookshelf_bulk_hook_13.lua`（**36 断言**）——A 源码级两条腿+
+    --         不再静默；B 用**真实 6 行布局**跑形状判据（旧代码在此判 false）；
+    --         C/D 行为级分别单测两条腿（按钮插到 Cancel/Apply 之上、点击回调
+    --         拿到选中路径、幂等不重复插）；E 诊断打点。
+    --   结论：21 个测试文件 → **22 个 / 790 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.5（用户原话：「单本统计正常，一旦多选就不行了，另外进度条的框怎么在最上方」）
+    --
+    --   用户报了两个问题。★ 关键线索：「**单本统计正常**」—— 这一句把嫌疑范围
+    --   从「批量引擎」直接排除掉了（引擎能跑单本，说明扫描/缓存/对话框都好的）。
+    --
+    --   bugQ —「一旦多选就不行了」（真因 = 第三种忙状态被漏掉）
+    --
+    --     真相：`_preparing_single` 是**第三种忙状态** ——「正在打开文档、
+    --     还没开扫」。单本入口 `startCountForPath()` 打开一本 epub 要**几十秒**
+    --     （KPW4 上开 2000+ 页的书更久），这期间它只持有 `_preparing_single`，
+    --     而 `_job` 和 `_batch` **都还是 nil**。
+    --       ① 用户点单本统计（打开中）；
+    --       ② 等不耐烦，切去多选，点「统计选中字数」；
+    --       ③ `startBatchCount` 守卫只查 `self._job or self._batch` ⇒ 都 nil
+    --          ⇒ **判定「没有任务」，照常起批**；
+    --       ④ 单本那条还在途的 nextTick 回调也只看 `_job/_batch` ⇒ 同样
+    --          判「空的」⇒ 也继续跑，把 doc 交给 startCount；
+    --       ⑤ 两个任务同时抢 UIManager 的对话框栈 + 同一批文档对象 ⇒
+    --          界面错乱、「多选不生效」。
+    --     修法：把「有没有任务在跑」**收敛成一个函数** `isBusy(self)`，
+    --           **四个状态一起查**（_job / _batch / _batch_preparing /
+    --           _preparing_single）；单本与批量两条入口都用它。
+    --           ⚠ 必须是 `local function` 且定义在所有调用点**之前**
+    --              （Lua 不做前向提升）。
+    --       · 单本在途的 nextTick 回调里，判据要**排除自己**（自己就是
+    --         _preparing_single），否则用统一 isBusy() 会把自己也算进去
+    --         ⇒ 回调永远早退 ⇒ 单本统计直接废掉。用
+    --         `other_preparing = self._preparing_single ~= preparing`。
+    --       · 批量入口的阻塞文案要**区分场景**：卡在「正在打开」时明确告诉
+    --         用户等的是哪一本，否则他会以为插件坏了。
+    --       · 批量入口的交接守卫也补上 `_batch_preparing`，并在早退时
+    --         **关掉 preparing 对话框 + 把刚打开的 doc 还回去**（否则
+    --         对话框在栈上残留、crengine 内存泄漏）。
+    --     验证：新增 `batch_e2e_15.lua`（**39 断言**）—— A 从真实源码抽出
+    --           startBatchCount/_startNextBatch/_batchAlive/**isBusy** 并编译；
+    --           C~G 是**真跑起来的端到端**（3 本全跑完、缓存命中不打开文档、
+    --           超大书跳过不中断、取消立停、去重/空表）；H 组专门验 bugQ：
+    --           源码级断言 isBusy 查全四个状态 + 两个入口都用它，
+    --           行为级断言「单本在途时批量**不建立批次**」（旧代码会建立）。
+    --
+    --   bugP —「进度条的框怎么在最上方」
+    --
+    --     真因：`LiveProgressDialog:init()` 追加取消按钮时写了
+    --        `self.dimen = nil`（外层），本意是「逼命中区域按新尺寸重算」。
+    --     但 `dimen` **身兼两职**（对照 widgetcontainer.lua:49-76 paintTo）：
+    --       ① `align == "center"` 时用 `(self.dimen.h - contentSize.h)/2`
+    --          算**垂直偏移** ⇒ 需要 dimen.h 是**整屏**高；
+    --       ② 事件命中区域。
+    --     上游 `ProgressbarDialog:init()` 里正是
+    --        `self.align = "center"` + `self.dimen = Screen:getSize()`（整屏）。
+    --     把外层 dimen 置 nil ⇒ paintTo 里 `if not self.dimen then
+    --        self.dimen = Geom:new{...content_size...} end` 用**内容尺寸**重建
+    --     ⇒ dimen.h == 内容高 ⇒ 偏移恒为 0 ⇒ **框贴屏幕最顶端**。
+    --     修法：**保留整屏 dimen**（定位不变），只清**内层 FrameContainer**
+    --           的 dimen（那才是命中测试真正用的那个，追加按钮后必须清掉，
+    --           否则按钮「看得见、点不到」）。
+    --     验证：`cancel_clears_incomplete_cache_12.lua` 新增 **N 组（7 断言，共 81）**
+    --           —— 在**去注释**的源码上断言外层 `self.dimen = nil` 已彻底消失、
+    --           外层 dimen 被重建为整屏、内层 frame.dimen 仍被清。
+    --   结论：22 个测试文件 → **23 个 / 846 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.6（用户原话：「为什么会跳过两本，书籍大小很小啊」）
+    --
+    --   用户的直觉是对的：**跳过与书的大小完全无关**。批量里「跳过」有 4 条
+    --   独立入口，其中 **3 条在 1.6 之前是完全静默的** —— 用户只看到汇总的
+    --   「跳过 2 本」，既不知道是**哪两本**，也不知道**为什么**，只能来问。
+    --
+    --   bugR — 三条静默的跳过路径：
+    --
+    --     ① `openPreparedDocument` 返回 nil（打不开：文件损坏 / 编码坏 /
+    --        扩展名与实际不符）。旧代码只有 `huge_document` 那条会写状态行，
+    --        普通打开失败**一个字都不说**就 skipped+1。
+    --     ② `pages < 1` 或「无可提取文本」（getPageText 缺失且无 CRE 取文
+    --        接口）—— epub 结构异常 / 纯图片书（无文本层）会落这里。
+    --        ★ **书小 ≠ 能排版**，这正是「书很小却被跳过」最反直觉、也最
+    --        可能是用户遇到的那一条。
+    --     ③ `try_start` 等上一本收尾 `MAX_BUSY_RETRY`(20)×0.25s = **5 秒**
+    --        后 `self._job` 仍被占着 ⇒ 直接把这本书当「跳过」扔掉。
+    --        ★★ 这一条是**真正的高发路径**：跳过与书本身**毫无关系**，
+    --        纯粹是「上一本的异步收尾迟迟不放开 _job」—— 而让 _job 被
+    --        长期占住的上游元凶，正是 1.5-bugQ 修掉的「单本 + 批量打架」。
+    --        ⇒ 小书反而更容易中招（本该秒过，却因为排队被丢）。
+    --
+    --   修法（让「跳过」不再是个黑盒）：
+    --     · 三条路径全部补上 `logger.warn`（含 path / 原因 / pages / 能力探测）；
+    --     · 新增 `batch.skip_reasons` 明细表，每条记「原因：书名」；
+    --     · 结束汇总从光秃秃的「跳过 N 本」升级为
+    --         「跳过 N 本 + 跳过明细：<原因：书名> ×最多 5 条（超出折叠）」；
+    --       且有跳过时提示框停留 8 秒（足够看清），无跳过时**不显示明细段**。
+    --       实测输出形如：
+    --         批量统计完成：成功 1 本，跳过 1 本
+    --
+    --         跳过明细：
+    --         无法分页：/books/nopage.epub
+    --     · 状态行文案按原因区分：已跳过（无法打开 / 无法分页 /
+    --       无可提取文字 / 等待超时 / 文件过大）。
+    --
+    --   验证：`batch_e2e_15.lua` 新增 **I 组（14 断言，共 50）** ——
+    --         I1~I5 源码级（4 条路径都记 skip_reasons、都落 logger.warn、
+    --         汇总含「跳过明细」、明细最多 5 条防盖满屏）；
+    --         I6/I10~I13 行为级（跳过后批次仍正常结束；汇总**点名**被跳过的
+    --         那一本 + 带明细段）；I14 无反例噪音（无跳过时不显示明细）。
+    --   结论：23 个测试文件 / **829 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.7（同一问题的**真根因** —— 拿到 crash(14).log 后定位）
+    --
+    --   1.6 先把「跳过」从静默变成「报出是哪本、为什么」（那是必要的可见性修复）。
+    --   但日志给出了**真正的机制**：
+    --
+    --     `pages==0, retrying prepareDocument` 在整份日志里出现 **12 次，
+    --     12 次都靠重试拿到了真实页数**（81 / 316 / 444 / 1456 / 2948 … 页）。
+    --
+    --   ⇒ 「`loadDocument` 之后第一次 `getPageCount()` 返回 0」是
+    --     **crengine 惰性分页的常态，与书的大小完全无关** —— 小书一样先返回 0。
+    --
+    --   ☠ 对照两条路径，发现**严重的不对称**：
+    --     · 单本入口 `startCountForPath` 对此有显式补刀：
+    --         if pages < 1 then
+    --             logger.info("...pages==0, retrying prepareDocument")
+    --             prepareDocument(doc)          -- ← 再 prepare 一次
+    --             pages = pageCount(doc)
+    --         end
+    --     · **批量入口 `_startNextBatch` 从来没有这段** ⇒ 只要某本恰好是
+    --       「loadDocument 后还没算出页数」的，就**直接被判 pages<1 跳过**。
+    --       一次批量跳过 2 本 = 恰好有 2 本撞上这个时序。
+    --
+    --   ★★ 为什么「书小」反而更容易中招（用户的直觉其实指向了真相）：
+    --     小书 load 快 ⇒ `prepareDocument` 返回得也快 ⇒ **更容易在 crengine
+    --     尚未完成惰性分页时就去取页数**；大书 load 耗时久，等它返回时
+    --     页数往往已经算好了。所以「小书被跳过」不是巧合，是时序必然。
+    --
+    --   修法：把单本那套「补刀重试」**原样搬到批量路径**，而且给到**两次**：
+    --     第一次重试：`prepareDocument(doc)`（覆盖绝大多数惰性分页）
+    --     第二次重试：再来一次（覆盖「render 之后才出页数」的书）
+    --   两次都仍为 0 才判跳过 —— 此时也确实是「真取不到页数」了。
+    --
+    --   验证：`batch_e2e_15.lua` I 组扩到 **21 断言（共 57）**，关键三条：
+    --     · I1b/I1c/I1d 源码级：批量路径有补刀 + 二次重试，单本路径的重试仍在
+    --       （两侧口径一致，防止只修一半）；
+    --     · **I15~I18 行为级（真根因复现）**：harness 新增「惰性分页」文档桩
+    --       （`zero_page_reads`：第一次 prepare 后 `getPageCount` 仍返回 0，
+    --       第二次才就绪）。用 2 本惰性书 + 1 本正常书跑批量 ⇒
+    --       **成功 3 本、跳过 0 本**（旧代码此处的期望值是「跳过 2 本」,
+    --       与用户报的现象一字不差）。
+    --   结论：23 个测试文件 / **836 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.8（两条用户新诉求：「本数阈值可调」+「点统计要清缓存重算」）
+    --
+    --   ① 「多选书籍统计没必要放阈值限制」→ 采纳为**用户可调**。
+    --      原先是写死的常量 `BATCH_SAMPLE_THRESHOLD = 5`：只要一次多选 ≥5 本，
+    --      不管每本多小，整批都被强制切成「抽样估算」。用户觉得这条限制多余。
+    --      改法：
+    --        · 新增 `batchSampleThreshold()` 读全局设置
+    --          `word_count_batch_sample_threshold`（默认 5，**0 = 关闭**）；
+    --        · 两处生效点（startBatchCount 的提示、startCount 的自动降级）
+    --          都改用该函数，并用「> 0」守卫（0 时彻底不降级）；
+    --        · 菜单加一行「多选本数阈值：N 本起改用估算 / 已关闭（多选也精确）」，
+    --          点进去弹输入框（取消 / 默认 / 确定，与页数/大小阈值同款）。
+    --      ⇒ 想在多选时也要精确数字，把阈值设 0 即可。
+    --
+    --   ② 「点击统计为什么不会清理之前的缓存并开始重新统计」→ 显式统计**先清缓存再重扫**。
+    --      老行为有两个坑：
+    --        · 单本 `force_rescan` 只**跳过读取**缓存，旧缓存**仍留在**存储里 ——
+    --          中途取消/扫描失败后旧值还在，下次又命中 ⇒ 用户以为「重算无效」；
+    --        · 批量里每本先 `readCachedCount`，命中就跳过（计 completed）⇒
+    --          用户选了「想重算」的一批，结果大半被判「有缓存」直接跳过，一本没重算。
+    --      改法：
+    --        · 单本：`force_rescan` 时先 `removeCachedCount(path)` 再扫；
+    --        · 批量：`startBatchCount` 开头**逐本** `removeCachedCount`（保留其他未选中
+    --          的书），并给 batch 打 `force_rescan = true`；
+    --        · `_startNextBatch` 的 cache HIT 跳过用 `if not batch.force_rescan` 包住
+    --          （双保险：即使某本清理失败也会真扫）。
+    --
+    --   验证：`batch_e2e_15.lua` 新增 **J 组（11）+ K 组（8）**，并把 D 组改写为
+    --     「显式统计 = 清缓存重算」；`batch_index.lua` 的 C4 窗口改为「到下一个
+    --     function」自适应边界。
+    --   结论：23 个测试文件 / **857 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 1.9（四条用户新诉求，对应开发代号 37r）
+    --
+    --   ① 「单位切换可以有完整数字，k，千，以及万，分别换算为各自的方式」
+    --      ⇒ 单位显示从 3 档扩到 **5 档**：自动 / 完整数字 / k / 千 / 万。
+    --        · k   ：每 1000 记 1k（358000 → 358k，1500 → 1.5k），不足 1000 显示完整数字；
+    --        · 千  ：每 1000 记 1千（358000 → 358千，1500 → 1.5千），同上；
+    --        · 万  ：始终用万（358000 → 35.8万）；
+    --        · 完整数字：358,000（千分位）；
+    --        · 自动：不足 1 万完整数字，1 万以上万，1 亿以上亿。
+    --      「自动」选项**后面加了介绍**（二级菜单每项都带 desc 说明）。
+    --      ⚠ 单位格式化在本插件里有**三份**实现（main.lua 的 UNIT_FORMAT_OPTIONS /
+    --        bookshelf_integration.lua 的 formatUnits / statistics_page.lua 的
+    --        formatCount），任何一处漏改都会出现「书架显示 35.8万、统计页显示 358000」。
+    --        三处的分支顺序与判据必须逐字一致，由 `unit_format_consistency_37q.lua`
+    --        直接执行**真源码**守住。
+    --
+    --   ② 「批量统计时书名过长会超到进度框外面去」+「下一本还是上一本过长的书名」
+    --      根因是两条叠加：
+    --        · `VerticalGroup:getSize()` 把 `_size` / `_offsets` **永久缓存**，
+    --          `FrameContainer:paintTo()` 又把 `dimen` 的 w/h 在第一次绘制时定死
+    --          ⇒ 外框尺寸停留在「标题还短的时候」；标题换成超长书名后，
+    --          文字按 max_width 画到 992px 宽，而外框还是旧的小框 ⇒ **画到框外**。
+    --        · `_refreshRegion()` 只按**当前**尺寸算重绘区域。换到短书名后框变小，
+    --          上一帧多出来的那截落在新区域之外 ⇒ e-ink 上**永远不会被重绘**，
+    --          屏幕上就留着上一本书的长书名。
+    --      改法：
+    --        · 新增 `shortBookName()` —— 按 **UTF-8 首字节**计数截到 22 字 + 「…」。
+    --          纯字节算术，不依赖字体度量（真机 `max_width` 截断依赖每字形 advance，
+    --          字体缺失 / 上游改实现就会失效，一失效就是画到框外）；
+    --        · 新增 `LiveProgressDialog:_invalidateLayout()` —— 文本真的变了就同时
+    --          作废 `VerticalGroup` 的布局缓存（调上游公开的 `resetLayout()`）和
+    --          内层 `FrameContainer.dimen`；**绝不动外层 self.dimen**（它兼着
+    --          「居中基准 + 命中区」两个职责，1.5-bugP 踩过）；
+    --        · `_redraw()` 的重绘区域改成「上一帧 ∪ 这一帧」（`unionRegion`），
+    --          并集最多是两块对话框的包络，仍远小于整屏，省电优化不受影响；
+    --        · `setBatchInfo()` 早退分支不再静默 return，会刷一次标题把书名擦掉；
+    --        · `_pushText()` 的槽位选择从 `(cond) and a or b` 改成显式 if/else ——
+    --          旧写法在 `_title_widget` 为 nil 时会把**标题写进副标题控件**；
+    --        · 新增 `onCloseWidget()` 清掉 `_last_region` 等残留（对话框整批复用）。
+    --
+    --   ③ 「阅读统计统计图都用实心的条条」⇒ 柱状图去掉空心描边，全部实心；
+    --      **保留选中态**：选中柱实心黑，其余实心浅灰。
+    --
+    --   ④ 「选择年份用左右箭头切换可以，点击年份直接选择年份也可以」
+    --      ⇒ 年份那行文字从「点了跳月份粒度」改为直接弹**年份选择框**
+    --        （`StatisticsPage:showYearPicker()`，ButtonDialog 每行 3 个，
+    --        当前年带 ✓，无数据的年份标「（无）」，左右箭头照旧）。
+    --        年份列表由新增的 `GlobalStats.availableYears()` 提供（扫 `store.days`
+    --        键的前 4 位 + 锚点年 + 当前年，倒序）。
+    --
+    --   验证：`dialog_survives.lua` 新增 8a~8i 组（书名截断 / 两层缓存作废 /
+    --     重绘区域并集 / 槽位不串，含反证），`menu_radio_behavior_37q.lua` 单位项
+    --     扩到 5 档并断言 desc 齐全、五个回调写入五个**不同**的值，
+    --     `unit_format_consistency_37q.lua` 扩到 k/千 边界 + 「四种写法互不相同」。
+    --     另做了**四组反向验证**：分别把截断、`_invalidateLayout`、`unionRegion`、
+    --     早退刷新改回旧写法，测试都**变红**（证明断言不是假绿）。
+    --
+    -- ★★★ 1.9 补充：**Bookshelf 跨大版本兼容性验证**（用户问「bookshelf 更新后
+    --   还能用吗」）。
+    --
+    --   背景：本插件的三项 Bookshelf 集成全部挂在它的**内部接口**上，而用户设备
+    --   上是 Bookshelf **3.10.9**，上游已经是 **5.3.1**（跨了 4、5 两个大版本）。
+    --   光看文档回答不了这个问题，所以直接把 5.3.1 的真源码拉下来跑。
+    --
+    --   ① 占位符（%word_count / %word_count_read / %word_speed）
+    --      依赖：`lib/bookshelf_tokens` 的 `expanders` / `CATALOGUE` / `expand`。
+    --      ⇒ 5.3.1 里三个符号**都还在**，结构也没变；自带 token 从 3.10.9 的
+    --        78 个涨到 82 个。`tokenNamesByLengthDesc()` 的**永久缓存**策略
+    --        一字未改（注释仍写着「no expanders are added after this file
+    --        finishes loading」—— 上游明确假设没有第三方往 expanders 里加东西，
+    --        而我们正是这么干的）。
+    --      ⇒ 因此**两种时序都要成立**，测试里都断言了：
+    --        · 时序A（正常）：插件先注册 → 缓存建立时包含我们的 token → 原生路径直接展开；
+    --        · 时序B（最坏）：Bookshelf 先渲染焊死缓存 → 我们再注册 → **靠我们自己
+    --          包裹的 `Tokens.expand` 兜底**。
+    --        反证：去掉那段包裹后，时序A 仍绿而**时序B 全红（14 条）** ——
+    --        精确证明这段代码不是冗余，删了就会有用户看到字面量 `%word_count`。
+    --      ⇒ 5.3.1 新增的两套语法也覆盖到了：`[if:token]` 条件（走
+    --        `valueForCondition` 直接查 expanders，不吃缓存）和 `%<token>` 定界
+    --        语法（sentinel 去掉后由我们的包裹接管），以及 `Tokens.menuPreview`。
+    --
+    --   ② 单本菜单「统计本书字数」：包裹 `BookshelfWidget._fileDialogPluginRows`。
+    --      ⇒ 5.3.1 里这个函数的**语义变了**（从「Bookshelf 生成自己的插件行」
+    --        变成「收集 FileManager.file_dialog_added_buttons 里其他插件注册的
+    --        按钮」），而且**会返回 nil**（没有别的插件注册时）。我们的包裹用
+    --        `or {}` 兜住，仍然有效。
+    --      ⇒ 消费侧契约没变：`ipairs(plugin_rows)` → `ipairs(row)` →
+    --        `spec.text` / `spec.callback`。我们返回的结构完全匹配。
+    --      ⚠ 但**外观变了**：5.3.1 把插件行渲染成「Plugin actions」分组下的
+    --        **chip 按钮**（横向流式排布），不再是 3.10.9 的普通菜单行。
+    --        功能不受影响，用户会看到位置/样式变化。
+    --
+    --   ③ 批量菜单「统计选中字数」：两条腿（包裹 `BulkActions.show` +
+    --      挂 `BookshelfWidget._openBulkMenu`）。
+    --      ⇒ 5.3.1 里 `BulkActions.show` 仍**同步** `ButtonDialog:new`（腿1 有效）；
+    --        `_openBulkMenu` 仍**同步**调用 `BulkActions.show`（腿2 依赖「原实现
+    --        返回时栈顶就是那个对话框」，仍成立）；`Selection:paths()` /
+    --        `Selection:exitMode()` / `bw:_rebuild()` 都还在。
+    --      ⇒ 对话框从 3.10.9 的 **6 行**变成 **7 行**，而且单按钮行从「第 4 行」
+    --        挪到了「第 1 行」（新增 `{ select_all }`）。我们的形状判据
+    --        （`#rows >= 6` 且有单按钮行且末行 ≥2）**新旧都命中**；
+    --        1.2 那版「假设单按钮行在第一行」的写法在新版反而会错。
+    --      ⇒ 真跑 5.3.1 的 `BulkActions.show`，捕获它交给 ButtonDialog 的
+    --        `buttons`，注入后是 `#1 #2 #4 #2 #2 #2 #1 #2`（摘掉我们那行即
+    --        原生 `#1 #2 #4 #2 #2 #2 #2`），我们的行落在 Cancel/Apply 之上。
+    --
+    --   验证：新增 `compat_bookshelf_531.lua`（40 断言）与
+    --     `compat_bookshelf_bulk_531.lua`（28 断言），夹具是 5.3.1 的**真源码**
+    --     （`_verify/bs531/`，由 run_tests.py 临时复制到 `_bs531/` 并在跑完删掉，
+    --     不进交付 zip）。另加 11 条**上游契约源码检查**（针对 1.26MB 的
+    --     `bookshelf_widget.lua` —— 没法低成本跑起来，只能对契约字符串断言）；
+    --     反证过：把 `spec.callback` / `_fileDialogPluginRows` / `Selection:paths()`
+    --     任一处改名，检查都会**变红**。
+    --   结论：25 个测试文件 / **985 断言全绿** + 静态扫描 0 错 0 警
+    --     + 11 条上游契约检查全 OK。
+    --
+    -- ★★★ 37s：**趋势图柱顶显示数值** + **柱子加粗**（用户两条诉求）
+    --
+    --   用户原话：
+    --     「阅读统计，每根实心柱上方显示对应数据值」
+    --     「实心柱可以粗一点」
+    --
+    --   一、柱顶数值标签（statistics_page.lua 新增 chartValueLabels /
+    --       buildChartWidget / metricBarLabel / barPixelHeight / labelMetrics）
+    --     · 每根柱子顶上标一个**紧凑数值**：走 metricBarLabel，**不带单位后缀**
+    --       （单位 Y 轴刻度已经给过；横向空间是「能不能每根都标」的唯一瓶颈）。
+    --       ⚠ 数值口径仍走 formatCount，与卡片/刻度/Y 轴完全一致。
+    --     · 铺排用**贪心**（不是「隔 n 根标一个」）：从**当前选中那根**出发，
+    --       向左右各扫一遍，只要跟上一个已放置的标签不重叠（留 gap）就放。
+    --       理由有二：① 标签宽度不齐（「0」一位、「29.5万」宽一倍多），
+    --       固定步长只能按最宽的留空，白白丢掉一堆放得下的位置；
+    --       ② 从选中柱出发 ⇒ 点了哪根就一定能看到它的数。
+    --       实测（KPW4 度量，见下）：日 8→13、月 7→8、年 6→7 个标签。
+    --     · 放不下时宁可**少标几根**，也绝不让两个数字叠在一起 —— 那是不可读。
+    --     · 标签外面套一层白底 FrameContainer —— 图上有虚线网格，文字直接压上去
+    --       会从笔画缝里透出灰点。
+    --     · labelMetrics 缓存每个标签的宽高：贪心必须逐个量宽，而本页每次
+    --       点柱子/切指标都会重建；缓存后重建几乎零成本（KPW4 单核，省电）。
+    --     · ★ 关键实现选择：**不给图加高**。图仍是 4*row_h，仍由
+    --       `HorizontalGroup{align="center"}` 居中在 6*row_h 的带里 ——
+    --       图上、图下各空出约一行（KPW4 上 62px）。最高的柱子顶到图顶时，
+    --       它的标签 y ≈ -(标签高+间距) ≈ -35，正好落进**上方那块本来就空着**
+    --       的区域。于是 x 轴刻度行、周期导航、翻页栏的位置**一行都没动**。
+    --       ⚠ 约束：标签高 + 间距 必须 ≤ 图上方那一行（KPW4 上约 41 ≤ 62）。
+    --         以后若把 faces().value 的字号调大，必须重新核这个约束，
+    --         否则标签会顶到标题上。
+    --     · 柱高与标签 y 共用同一个 barPixelHeight（含同样的 +0.5 取整与
+    --       最小高度规则）—— 两处各写一份公式的话，标签迟早和柱顶错开。
+    --
+    --   二、柱子加粗：bar_w 由 `slot * 0.6` 改成 `slot * 0.8`
+    --       （柱间空隙 40% → 20%）。只影响观感，不影响标签铺排（那边只看 x）。
+    --
+    --   验证：新增 `chart_value_labels_37s.lua`（41 断言，全部跑**真实函数体** +
+    --     一层尺寸可预测的控件桩，因此几何断言与设备 DPI 无关）。
+    --     反证过：把两处防重叠判断都拆掉 → 31 根时标签**确实叠在一起**（E1d），
+    --     证明 C7 不是摆设；C10 断言贪心必须**多于**固定步长（宽度不齐的数据下
+    --     12 > 5），谁改回固定步长立刻红；E2 盯着 barPixelHeight 的出现次数
+    --     （定义 1 次 + 调用 2 次），谁把公式抄一份也立刻红。
+    --   另外用 `_verify/preview_chart_37s.py` 按 KPW4 真实度量（dpi 300 →
+    --     scaleBySize ≈ 1.875）**复刻渲染**了一遍四种周期的趋势图，
+    --     用于肉眼验收 + 量出上面那组「标签数」数字（测试断言不了「好不好看」）。
+    --   结论：26 个测试文件 / **1026 断言全绿** + 静态扫描 0 错 0 警。
+    --
+    -- ★★★ 37t：**年份切换改成「胶囊 + 竖排列表」**（对齐第三方补丁）
+    --
+    --   用户原话：
+    --     「年份切换按照补丁 2-reading-insights-popup02.lua 里的点击切换方式改」
+    --   用户选定方案（三选一里选的第一条）：
+    --     「胶囊年份 + 竖排列表」
+    --
+    --   一、`buildPeriodNav` 第 1 行的年文字 → **胶囊按钮**
+    --       （statistics_page.lua，对齐补丁 `buildYearHeader`）：
+    --     · 文字左右各留 `Size.padding.large`，外面套 `FrameContainer`
+    --       （bordersize = sbs(1)、radius = sbs(7)、边框色 `Blitbuffer.COLOR_GRAY_E`）
+    --       ⇒ 用户一眼就知道「这里能点」，不再是一块看不出可点的粗体字。
+    --     · ⚠⚠ 边框色字段是 **`color`**，**不是** `bordercolor`
+    --       （upstream framecontainer.lua:29 声明 `color`、:139
+    --        `paintBorder(..., self.color, ...)`）。写成 `bordercolor` 会被
+    --       **静默忽略**、落回默认黑框 —— 本文件另有 7 处写的就是 `bordercolor`
+    --       （都是 `COLOR_BLACK`，恰好等于默认值才一直没暴露）。
+    --       新测试用**反证**盯死了这个坑（见下 C2）。
+    --     · 触摸热区仍是**整条中间带**（外层 `FixedBox` 撑满 `width - 2*arrow_w`），
+    --       比胶囊本身大得多 —— 手指没那么准，这样更好按。
+    --     · ★ 「累计」周期**不画**胶囊、也不套 TapBox：没有年份可选，
+    --       画成按钮会误导用户去点。测试 A20~A24 盯死这一条。
+    --     · 左右两侧的**裸箭头**完全不动（用户之前明确说过
+    --       「箭头样式不是自己选择的，你做好固定的就可以」）。
+    --
+    --   二、`showYearPicker()` 弹窗 → **一行一个年份**的竖列表
+    --       （对齐补丁 `year_button_tap_dialog`）：
+    --     · 原来是「一行 3 格」的网格（`per_row = 3`），补丁是
+    --       `buttons = { {a}, {a}, ... }` —— 每条自己一行。改成竖排后，
+    --       年份一多也不会挤成小方块，手感与补丁一致。
+    --     · 加 `shrink_unneeded_width = true`（补丁同款）：弹窗收到
+    --       「刚好放下最宽那行」那么窄。底层是 ButtonTable 的收缩逻辑
+    --       （upstream buttontable.lua:143-168），下限 `shrink_min_width`
+    --       = sbs(100) = 188px。
+    --     · 加 `modal = true`（补丁同款）：盖住统计浮窗，点击不穿透。
+    --     · 标签只留**纯数字**（补丁是 `text = i`）：去掉「年」后缀（竖排里
+    --       纯属噪声）和「（无）」后缀（每行长短不一）。当前年补一个 `✓`
+    --       作选中反馈 —— 用户之前专门问过「有选中效果吗」。
+    --       `GlobalStats.availableYears()` 仍返回 `has_data`，想加回「无数据」
+    --       标记随时可以。
+    --     · ⚠ 年份可能不少（数据年份 ∪ anchor 年 ∪ 今年），但不用担心溢出：
+    --       ButtonDialog 在内容高于屏幕时自己套 ScrollableContainer 并**整行**
+    --       翻页（upstream buttondialog.lua:186-233）。
+    --     · ★ 保留 `local year = item.year` 的**值捕获**：`self:reload` 是在
+    --       `for` 里建的闭包，而**设备上的 LuaJIT 是 Lua 5.1 语义 —— 循环变量
+    --       所有迭代共用同一个**（Programming in Lua §6.1 的经典陷阱），
+    --       不捕获的话点任何一个年份都会跳到**最后那一年**。测试 C1 盯死。
+    --
+    --   验证：新增 `year_picker_37t.lua`（**58 断言**）。
+    --     同样跑**真实函数体** + 一层「记录构造过程」的控件桩：
+    --       A 组（24 条）断言控件树形状：胶囊包在
+    --         `TapBox → FixedBox → FrameContainer → HorizontalGroup` 里、
+    --         边框/圆角/`color` 字段/两侧留白宽度都对，点它真的调到
+    --         `showYearPicker()`，而「累计」那行**一个 FrameContainer 都没有**。
+    --       B 组（22 条）断言弹窗结构：N 个年份 = N 行、每行恰好 1 个按钮、
+    --         `shrink_unneeded_width`/`modal` 都在、标签是纯数字、
+    --         点第 k 个按钮跳到**第 k 个**年份（delta = -1 / -5）、
+    --         「当前年」那格不 reload、1 个年份 / 0 个年份 / 12 个年份都不崩。
+    --       C 组（12 条）是**反证**，证明上面的断言不是摆设：
+    --         C1 把「每个按钮捕获自己的年份」改成共享一个变量 →
+    --            **3 个按钮全部**跳到同一年（delta 全 -5），B13 立刻能发现；
+    --         C2 把 `color` 写成 `bordercolor` → 胶囊边框色变 **nil**，A10 立刻能发现。
+    --     ⚠⚠ C0 是一条**VM 语义自检**，写这类反证前必须先看它：
+    --        **fengari(Lua 5.3) 的 for 循环每次迭代都是新绑定**（实测 1,2,3），
+    --        而**设备上的 LuaJIT(Lua 5.1) 是所有迭代共用一个变量**（会是 3,3,3）。
+    --        ⇒ 「删掉值捕获、直接引用循环变量」这种反证在 fengari 上
+    --          **复现不出 bug**，必须**显式造一个共享 upvalue**才与设备同语义。
+    --        （本测试的 `extract_fn` 只认**顶格**的 `\nlocal function ` ——
+    --          `buildPeriodNav` 内部那个缩进的 `stepArrow` 不会被误当结束标记。）
+    --   结论：27 个测试文件 / **1084 断言全绿** + 静态扫描 0 错 0 警
+    --     + 11 条上游契约检查全 OK。
+    --
+    -- ★★★ 1.0（正式发布）
+    --
+    --   版本号定为 **1.0**：这是本插件对外发布的第一版。
+    --
+    --   为什么从 1.9 回到 1.0：上面 1.1 ~ 1.9 是**开发过程中的内部迭代号**
+    --   （每修一批 bug 就 +0.1），一路涨到 1.9 只是「改了多少轮」的计数，
+    --   不是对外版本语义。用户反馈「版本号一直变、分不清哪个是正式版」，
+    --   所以这里收敛成 1.0 —— 从此 **只有对外发版才动这个号**。
+    --
+    --   上面 1.1 ~ 1.9 的记录**原样保留**，作为改动溯源（排查老问题时能对上
+    --   用户当时装的是哪一轮）。
+    --
+    --   ⚠ 以后发版只改两处：本行的 version + run_tests.py 的 VERSION/VARIANT。
+    --     `run_tests.py --pack` 会校验 zip 里的 `version = "..."` 与 VARIANT 一致，
+    --     改漏一处直接报错。
+    version = "1.0",
+}
