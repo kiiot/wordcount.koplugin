@@ -1093,24 +1093,30 @@ local function buildTrendList(buckets, metric, selected_index, width)
     local row_h = Screen:scaleBySize(34)
     for i, bucket in ipairs(buckets) do
         local is_selected = (i == selected_index)
-        local color = Blitbuffer.COLOR_BLACK
+        local color = is_selected and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
         local left = text(tostring(bucket.label), f.axis, { color = color, bold = is_selected })
         local right = text(metricValueText(bucket.value, metric), f.footer, { color = color, bold = is_selected })
         local left_w = left:getSize().w
         local right_w = right:getSize().w
         local filler = math.max(0, width - left_w - right_w - Screen:scaleBySize(8))
-        group[#group + 1] = FixedBox:new{
-            width = width,
-            height = row_h,
-            align = "left",
-            vertical_align = "center",
+        local row = FixedBox:new{
+            width = width, height = row_h,
+            align = "left", vertical_align = "center",
             HorizontalGroup:new{
-                align = "center",
-                left,
+                align = "center", left,
                 HorizontalSpan:new{ width = filler },
                 right,
             },
         }
+        if is_selected then
+            row = FrameContainer:new{
+                width = width, height = row_h,
+                bordersize = 0, padding = 0, margin = 0,
+                background = Blitbuffer.COLOR_BLACK,
+                row,
+            }
+        end
+        group[#group + 1] = row
     end
     return group
 end
@@ -1168,8 +1174,8 @@ local function buildCardContent(spec, inner_width)
     -- ★★★ 41-no-card-icon：**卡片左侧的小图标删掉了**（用户：「总览页的卡片
     --   不要图标」）。
     --   · 删的是行首那个 `icon(spec.icon, ...)`。行尾那个 `chevron.right`
-    --     **保留** —— 它是「这张卡能点进去下钻」的**唯一**线索（卡片没有
-    --     边框、没有按钮外观），和行首那个纯装饰性图标不是一回事。
+    --     **保留** —— 它明确提示「这张卡能点进去下钻」；浅灰描边只划分卡片边界，
+    --     不表达点击动作。它和行首那个纯装饰性图标不是一回事。
     --   · 顺带把 `icon_size` 和它参与的 max_width 算术一起收掉：标签文字
     --     现在直接从卡片内边距起排，可用宽度多了 icon_size + 5px
     --     （KPW4 上 15+5 经 scaleBySize 后约 33px）——
@@ -1181,7 +1187,7 @@ local function buildCardContent(spec, inner_width)
     --     那等于把图标换成了空白，用户要的是**标签整体靠左**。
     local label_row = HorizontalGroup:new{ align = "center" }
     label_row[#label_row + 1] = text(spec.label, f.label, {
-        color = Blitbuffer.COLOR_BLACK,
+        color = Blitbuffer.COLOR_DARK_GRAY,
         max_width = inner_width - Screen:scaleBySize(20),
     })
     if spec.drill then
@@ -1197,7 +1203,7 @@ local function buildCardContent(spec, inner_width)
         delta_row = HorizontalGroup:new{
             align = "center",
             text(spec.delta_text, f.delta, {
-                color = Blitbuffer.COLOR_BLACK,
+                color = Blitbuffer.COLOR_DARK_GRAY,
                 max_width = inner_width,
             }),
         }
@@ -1443,7 +1449,7 @@ local function wrapCard(content, card_width, card_height, style, on_tap)
                     content,
                 },
                 HRule:new{ width = card_width, height = border,
-                    color = Blitbuffer.COLOR_BLACK, dotted = true },
+                    color = Blitbuffer.COLOR_GRAY_E, dotted = true },
             },
         }
     elseif style == "plate" then
@@ -1501,7 +1507,7 @@ local function wrapCard(content, card_width, card_height, style, on_tap)
                 --   用户要求「不选中有边框，不要填充颜色」，这里统一给卡片描边，
                 --   底色一律纯白（不再用任何灰底）。
                 bordersize = border,
-                color = Blitbuffer.COLOR_BLACK,
+                color = Blitbuffer.COLOR_GRAY_E,
                 padding = pad,
                 margin = 0,
                 content,
@@ -1669,13 +1675,13 @@ function DrillDownPopup:build()
                 FixedBox:new{ width = right_w, height = row_h,
                     align = "right", vertical_align = "center",
                     text(right, faces().footer, { color = Blitbuffer.COLOR_BLACK,
-                        max_width = right_w }) },
+                        max_width = right_w, bold = true }) },
             },
         }
         -- 行间点线（最后一行不画）
         if _i < #self.rows then
             body[#body + 1] = HRule:new{ width = content_w, height = line_w,
-                color = Blitbuffer.COLOR_BLACK, dotted = true }
+                color = Blitbuffer.COLOR_GRAY_E, dotted = true }
         end
     end
 
@@ -2235,7 +2241,7 @@ function StatisticsPage:build()
     self.popup_frame = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE,
         bordersize = Screen:scaleBySize(2),
-        bordercolor = Blitbuffer.COLOR_BLACK,
+        color = Blitbuffer.COLOR_GRAY_E,
         radius = Screen:scaleBySize(12),
         padding = 0,
         margin = 0,
@@ -2276,8 +2282,8 @@ end
 ---   反而没有这个问题（所以只有周期排看起来脏）—— 但两排观感不一致。
 ---
 ---   现在两排统一走标准分段控件：
----     · 外框**只画一圈**（2px 黑边 + `radius` 圆角 + 白底）；
----     · 格子内部**不画边框**，格与格之间插一条 2px 黑竖线（单线，不叠）；
+---     · 外框**只画一圈**（浅灰描边 + `radius` 圆角 + 白底）；
+---     · 格子内部**不画边框**，格与格之间插一条浅灰竖线；
 ---     · 选中格填黑，圆角取 `radius - 边宽` ⇒ 贴到两端时正好与外框内缘吻合，
 ---       不会在角上露出白缝。
 local function buildSegmentedRow(opts)
@@ -2295,7 +2301,7 @@ local function buildSegmentedRow(opts)
     local row = HorizontalGroup:new{ align = "center" }
     for i, it in ipairs(items) do
         if i > 1 then
-            -- 分隔线：一个填黑的窄条。
+            -- 分隔线：浅灰窄条，避免和黑底选中项争抢注意力。
             -- ⚠ `FrameContainer` 必须有子控件（`getSize()` 会取 `self[1]`），
             --   所以塞一个 1×1 的 `FixedBox` 占位；实际尺寸由 `width/height` 决定。
             row[#row + 1] = FixedBox:new{
@@ -2303,16 +2309,21 @@ local function buildSegmentedRow(opts)
                 FrameContainer:new{
                     width = sep_w, height = inner_h,
                     bordersize = 0, margin = 0, padding = 0,
-                    background = Blitbuffer.COLOR_BLACK,
+                    background = Blitbuffer.COLOR_GRAY_E,
                     FixedBox:new{ width = 1, height = 1 },
                 },
             }
         end
-        local label = text(it.label, it.face, {
-            color = it.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-            bold = it.active,
-            max_width = math.max(1, cell_w - Screen:scaleBySize(6)),
-        })
+        local label
+        if it.icon then
+            label = icon(it.icon, Screen:scaleBySize(16), { white = it.active })
+        else
+            label = text(it.label, it.face, {
+                color = it.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+                bold = it.active,
+                max_width = math.max(1, cell_w - Screen:scaleBySize(6)),
+            })
+        end
         local inner = FixedBox:new{
             width = cell_w, height = inner_h,
             align = "center", vertical_align = "center", label,
@@ -2345,7 +2356,7 @@ local function buildSegmentedRow(opts)
         FrameContainer:new{
             width = width, height = height,
             bordersize = border,
-            color = Blitbuffer.COLOR_BLACK,
+            color = Blitbuffer.COLOR_GRAY_E,
             radius = radius,
             margin = 0, padding = 0,
             background = Blitbuffer.COLOR_WHITE,
@@ -2620,9 +2631,22 @@ function StatisticsPage:buildPeriodNav(width, range_label)
     --     · 中间簇始终居中，与第 1 行「年」对齐。
     if not disabled and month_day_label then
         local md_text = text(month_day_label, f.footer, { bold = true })
+        local md_pill = FrameContainer:new{
+            bordersize = Screen:scaleBySize(1),
+            color = Blitbuffer.COLOR_GRAY_E,
+            radius = Screen:scaleBySize(7),
+            margin = 0,
+            padding = 0,
+            HorizontalGroup:new{
+                align = "center",
+                HorizontalSpan:new{ width = Size.padding.small },
+                md_text,
+                HorizontalSpan:new{ width = Size.padding.small },
+            },
+        }
         -- 中间簇：日‹ + [tiny] + 月日 + [tiny] + 日›
         --   点文字下钻到「日」（保留 37c 手感）。
-        local md_text_widget = md_text
+        local md_text_widget = md_pill
         if not disabled then
             -- ★★★ 43-pickers：点第 2 行文字 = 弹**当前粒度**的选择器。
             --
@@ -2637,7 +2661,7 @@ function StatisticsPage:buildPeriodNav(width, range_label)
             --   ⚠ 第 2 行左右两个**日**箭头、最外端两个**月**箭头的行为
             --     一个字都没动（它们仍是精确翻格）；这里只是把「中间那块文字」
             --     从「切粒度」改成「弹选择器」。
-            md_text_widget = TapBox:new{ md_text, on_tap = function()
+            md_text_widget = TapBox:new{ md_pill, on_tap = function()
                 self:showPeriodPicker(self.period)
                 return true
             end }
@@ -2768,7 +2792,7 @@ function StatisticsPage:buildCardStyleRow(width)
         local target = style.value
         row[#row + 1] = FrameContainer:new{
             width = btn_w, height = btn_h,
-            bordersize = Screen:scaleBySize(1), bordercolor = Blitbuffer.COLOR_BLACK,
+            bordersize = Screen:scaleBySize(1), color = Blitbuffer.COLOR_GRAY_E,
             radius = Size.radius.button,
             background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
             padding = 0,
@@ -3097,42 +3121,33 @@ function StatisticsPage:buildUnitsPage(width)
     --------------------------------------------------------------------------
     -- 排序行：字数 / 最近阅读 / 书名（沿用 32 的黑底反白选中样式）
     --------------------------------------------------------------------------
-    local sort_row = HorizontalGroup:new{ align = "center" }
     local sorts = {
         { value = "units", label = _("字数") },
         { value = "date", label = _("最近阅读") },
         { value = "title", label = _("书名") },
     }
-    local sort_cell_w = math.floor((width - Size.padding.small * 2) / 3)
+    local sort_items = {}
     for i, item in ipairs(sorts) do
-        if i > 1 then sort_row[#sort_row + 1] = HorizontalSpan:new{ width = Size.padding.small } end
-        local active = sort == item.value
         local target = item.value
-        sort_row[#sort_row + 1] = FrameContainer:new{
-            width = sort_cell_w,
-            height = Screen:scaleBySize(36),
-            bordersize = Screen:scaleBySize(1), bordercolor = Blitbuffer.COLOR_BLACK,
-            radius = Size.radius.button,
-            background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
-            padding = 0,
-            TapBox:new{
-                FixedBox:new{ width = sort_cell_w, height = Screen:scaleBySize(36),
-                    align = "center", vertical_align = "center",
-                    text(item.label, Font:getFace("cfont", 17), {
-                        color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-                        bold = active,
-                    }) },
-                -- 换排序时**回到第 1 页**（排序变了，页码不再有意义）
-                on_tap = function()
-                    if target ~= self.unit_sort then
-                        self:reload{ unit_sort = target, view = "units", unit_page = 1 }
-                    end
-                    return true
-                end,
-            },
+        sort_items[i] = {
+            label = item.label,
+            face = Font:getFace("cfont", 17),
+            active = sort == target,
+            on_tap = function()
+                -- 换排序时回到第 1 页（排序变了，页码不再有意义）。
+                if target ~= self.unit_sort then
+                    self:reload{ unit_sort = target, view = "units", unit_page = 1 }
+                end
+                return true
+            end,
         }
     end
-    group[#group + 1] = sort_row
+    group[#group + 1] = buildSegmentedRow{
+        width = width,
+        height = Screen:scaleBySize(36),
+        radius = Size.radius.button,
+        items = sort_items,
+    }
     group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
 
     --------------------------------------------------------------------------
@@ -3164,7 +3179,7 @@ function StatisticsPage:buildUnitsPage(width)
             HorizontalGroup:new{
                 align = "center",
                 text(T(_("第 %1 / %2 页"), page, total_pages),
-                    faces().footer, { color = Blitbuffer.COLOR_BLACK }),
+                    faces().footer, { color = Blitbuffer.COLOR_DARK_GRAY, bold = true }),
                 HorizontalSpan:new{ width = Size.padding.small },
                 FixedBox:new{ width = math.max(0, width - Screen:scaleBySize(120)),
                     height = Screen:scaleBySize(30), align = "right", vertical_align = "center",
@@ -3183,8 +3198,28 @@ function StatisticsPage:buildUnitsPage(width)
     -- （row_h / line_w 已在函数开头按可用高度算好，这里不再重复定义）
     if total_rows == 0 then
         group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-        group[#group + 1] = text(_("当前周期没有阅读字数记录"),
-            faces().footer, { color = Blitbuffer.COLOR_BLACK })
+        local empty_h = row_h * 2
+        local empty_padding = Size.padding.default
+        local empty_inner_w = math.max(1, width - 2 * empty_padding)
+        local empty_inner_h = math.max(1, empty_h - 2 * empty_padding)
+        group[#group + 1] = FrameContainer:new{
+            width = width, height = empty_h,
+            bordersize = Screen:scaleBySize(1),
+            color = Blitbuffer.COLOR_GRAY_E,
+            radius = Size.radius.window,
+            background = Blitbuffer.COLOR_WHITE,
+            padding = empty_padding,
+            margin = 0,
+            FixedBox:new{
+                width = empty_inner_w,
+                height = empty_inner_h,
+                align = "center", vertical_align = "center",
+                text(_("当前周期没有阅读字数记录"), faces().footer, {
+                    color = Blitbuffer.COLOR_DARK_GRAY,
+                    max_width = empty_inner_w,
+                }),
+            },
+        }
         return group
     end
 
@@ -3209,14 +3244,14 @@ function StatisticsPage:buildUnitsPage(width)
                 HorizontalSpan:new{ width = Size.padding.small },
                 FixedBox:new{ width = right_w, height = row_h,
                     align = "right", vertical_align = "center",
-                    text(value, faces().footer, { color = Blitbuffer.COLOR_BLACK,
+                    text(value, faces().footer, { color = Blitbuffer.COLOR_BLACK, bold = true,
                         max_width = right_w }) },
             },
         }
         -- 行间点线（本页最后一行不画，交给翻页栏上方的收口线）
         if _i < last_idx then
             group[#group + 1] = HRule:new{ width = width, height = line_w,
-                color = Blitbuffer.COLOR_BLACK, dotted = true }
+                color = Blitbuffer.COLOR_GRAY_E, dotted = true }
         end
     end
 
@@ -3336,48 +3371,41 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     end
 
     -- 标题行 + 图表/列表切换
-    local icon_size = Screen:scaleBySize(22)
+    local toggle_width = Screen:scaleBySize(58)
     local header = HorizontalGroup:new{ align = "center" }
     header[#header + 1] = text(title_text, f.section, {
         bold = true,
-        max_width = inner_w - 2 * icon_size - Size.padding.large,
+        max_width = inner_w - toggle_width - Size.padding.large,
     })
-    local spacer_w = math.max(0, inner_w - 2 * icon_size
+    local spacer_w = math.max(0, inner_w - toggle_width
         - Size.padding.large - header[1]:getSize().w)
     header[#header + 1] = HorizontalSpan:new{ width = spacer_w }
-    header[#header + 1] = IconButton:new{
-        icon = "column.three",
-        width = icon_size, height = icon_size, padding = 0,
-        show_parent = self,
-        -- ★★★ 43-no-flash：**必须** `allow_flash = false`（上游源码里的原话：
-        --   `allow_flash = true, -- set to false for any IconButton that may close
-        --   its container`）。
-        --
-        --   用户报的「点击阅读字数趋势后就没办法返回柱状图形式了」根因就在这：
-        --   `IconButton:onTapIconButton()`（upstream iconbutton.lua:101-147）在
-        --   flash 路径下会这么做 ——
-        --       1. 反色图标 + `setDirty(nil,"fast",图标矩形)` + forceRePaint
-        --       2. 恢复图标
-        --       3. **调用 callback**（也就是我们的 `reload`）
-        --       4. 再 `setDirty(nil,"fast",图标矩形)` + forceRePaint
-        --   第 4 步是关键：它把刷新队列里**塞了一个只有图标大小的矩形**。
-        --   而 `UIManager:_repaint()`（upstream uimanager.lua:1289-1294）的兜底
-        --   「画了东西却没有任何刷新请求 → 补一次全屏 partial」因此**不会触发**
-        --   ⇒ 新页面的像素已经画进帧缓冲，但只有那 40×40 的小方块被推给面板，
-        --     **整页看起来纹丝不动** —— 而 chart/list 两种模式下那个小方块长得
-        --     一模一样，所以「点了没反应」。
-        --   ⇒ 更坑的是 callback **真的执行了**：`trend_view` 已经被悄悄改成
-        --     "list"，只是屏幕没更新。于是用户以为「回不去柱状图」，
-        --     实际是「回得去，但整页不刷新」。
-        allow_flash = false,
-        callback = function() self:reload{ trend_view = "chart" } end,
-    }
-    header[#header + 1] = IconButton:new{
-        icon = "align.justify",
-        width = icon_size, height = icon_size, padding = 0,
-        show_parent = self,
-        allow_flash = false,   -- ★ 43-no-flash：同上
-        callback = function() self:reload{ trend_view = "list" } end,
+    header[#header + 1] = buildSegmentedRow{
+        width = toggle_width,
+        height = Screen:scaleBySize(28),
+        radius = Size.radius.button,
+        items = {
+            {
+                icon = "column.three",
+                active = self.trend_view ~= "list",
+                on_tap = function()
+                    if self.trend_view == "list" then
+                        self:reload{ trend_view = "chart" }
+                    end
+                    return true
+                end,
+            },
+            {
+                icon = "align.justify",
+                active = self.trend_view == "list",
+                on_tap = function()
+                    if self.trend_view ~= "list" then
+                        self:reload{ trend_view = "list" }
+                    end
+                    return true
+                end,
+            },
+        },
     }
 
     local section = VerticalGroup:new{ align = "left" }
@@ -3453,8 +3481,8 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     section[#section + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
     section[#section + 1] = HorizontalGroup:new{
         align = "center",
-            text(self:footerText(buckets, selected, metric), f.footer, {
-            color = Blitbuffer.COLOR_BLACK,
+        text(self:footerText(buckets, selected, metric), f.footer, {
+            color = Blitbuffer.COLOR_DARK_GRAY,
             max_width = inner_w,
         }),
     }
@@ -3549,7 +3577,7 @@ function StatisticsPage:buildMetricLegend(width)
                     width = cell_w - Size.padding.small, height = cell_h,
                     align = "left", vertical_align = "center",
                     bordersize = Screen:scaleBySize(1),
-                    bordercolor = Blitbuffer.COLOR_BLACK,
+                    color = Blitbuffer.COLOR_GRAY_E,
                     radius = Size.radius.button,
                     background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
                     padding = 0,
@@ -3807,6 +3835,72 @@ function StatisticsPage:showDayPicker(display_year, display_month)
     })) or 31
 
     local buttons = {}
+    local function closePicker()
+        if self.dialog then
+            UIManager:close(self.dialog)
+            self.dialog = nil
+        end
+    end
+    local function showMonthChoices(target_year)
+        local month_buttons = {}
+        local row = {}
+        for m = 1, 12 do
+            local label = string.format("%d月", m)
+            if target_year == year and m == month then label = label .. " ✓" end
+            local selected_month = m
+            row[#row + 1] = {
+                text = label,
+                no_vertical_sep = true,
+                callback = function()
+                    closePicker()
+                    self:showDayPicker(target_year, selected_month)
+                end,
+            }
+            if #row == 3 then
+                month_buttons[#month_buttons + 1] = row
+                row = {}
+            end
+        end
+        local ButtonDialog = require("ui/widget/buttondialog")
+        self.dialog = ButtonDialog:new{
+            title = T(_("%1年 - 选择月份"), target_year),
+            shrink_unneeded_width = true,
+            modal = true,
+            buttons = month_buttons,
+        }
+        UIManager:show(self.dialog)
+    end
+    local function showYearChoices()
+        local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
+        local calendar_anchor = os.time{
+            year = year, month = month, day = 1, hour = 12, min = 0, sec = 0,
+        }
+        local years = GlobalStats.availableYears(store, calendar_anchor)
+        local year_buttons = {}
+        for _i, item in ipairs(years) do
+            local choice_year = item.year
+            local label = tostring(choice_year)
+            if choice_year == year then label = label .. " ✓" end
+            year_buttons[#year_buttons + 1] = {
+                {
+                    text = label,
+                    callback = function()
+                        closePicker()
+                        self:showDayPicker(choice_year, month)
+                    end,
+                },
+            }
+        end
+        local ButtonDialog = require("ui/widget/buttondialog")
+        self.dialog = ButtonDialog:new{
+            title = _("选择年份"),
+            shrink_unneeded_width = true,
+            modal = true,
+            width_factor = 0.96,
+            buttons = year_buttons,
+        }
+        UIManager:show(self.dialog)
+    end
     local function showAdjacentMonth(month_delta)
         local target = os.time{
             year = year, month = month + month_delta, day = 1,
@@ -3814,16 +3908,13 @@ function StatisticsPage:showDayPicker(display_year, display_month)
         }
         local target_year = tonumber(os.date("%Y", target))
         local target_month = tonumber(os.date("%m", target))
-        if self.dialog then
-            UIManager:close(self.dialog)
-            self.dialog = nil
-        end
+        closePicker()
         self:showDayPicker(target_year, target_month)
     end
     local function showAdjacentYear(year_delta)
         showAdjacentMonth(year_delta * 12)
     end
-    local calendar_nav = {
+    local year_nav = {
         {
             text = "«",
             callback = function()
@@ -3832,20 +3923,9 @@ function StatisticsPage:showDayPicker(display_year, display_month)
             end,
         },
         {
-            text = "‹",
+            text = string.format("%d年", year),
             callback = function()
-                showAdjacentMonth(-1)
-                return true
-            end,
-        },
-        {
-            text = string.format("%d年%d月", year, month),
-            callback = function() return true end,
-        },
-        {
-            text = "›",
-            callback = function()
-                showAdjacentMonth(1)
+                showYearChoices()
                 return true
             end,
         },
@@ -3857,19 +3937,53 @@ function StatisticsPage:showDayPicker(display_year, display_month)
             end,
         },
     }
-    buttons[#buttons + 1] = calendar_nav
+    local month_nav = {
+        {
+            text = "‹",
+            callback = function()
+                showAdjacentMonth(-1)
+                return true
+            end,
+        },
+        {
+            text = string.format("%d月", month),
+            callback = function()
+                showMonthChoices(year)
+                return true
+            end,
+        },
+        {
+            text = "›",
+            callback = function()
+                showAdjacentMonth(1)
+                return true
+            end,
+        },
+    }
+    buttons[#buttons + 1] = year_nav
+    buttons[#buttons + 1] = month_nav
 
     local weekdays = { _("一"), _("二"), _("三"), _("四"), _("五"), _("六"), _("日") }
     local heading = {}
     for i, name in ipairs(weekdays) do
         heading[i] = {
             text = name,
+            no_vertical_sep = true,
             callback = function() return true end,
         }
     end
     buttons[#buttons + 1] = heading
 
     local row = nil
+    local function appendBlankCell()
+        row = row or {}
+        row[#row + 1] = {
+            text = " ",
+            enabled = false,
+            no_vertical_sep = true,
+            callback = function() return true end,
+        }
+    end
     local first_day = os.time{
         year = year, month = month, day = 1,
         hour = 12, min = 0, sec = 0,
@@ -3877,11 +3991,7 @@ function StatisticsPage:showDayPicker(display_year, display_month)
     local first_weekday = tonumber(os.date("%w", first_day)) or 0 -- Sunday = 0
     local leading_blanks = (first_weekday + 6) % 7
     for _i = 1, leading_blanks do
-        row = row or {}
-        row[#row + 1] = {
-            text = "",
-            callback = function() return true end,
-        }
+        appendBlankCell()
     end
     for d = 1, last_day do
         local label = tostring(d)
@@ -3892,6 +4002,7 @@ function StatisticsPage:showDayPicker(display_year, display_month)
         row = row or {}
         row[#row + 1] = {
             text = label,
+            no_vertical_sep = true,
             callback = function()
                 if self.dialog then
                     UIManager:close(self.dialog)
@@ -3912,13 +4023,17 @@ function StatisticsPage:showDayPicker(display_year, display_month)
             row = nil
         end
     end
-    if row then buttons[#buttons + 1] = row end
+    if row then
+        while #row < 7 do appendBlankCell() end
+        buttons[#buttons + 1] = row
+    end
 
     local ButtonDialog = require("ui/widget/buttondialog")
     self.dialog = ButtonDialog:new{
-        title = T(_("选择日期（%1年%2月）"), year, month),
+        title = _("选择日期"),
         shrink_unneeded_width = true,
         modal = true,
+        width_factor = 0.96,
         buttons = buttons,
     }
     UIManager:show(self.dialog)
