@@ -1807,5 +1807,61 @@ return {
     --   ⚠ 以后发版只改两处：本行的 version + run_tests.py 的 VERSION/VARIANT。
     --     `run_tests.py --pack` 会校验 zip 里的 `version = "..."` 与 VARIANT 一致，
     --     改漏一处直接报错。
-    version = "1.0",
+    --
+    -- ★★★ 1.0 → 1.1（闪退修复：sorting_hint 悬空）
+    --
+    --   用户原话：「一进书籍阅读，点顶部想调出菜单就闪退」+ 附 crash.log。
+    --
+    --   ☠ 崩溃（crash.log 原文；2026-10-08 19:59 起，10-10、10-11 各复现一次）：
+    --       ./luajit: frontend/ui/menusorter.lua:181: attempt to index local
+    --         'sorting_hint_menu' (a nil value)
+    --       stack traceback:
+    --         menusorter.lua:181 in 'mergeAndSort'
+    --         readermenu.lua:351 in 'orig_setUpdateItemTable'
+    --         patches/2-configurable-touchzones-v4.lua:390
+    --         patches/2-quick-settings-v9.lua:1118
+    --         plugins/pinyin_enhancement.koplugin/main.lua:670   ×N
+    --         readermenu.lua:462 '_getTabIndexFromLocation'   ← 用户「点了顶部」
+    --
+    --   ★ 根因（37p 引入；**与 37p 的诉求本身无关**）：
+    --     ① `addToMainMenu` 是**阅读器菜单与文件管理器菜单共用**的
+    --        （本插件没有 `is_doc_only`，两侧都会实例化并调用它）；
+    --     ② 37p 把 `sorting_hint` 写死成 "filemanager_settings"，
+    --        而这个分组**只存在于 `ui/elements/filemanager_menu_order.lua`**，
+    --        `reader_menu_order.lua` 里根本没有；
+    --     ③ `MenuSorter:findById` 找不到时**不 return（返回 nil）**，
+    --        紧接着 `menusorter.lua:181` 的 `nil.sub_item_table` 就崩。
+    --     ⇒ 崩溃点在「构建顶部菜单」，所以现象是「一进书、点顶部就闪退」。
+    --
+    --   ★ 为什么堆栈里那几个文件都不是元凶：
+    --     `readermenu` / `patches/2-*.lua` / `pinyin_enhancement` 都只是
+    --     `setUpdateItemTable` 的**包装器**（帧名都带 orig_…），
+    --     只说明「事件经过了我」；真正往 menu_items 里写坏 hint 的是本插件。
+    --     （`pinyin_enhancement` 重复包了 7 层是它自己 init 被反复调用，
+    --       属另一码事，与本次闪退**无因果**。）
+    --
+    --   ★ 修法：`sorting_hint` 改成**按上下文选**——
+    --     `self.ui.document` 只有 ReaderUI 有（FileManager 实例化时只传
+    --     `{ ui = self }`），这是 KOReader 惯例判据（opds / newsdownloader 同款）：
+    --       · reader 侧 → "tools"（37p 之前的位置，reader 侧存在该分组）
+    --       · FM   侧 → "filemanager_settings"（37p 的诉求，原样保住）
+    --
+    --   ★ 验证（无设备；fengari + **设备同版本 v2026.07 的真实上游源码**）：
+    --     用真实 `frontend/ui/menusorter.lua` + `reader_menu_order.lua` /
+    --     `filemanager_menu_order.lua` 真跑，18 条断言全绿：
+    --       · 复现：reader 树 + "filemanager_settings" → 崩在第 181 行，
+    --               报错串与 crash.log **逐字一致**；
+    --       · 变量隔离探针：reader 树上 11 个组名里**只有** filemanager_settings
+    --               是 nil（其余 tools/more_tools/device/screen/… 全找得到）；
+    --       · 修复后：抽**真实 addToMainMenu 源码**在两个上下文各跑一遍
+    --               → reader 得 "tools"、FM 得 "filemanager_settings"，
+    --               再喂进真实 menusorter：两侧都不崩，且分别落进
+    --               tools 标签 / FM「设置」标签；
+    --       · 反向验证：把表达式改回硬编码 → **立刻重新崩**（证明断言有鉴别力）。
+    --     静态扫描：语法错 0、未声明变量 0、多字节字符类告警 0。
+    --
+    --   ★ 附带结论（不是本次要改的）：崩溃本身是**上游 menusorter 的健壮性缺口**
+    --     （hint 找不到时该降级为孤儿项而不是崩）。本插件只负责别写坏 hint；
+    --     要不要给 `menusorter.lua` 打防御性补丁，另议。
+    version = "1.1",
 }

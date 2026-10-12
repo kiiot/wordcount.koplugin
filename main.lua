@@ -1994,6 +1994,35 @@ function WordCount:addToMainMenu(menu_items)
             version_text = tostring(meta.version)
         end
     end
+    -- ★★★ 38a-bugA：**sorting_hint 必须按上下文选，不能写死**。
+    --
+    --   ☠ 真 bug（用户 crash.log 坐实，2026-10-11）：
+    --       10/08/26-19:59:55 起，每次「进书 → 点顶部调出菜单」必闪退，
+    --       frontend/ui/menusorter.lua:181:
+    --         attempt to index local 'sorting_hint_menu' (a nil value)
+    --
+    --   ★ 根因链：
+    --     ① `addToMainMenu` 是**阅读器菜单和文件管理器菜单共用**的 ——
+    --        本插件没有 `is_doc_only`，两边都会 createPluginInstance 并调用它；
+    --     ② 37p 把 sorting_hint 硬编码成 "filemanager_settings"，
+    --        而这个分组**只存在于 `ui/elements/filemanager_menu_order.lua`**，
+    --        `reader_menu_order.lua` 里没有它；
+    --     ③ `MenuSorter:findById` 找不到时**不 return（返回 nil）**，
+    --        紧接着第 181 行 `sorting_hint_menu.sub_item_table` 就崩。
+    --     ⇒ 崩溃发生在「构建顶部菜单」时，所以现象正是
+    --       「一进书、点顶部想调菜单就闪退」。
+    --
+    --   ★ 判据（KOReader 惯例）：`self.ui.document` 只有 ReaderUI 有；
+    --     FileManager 实例化时只传 `{ ui = self }`（没有 document）。
+    --     上游 opds.koplugin / newsdownloader.koplugin 都用这个判据分两侧。
+    --
+    --   ⇒ 修法：**FM 侧保持 37p 的诉求**（「设置」标签，与「排序依据」同组）；
+    --     **reader 侧回落到 "tools"**（37p 之前的位置，reader 侧存在该分组）。
+    --     ⚠ 以后改这里，**不要**再写成字面量字符串 —— 用下面这个变量。
+    local is_reader_context = (self.ui ~= nil and self.ui.document ~= nil)
+    local word_count_sorting_hint =
+        is_reader_context and "tools" or "filemanager_settings"
+
     menu_items.word_count = {
         text = _("字数与阅读速度"),
         -- ★★★ 37p：把入口挪进**文件管理器顶部菜单的「设置」标签**
@@ -2002,13 +2031,15 @@ function WordCount:addToMainMenu(menu_items)
         --
         --   ★ 机制说明（别再踩）：插件在顶部菜单里的归属**不是自由坐标**，
         --     而是由 `sorting_hint` 指定一个**已有分组名**，再由
-        --     `MenuSorter:mergeAndSort("filemanager", ...)` 按
-        --     `ui/elements/filemanager_menu_order.lua` 的分组顺序摆放。
-        --     所以「插到某两项之间」做不到；能做的是换分组。
-        --     · "tools"               → 工具标签（原来的位置）
-        --     · "filemanager_settings"→ 设置标签，与 sort_by / show_filter 同组
+        --     `MenuSorter:mergeAndSort(...)` 按对应的 `*_menu_order.lua`
+        --     分组顺序摆放。所以「插到某两项之间」做不到；能做的是换分组。
+        --     · "tools"               → 工具标签（37p 之前的位置）
+        --     · "filemanager_settings"→ FM 设置标签，与 sort_by / show_filter 同组
         --                               ⇒ 就是「排序依据」所在的那一带 ✅
-        sorting_hint = "filemanager_settings",
+        --
+        --   ⚠ "filemanager_settings" **只能给 FM 用**，reader 侧没有这个分组
+        --     （见上面 38a-bugA）。所以这里必须用 word_count_sorting_hint。
+        sorting_hint = word_count_sorting_hint,
         sub_item_table = {
             {
                 -- ★ 版本号：点一下弹通知，方便核对装的是哪一版。
