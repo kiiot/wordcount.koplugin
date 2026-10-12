@@ -915,6 +915,27 @@ end
 --   真正会触发它的只有「几万页」这一类极端书，正是我们要保护的场景。
 local MAX_TRACKED_PAGES = 50000
 
+-- ★★★ 39-jump-overcount：**单页字数的合理上限**。
+--
+--   用户报：「当从某一章节跳另一章节的时候，中间未阅读的部分也会计算进去，
+--   并且也会计算到阅读速度里」。
+--
+--   为什么需要这两个常量：`page_units[key]` 是「这一页有多少字」，
+--   它同时决定「已读字数」和「阅读速度」（speed = 字数*60/秒）。
+--   一旦某一页被记成**整章/整书**的量，两个指标立刻一起虚高，
+--   而且这个错值会写进 sidecar 与全局统计**长期固化**。
+--
+--   物理事实：KPW4 是 6 吋屏，即使把字号调到最小、行距压到最紧，
+--   一页也放不下 4000 个汉字。所以：
+--     · `PAGE_UNITS_MIN_CAP`  —— 绝对下限（全书字数未知时也至少用这个）；
+--     · `PAGE_UNITS_MAX_FACTOR` —— 相对上限 = 全书页均值 × 这个倍数。
+--       真实书里页与页的字数差异通常 < 2 倍（图页/章首页会短），
+--       取 3 倍已经很宽松；同时它随书的排版自适应，不会误伤大字号的书。
+--
+--   ★ 只用于「**抽到的**文本明显不可信」时兜底 —— 正常的页永远走真实值。
+local PAGE_UNITS_MIN_CAP = 4000
+local PAGE_UNITS_MAX_FACTOR = 3
+
 -- ★★★ 28-kpw4-tuning：批量统计的自动降级阈值。
 --
 --   问题：Bookshelf 里一次选 50 本批量统计，如果每本都走完整扫描，
@@ -2723,6 +2744,13 @@ function WordCount:_syncGlobalBook(state, new_page, book_path, total_units_overr
     if not state then return end
     local info = self:_bookInfo(book_path and { file = book_path } or nil, total_units_override)
     if type(info.path) ~= "string" or info.path == "" then return end
+    -- ★★★ 39-jump-overcount：顺手把最新的全书字数同步进阅读状态，
+    --   并重算一次 —— 让「已读 ≤ 全书」的钳制在**写进全局统计之前**生效，
+    --   否则虚高的 read_units 会先被 upsert 进 KEY_GLOBAL_STATS 固化下来。
+    if tonumber(info.total_units) and tonumber(info.total_units) > 0 then
+        state.total_units = tonumber(info.total_units)
+        ReadingStats.recompute(state)
+    end
     GlobalStats.upsertBook(self:_globalStore(), {
         path = info.path, title = info.title, status = info.status,
         total_units = info.total_units,
@@ -2945,9 +2973,18 @@ function WordCount:_ensureReadState(doc, path, known_page_count)
         state = ReadingStats.newState(pages, mtime, size)
         self._read_save_count = 0
         self._read_dirty = true
-    else
-        ReadingStats.recompute(state)
     end
+    -- ★★★ 39-jump-overcount：把**全书字数**记进阅读状态。
+    --   `ReadingStats.recompute` 用它守「已读字数 ≤ 全书字数」这条硬不变式；
+    --   `_pageUnitsBounds` 用它算单页字数的相对上限。
+    --   只在本状态里还没有这个值时查一次 —— `_bookInfo` 走的是按 path 缓存的
+    --   DocSettings，成本是一次性的（同一本书后续调用直接命中缓存）。
+    if not tonumber(state.total_units) then
+        local info = self:_bookInfo(doc)
+        local total = info and tonumber(info.total_units)
+        if total and total > 0 then state.total_units = total end
+    end
+    ReadingStats.recompute(state)
     self._read_state = state
     self._read_settings = settings
     self._read_doc_path = path
@@ -2986,6 +3023,39 @@ end
 --   `_finishPageTimer`）都可以安全地传廉价 key。
 --
 --   `precise_key` 可选：调用方已经算好了就直接给，省一次重复计算。
+--- ★★★ 39-jump-overcount：单页字数的**合理上下界**。
+---
+--- 返回 `(cap, avg)`：
+---   · `cap` —— 一页字数不可能超过它。取
+---       `max(PAGE_UNITS_MIN_CAP, 全书页均值 × PAGE_UNITS_MAX_FACTOR)`
+---     两者较大者：绝对下限保证「全书字数未知」时也有闸门；
+---     相对上限让闸门随书的排版自适应，不误伤大字号/多图的书。
+---   · `avg` —— 全书页均值；全书字数未知时返回 nil。
+---
+--- 全书字数取自 `state.total_units`（由 `_ensureReadState` / `_syncGlobalBook`
+--- 维护）；万一还没有，就地用 `_bookInfo` 补一次（按 path 缓存，一次性成本）。
+function WordCount:_pageUnitsBounds(doc)
+    local state = self._read_state
+    local total = state and tonumber(state.total_units) or nil
+    if (not total or total <= 0) and doc then
+        local info = self:_bookInfo(doc)
+        total = info and tonumber(info.total_units) or nil
+        if total and total > 0 and state then state.total_units = total end
+    end
+    local pages = state and tonumber(state.page_count) or nil
+    if not pages or pages <= 0 then
+        pages = doc and pageCount(doc) or nil
+    end
+    pages = math.max(1, tonumber(pages) or 1)
+    local avg = nil
+    if total and total > 0 then avg = total / pages end
+    local cap = PAGE_UNITS_MIN_CAP
+    if avg then
+        cap = math.max(cap, math.floor(avg * PAGE_UNITS_MAX_FACTOR))
+    end
+    return cap, avg
+end
+
 function WordCount:_getPageUnits(doc, page, key, precise_key)
     local state = self._read_state
     -- ★ 精确 key 按需计算：这里只算一次，下面读/写都用它。
@@ -3006,21 +3076,66 @@ function WordCount:_getPageUnits(doc, page, key, precise_key)
         return tonumber(state.page_units[lookup_key]) or 0
     end
     if not doc then return 0 end
-    local ok, text, err = pcall(PageText.extract, doc, page, pageCount(doc))
-    if not ok or text == nil then
-        logger.warn("WordCount: could not extract text for page", page, ok and err or text)
-        return 0
+
+    -- ★★★ 39-jump-overcount：先算出这一页的「合理区间」。
+    local cap, avg = self:_pageUnitsBounds(doc)
+    -- 日志闸门：同一本书只抱怨一次，避免整本退化书把 crash.log 刷爆。
+    local function warnOnce(msg, a, b, c)
+        if self._units_warn_path == doc.file then return end
+        self._units_warn_path = doc.file
+        logger.warn(msg, a, b, c)
     end
-    local units = Counter.count(text)
-    if state then
-        ReadingStats.setPageUnits(state, lookup_key, units)
+
+    local units, from_extract = nil, false
+    local ok, text, err = pcall(PageText.extract, doc, page, pageCount(doc))
+    if ok and type(text) == "string" and #text > 0 then
+        -- ★ 计数**之前**先按字节粗筛：UTF-8 里一个汉字 3 字节，取 4 字节上界
+        --   ⇒ `cap * 4` 字节已经覆盖 cap 个汉字。超过就直接判为不可信。
+        --   这既挡住「整章/整书被当成一页」，也省掉在 PW4 上白数几 MB 文本的 CPU。
+        if #text > cap * 4 then
+            warnOnce("WordCount: page text implausibly large, ignoring; bytes/page/cap:",
+                #text, page, cap)
+        else
+            local n = Counter.count(text)
+            if n > 0 and n <= cap then
+                units, from_extract = n, true
+            else
+                warnOnce("WordCount: page unit count implausible, ignoring; units/page/cap:",
+                    n, page, cap)
+            end
+        end
+    elseif not ok then
+        warnOnce("WordCount: could not extract text for page", page, tostring(text))
+    end
+
+    -- ★★★ 39-jump-overcount：抽取失败或明显不可信 ⇒ **退回「全书页均值」**，
+    --   并打上「估算」标记。三个取舍理由：
+    --     · 不记 0 —— 一记 0，「已读字数」会明显偏低，用户照样觉得不对；
+    --     · 不用抽到的那个大值 —— 那正是虚高的来源；
+    --     · 打估算标记 —— `_getPageUnits` 遇估算值**不短路**，后续能抽到真实
+    --       值的页会把它覆盖掉，逐页精度还能自己回来（30-estimate-shadow-fix）。
+    --   全书字数未知（avg 为 nil）时仍然不写，保持「不知道就不编」。
+    if not from_extract and avg and avg > 0 then
+        units = math.floor(avg + 0.5)
+    end
+
+    if state and units then
+        if from_extract then
+            ReadingStats.setPageUnits(state, lookup_key, units)
+        else
+            ReadingStats.setEstimatedPageUnits(state, lookup_key, units)
+        end
         self._read_dirty = true
     end
-    return units
+    return units or 0
 end
 
 function WordCount:_startPageTimer(doc, page)
     if self._reading_paused or not doc or not page then return end
+    -- ★★★ 39-jump-overcount：页映射失效后**不再起新的计时**。
+    --   否则「挂起→恢复」会在失效状态下重新起表，最后结算时又去抽
+    --   那个不可信的「本页文本」。见 `onDocumentPartiallyRerendered`。
+    if self._pagemap_invalid then return end
     local path = doc.file
     local pages = pageCount(doc)
     local state = self._read_state
@@ -3042,7 +3157,10 @@ function WordCount:_startPageTimer(doc, page)
     }
 end
 
-function WordCount:_finishPageTimer(force_flush)
+--- `skip_extract`（39-jump-overcount 新增）：**只记时间，不抽本页文本**。
+---   用在「页映射已经失效」的场合（部分重排）—— 那时抽出来的「本页文本」
+---   可能是**整章**，宁可这一页的字数不记（退回已缓存值/0），也绝不记假。
+function WordCount:_finishPageTimer(force_flush, skip_extract)
     local active = self._active_page
     if not active then
         if force_flush then self:_saveReadState(true) end
@@ -3063,7 +3181,12 @@ function WordCount:_finishPageTimer(force_flush)
         --     `page_units[key]` 给 `page_seconds[key]` 配字数，键不一致
         --     就会算出「有秒数没字数」的错值。
         local precise_key = self:_pageKey(active.doc, active.page)
-        local units = self:_getPageUnits(active.doc, active.page, precise_key, precise_key)
+        -- ★★★ 39-jump-overcount：`units = nil` 时 `addPageVisit` 不写 page_units，
+        --   `recompute` 会退回该页**已缓存**的字数（通常 0）—— 只记时间。
+        local units
+        if not skip_extract then
+            units = self:_getPageUnits(active.doc, active.page, precise_key, precise_key)
+        end
         local accepted, new_page, added_seconds = ReadingStats.addPageVisit(
             self._read_state, precise_key, units, elapsed, min_sec, max_sec)
         self:_saveReadState(force_flush)
@@ -3102,6 +3225,11 @@ function WordCount:_trackPageUpdate(page)
         self:_finishPageTimer(true)
         return
     end
+    -- ★★★ 39-jump-overcount：页映射已失效（部分重排之后）⇒ **不再按页码记账**。
+    --   上游 readerrolling.lua 自己写明此时「Pages and ToC will be invalid」，
+    --   上游 statistics.koplugin 也正是在这里停掉页记账。详见
+    --   `onDocumentPartiallyRerendered` 的注释。
+    if self._pagemap_invalid then return end
     if self._reading_paused then return end
     if not doc then return end
     local path = doc.file
@@ -3155,6 +3283,12 @@ function WordCount:onReaderReady(_config)
     local doc = self.ui.document
     if not doc then return end
     self._reading_paused = false
+    -- ★★★ 39-jump-overcount：换书 / 重新打开 ⇒ **重置「页映射失效」闸门**。
+    --   上游的部分重排状态是**跟文档实例**走的；新开一本书就是新实例，
+    --   页映射重新有效，必须恢复按页记账。
+    --   `_units_warn_path` 同理：换书后允许再抱怨一次。
+    self._pagemap_invalid = false
+    self._units_warn_path = nil
     -- ★ 先做**最廉价**的一件事：启动当前页计时（只有 os.time 和字符串拼接）。
     --   它必须在开书时同步完成 —— 否则用户「打开书就一直停在这一页」的
     --   那段阅读时间会被漏掉。
@@ -3200,16 +3334,50 @@ function WordCount:onResume()
     self:onReadingResumed()
 end
 
-function WordCount:onDocumentPartiallyRerendered(_first_partial_rerender)
-    local doc = self.ui.document
+--- ★★★ 39-jump-overcount：**页映射失效时停止按页记账**。
+---
+--- 用户报：「当从某一章节跳另一章节的时候，中间未阅读的部分也会计算进去，
+---   并且也会计算到阅读速度里」。
+---
+--- 根因（上游自己的注释就是判据）：
+---   KOReader 在「延迟重排 / 部分重排」状态下，页数与页↔XPointer 映射
+---   **全部失效**。`frontend/apps/reader/modules/readerrolling.lua` 的
+---   `handleRenderingDelayed()` 里写明：
+---
+---     「Partial rendering will happen on next drawing: let it be known.
+---       Pages and ToC will be invalid, some modules may want to disable
+---       some features (ie. **reading statistics should stop accounting
+---       pages read/total pages, as there are invalid, and bogus data
+---       would stick in the stats db**).」
+---
+---   上游 `plugins/statistics.koplugin/main.lua` 的做法就是在这里**彻底停掉
+---   页记账**（覆写 `onPageUpdate` 让它直接 return）。
+---
+---   而本插件旧实现**反着来**：拿失效的 `pageCount(doc)` 重建阅读状态、
+---   并重启计时；于是之后每次翻页结算都拿失效的页映射去抽「本页文本」——
+---   而 page_text.lua 开头就写了，页边界吸附后
+---   `getTextFromXPointers` 会返回「空串或**整段**」。
+---   对「一章 = 一个文本节点」的书（网文 TXT 转 EPUB 极常见），
+---   那个「整段」就是**整章** ⇒ 一页被记成几千上万字，
+---   「已读字数」与「阅读速度」同时虚高，还会固化进 sidecar / 全局统计。
+---
+--- 现在：
+---   · 先把当前页**只记时间**结算掉（`skip_extract = true`）—— 那一页的时间
+---     是真实读掉的，不该丢；但**不抽文本**，因为页映射已经不可信。
+---   · 然后置 `_pagemap_invalid`，本次开书期间不再按页记账。
+---     与上游一致：**宁可少记，不可记假。**
+---   · `onReaderReady` 会重置这个闸门（换书后页映射重新有效）。
+function WordCount:onDocumentPartiallyRerendered(first_partial_rerender)
+    if not first_partial_rerender then return end
+    local doc = self.ui and self.ui.document
     if not doc then return end
-    local pages = pageCount(doc)
-    if self._read_state and pages ~= self._read_state.page_count then
-        self:_finishPageTimer(false)
-        self:_ensureReadState(doc, doc.file, pages)
-        self._active_page = nil
-        self:_startPageTimer(doc, self:_currentPage())
-    end
+    if self._pagemap_invalid then return end
+    -- 只记时间、不抽文本；force_flush = false（后面还有正常的落盘时机）
+    self:_finishPageTimer(false, true)
+    self._active_page = nil
+    self._pagemap_invalid = true
+    logger.info("WordCount: page map invalid after partial rerender; "
+        .. "page accounting stopped for this document")
 end
 
 --- ★★★ 36：打开阅读统计页面。
@@ -3285,7 +3453,11 @@ function WordCount:showSavedStats()
     local read_units = state and tonumber(state.read_units) or 0
     local speed = state and tonumber(state.speed_units_per_minute)
     if speed then
-        notifyUser(T(_("全书约 %1；已读约 %2；平均 %3 单位/分钟"),
+        -- ★★★ 39-terms：**术语统一**。这里原来写的是「平均 %3 单位/分钟」，
+        --   而统计页的卡片/坐标轴/页脚一律是「字/分钟」—— 同一个量两种叫法，
+        --   用户直接反馈「术语和单位混乱」。本插件数出来的东西就是**字**，
+        --   没有第二个单位；「单位」这个词在整个插件里不再对用户出现。
+        notifyUser(T(_("全书约 %1；已读约 %2；平均 %3 字/分钟"),
             fmtCount(total), fmtCount(read_units), fmtCount(speed)))
     else
         notifyUser(T(_("全书约 %1；已读约 %2；阅读速度尚未形成"),
@@ -4833,11 +5005,11 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 --   否则用户会以为我们把他要的精确值做错了。
                 if job.huge_book_forced_sample then
                     job.progress_dialog:setStatus(
-                        T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 个阅读单位"),
+                        T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 字"),
                             fmtCount(total_pages), fmtCount(total)))
                 else
                     job.progress_dialog:setStatus(
-                        T(_("统计完成：全书约 %1 个阅读单位"), fmtCount(total)))
+                        T(_("统计完成：全书约 %1 字"), fmtCount(total)))
                 end
             end
             job.progress_dialog:updateProgress(job.page_count, true)
@@ -4851,10 +5023,10 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         else
             -- 只在「压根没有对话框」时才退回弹窗（兜底，正常不会走到）
             if job.huge_book_forced_sample then
-                notifyUser(T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 个阅读单位"),
+                notifyUser(T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 字"),
                     fmtCount(total_pages), fmtCount(total)))
             else
-                notifyUser(T(_("统计完成：全书约 %1 个阅读单位"), fmtCount(total)))
+                notifyUser(T(_("统计完成：全书约 %1 字"), fmtCount(total)))
             end
         end
         if batch_mode and in_batch then self:_startNextBatch() end

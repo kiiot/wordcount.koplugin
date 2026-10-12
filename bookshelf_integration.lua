@@ -159,10 +159,13 @@ function M.register(Tokens, data_reader)
     if Tokens._word_count_koplugin_registered then return true, "already enabled" end
 
     local read_data = data_reader or cachedDataFor
+    -- ★★★ 39-terms：**术语统一**。三条描述原来都写 "reading units"，
+    --   而统计页/卡片一律叫「字」—— 同一个量两种叫法，用户反馈「术语混乱」。
+    --   本插件数出来的就是**字数**，英文也用 words 而不是 units。
     local descriptions = {
-        { "word_count", "Total reading units counted by the KOReader Word count plugin" },
-        { "word_count_read", "Reading units on pages actually read" },
-        { "word_speed", "Average reading units per minute" },
+        { "word_count", "Total word count measured by the KOReader Word count plugin" },
+        { "word_count_read", "Word count on pages actually read" },
+        { "word_speed", "Average reading speed (words per minute)" },
     }
     local gettext_ok, gettext = pcall(require, "gettext")
     local gettext_fn = gettext_ok and gettext or function(s) return s end

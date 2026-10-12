@@ -295,6 +295,170 @@ function M.availableYears(store, anchor)
     return list
 end
 
+--==========================================================================
+-- ★★★ 43-pickers：周期选择器的数据源（月份列表 / 周列表）
+--==========================================================================
+--
+-- 背景：用户要求「年的点击可以选择年份，月的点击可以选择月份，日的点击可以
+--   选择月份，周的点击可以选择第几周（第几周后面跟着时间）」。
+--   年份列表 37r 就有了（availableYears），这里补上月份和周。
+
+--- 某一周（周一为一周之始）的周一零点时间戳。
+--- ★ 口径必须与 `M.bounds("week", …)` 完全一致：都是
+---   `day_start - ((weekday + 6) % 7) * 86400`（Sunday=0 ⇒ 周一偏移 6）。
+---   两处一旦不一致，选择器里选的那一周和统计页显示的那一周就会差一天。
+function M.weekStart(anchor)
+    anchor = tonumber(anchor) or os.time()
+    local year, month, day = parts(anchor)
+    local day_start = dayTimestamp(year, month, day)
+    local weekday = tonumber(os.date("%w", day_start)) or 0 -- Sunday = 0
+    return day_start - ((weekday + 6) % 7) * 86400
+end
+
+--- 周序号（1 起）。
+---
+--- ★ 口径 = ISO 8601：「含当年**第一个周四**的那一周是第 1 周」。
+---   等价说法：用「该周**周四**」所在的年 + 它距该年第一个周四几周。
+---   跨年的那一周（例如 2025-12-29 周一 ~ 2026-01-04 周日）按周一算会被
+---   归到上一年的第 53 周；按周四算它属于 2026 年第 1 周 —— 这才是大家
+---   习惯的「第几周」。
+---
+--- ★ 全部用 `os.date("*t")` + `os.time` **自己算**，不用 `os.date("%W")`：
+---   `%W` 虽然也是 C89，但插件没必要为了一个数字去赌 strftime 的实现；
+---   而且自己算能在没有 KOReader 的环境里跑行为测试。
+--- ★ 参数是「**任意一天**」，内部先归一到那一周的周一 —— 这样传周一、传周四、
+---   传今天都对，不会因为调用方忘了归一而算出离谱的周号
+---   （实测：直接把周四喂进来会得到 0）。
+function M.weekNumber(any_day)
+    local monday = M.weekStart(tonumber(any_day) or os.time())
+    local thursday = monday + 3 * 86400
+    local year = os.date("*t", thursday).year
+    -- 该年 1 月 1 日，以及「第一个周四」是哪天
+    local jan1 = os.time{ year = year, month = 1, day = 1, hour = 12, min = 0, sec = 0 }
+    local jan1_wday = os.date("*t", jan1).wday          -- 1 = 周日 … 7 = 周六
+    local offset = (5 - jan1_wday) % 7                  -- 1/1 到第一个周四的天数
+    local first_thursday = jan1 + offset * 86400
+    return math.floor((thursday - first_thursday) / (7 * 86400) + 0.5) + 1
+end
+
+--- 列出可选月份，供统计页「点月份直接跳转」用。
+--
+--   口径与 availableYears 一致：
+--     · 来源是 `store.days` 的日期键（形如 "2026-10-03"）；
+--     · **永远**把 anchor 所在月与本月算进去（刚装插件时列表不至于空白）；
+--     · 从新到旧排序（最近的月份最常被点）。
+--
+--   返回：{ { year = 2026, month = 10, label = "2026年10月", has_data = true }, … }
+function M.availableMonths(store, anchor)
+    anchor = tonumber(anchor) or os.time()
+    local anchor_year, anchor_month = parts(anchor)
+    local today_year, today_month = parts(os.time())
+
+    local seen = {}
+    seen[string.format("%04d-%02d", anchor_year, anchor_month)] = false
+    local today_key = string.format("%04d-%02d", today_year, today_month)
+    if seen[today_key] == nil then seen[today_key] = false end
+
+    local days = type(store) == "table" and store.days or nil
+    if type(days) == "table" then
+        for key in pairs(days) do
+            local y, m = tostring(key):match("^(%d%d%d%d)%-(%d%d)%-")
+            local yn, mn = tonumber(y), tonumber(m)
+            -- 只认合法的 YYYY-MM，脏键（nil / 短串 / 13 月）直接跳过
+            if yn and mn and yn >= 1970 and yn <= 9999 and mn >= 1 and mn <= 12 then
+                seen[string.format("%04d-%02d", yn, mn)] = true
+            end
+        end
+    end
+
+    local list = {}
+    for key, has_data in pairs(seen) do
+        local y, m = key:match("^(%d%d%d%d)%-(%d%d)$")
+        list[#list + 1] = {
+            year = tonumber(y),
+            month = tonumber(m),
+            has_data = has_data == true,
+        }
+    end
+    table.sort(list, function(a, b)
+        if a.year ~= b.year then return a.year > b.year end
+        return a.month > b.month
+    end)
+    for _i, item in ipairs(list) do
+        -- ★★★ 44-month-label：**只显示月份**（用户原话「选择月份只显示月份」）。
+        --   原来是 `"%d年%d月"`（「2026年10月」），在选择器里 7 个字太占宽。
+        --   年份没丢，仍在 `item.year` 里；要拼回「2026年10月」随时可以。
+        --   ⚠ 已知取舍：列表若跨年（如 2026年1月 与 2025年1月 同时出现），
+        --     两行的「1月」会长得一模一样。当前列表是「有数据的月 ∪ anchor 月
+        --     ∪ 当前月」，一般 ≤ 13 行、跨 1~2 年，实际很少撞。
+        --     真撞了的话，选择器标题里会补一句「跨 20xx–20xx 年」提示。
+        item.label = string.format("%d月", item.month)
+    end
+    return list
+end
+
+--- 列出某一年的所有周（含「第几周 + 日期区间」），从新到旧。
+--
+--   用户原话：「周的点击可以选择第几周（第几周后面跟着时间）」——
+--   所以每一项都带 `range`（如 "10月05日–10月11日"），选择器里
+--   拼成「第41周  10月05日–10月11日」。
+--
+--   ★ 只列 anchor 所在年（year_override 可指定别的年）：
+--     一年最多 53 周，弹窗可控；要是把「有数据的周」全列出来，
+--     读三年就是 150+ 行 —— 那种列表没人会去翻。
+--     想看别的年，先在「年」标签里选年，再点「周」。
+--
+--   返回：{ { monday = ts, year = 2026, week_no = 41,
+--            label = "第41周", range = "10月05日–10月11日", has_data = true }, … }
+function M.availableWeeks(store, anchor, year_override)
+    anchor = tonumber(anchor) or os.time()
+    local anchor_year = parts(anchor)
+    local year = tonumber(year_override) or anchor_year
+
+    local has_data = {}
+    local days = type(store) == "table" and store.days or nil
+    if type(days) == "table" then
+        for key in pairs(days) do has_data[key] = true end
+    end
+
+    -- 从「12 月 31 日所在那一周的周一」往回数 55 周 ——
+    -- 覆盖完「周四落在本年内」的所有周（最多 53 个）绰绰有余。
+    local dec31 = dayTimestamp(year, 12, 31)
+    local weekday = tonumber(os.date("%w", dec31)) or 0
+    local last_monday = dec31 - ((weekday + 6) % 7) * 86400
+
+    local weeks = {}
+    for i = 0, 54 do
+        local monday = last_monday - i * 7 * 86400
+        local thursday = monday + 3 * 86400
+        local ty = parts(thursday)
+        if ty == year then
+            local sunday = monday + 6 * 86400
+            local any = false
+            for k = 0, 6 do
+                if has_data[dayKey(monday + k * 86400)] then any = true break end
+            end
+            -- ⚠ weekNumber 只算一次：它内部要 os.date/os.time 三次，
+            --   这里循环 55 次，重复调用纯属白烧 CPU（KPW4 是单核 1GHz）。
+            local week_no = M.weekNumber(monday)
+            weeks[#weeks + 1] = {
+                monday = monday,
+                year = year,
+                week_no = week_no,
+                has_data = any,
+                label = string.format("第%d周", week_no),
+                -- ★★★ 44-week-range：日期区间改成 `12.28–01.03` 这种「月.日」形式
+                --   （用户原话「选择周的周后面的日期是12.28这种形式」）。
+                --   原来是 `12月28日–01月03日`（14 字），一行塞不下、被裁；
+                --   改成 `12.28–01.03`（11 字）后整行短了一大截。
+                range = os.date("%m.%d", monday) .. "–" .. os.date("%m.%d", sunday),
+            }
+        end
+    end
+    table.sort(weeks, function(a, b) return a.monday > b.monday end)
+    return weeks
+end
+
 local function inside(date, first, last)
     return first == nil or (date >= first and date <= last)
 end

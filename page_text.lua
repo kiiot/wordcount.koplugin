@@ -19,6 +19,25 @@ local M = {}
 -- `getTextFromXPointers` 接受任意两个 XPointer，文档首尾各取一个即可。
 M.WHOLE_BOOK_CHUNK = nil   -- 占位，便于外部探测版本
 
+--- ★★★ 39-jump-overcount：**一页文本的字节上限**。
+---
+--- 用户报：「当从某一章节跳另一章节的时候，中间未阅读的部分也会计算进去，
+---   并且也会计算到阅读速度里」。
+---
+--- 根因就在本文件开头那段注释里已经写明的现象：
+---   crengine 会把页边界**吸附到元素/文本节点边界**，于是
+---     `getPageXPointer(page)` 与 `getPageXPointer(page+1)` 可能指向**同一个节点**，
+---   此时 `getTextFromXPointers` 会返回「空串或**整段**」。
+---   对「一章 = 一个文本节点」的书（网文 TXT 转 EPUB 极常见），
+---   那个「整段」就是**整章** —— 一页被记成几千上万字，
+---   已读字数与阅读速度同时虚高，并且会固化进 sidecar / 全局统计。
+---
+--- 闸门：一页的文本长度有个物理上限。KPW4 6 吋屏即使把字号调到最小，
+---   一页也放不下两万个汉字（= 60000 字节）；超过就一定是「整段/整章」被
+---   当成了「一页」，直接判为不可信。
+---   ★ 这个闸门同时是**省电**的：不数那几 MB 的字符串。
+M.MAX_PAGE_TEXT_BYTES = 60000
+
 --- 尝试一次性取回整本文本的函数（返回 text 或 nil, err）。
 -- 这是 page_text.lua 里唯一不会重复/漏计数的路径。
 function M.extractWholeBook(doc)
@@ -112,10 +131,29 @@ local function crePageText(doc, page, page_count)
             and type(doc.getTextFromXPointers) == "function" then
         local ok_end, end_xp = pcall(doc.getPageXPointer, doc, page + 1)
         if ok_end and type(end_xp) == "string" and end_xp ~= "" then
+            -- ★★★ 39-jump-overcount：**页区间单调性闸门**。
+            --   本文件开头的注释已经说明：crengine 会把页边界吸附到元素/
+            --   文本节点边界，于是 page+1 的 xpointer 有可能**不大于** page 的
+            --   （相等或逆序）。此时 getTextFromXPointers 实测会返回
+            --   「空串或整段」——「整段」对「一章一个文本节点」的书就是**整章**。
+            --   compareXPointers 返回 1 才表示 end 严格在 start 之后（合法页区间）。
+            --
+            --   ★ 一旦确认区间不合法，**必须直接放弃**，绝不能退到下面
+            --     「返回整段文本节点」的兜底 —— 那正是虚高的来源。
+            local ordered = nil
+            if type(doc.compareXPointers) == "function" then
+                local ok_cmp, cmp = pcall(doc.compareXPointers, doc, start_xp, end_xp)
+                if ok_cmp then ordered = cmp end
+            end
+            if ordered == 0 or ordered == -1 then
+                return nil, "non-monotonic page span (page boundaries snapped)"
+            end
             local ok_text, text = pcall(doc.getTextFromXPointers, doc, start_xp, end_xp)
             if ok_text then
                 local normalized = normalize(text)
-                if normalized ~= nil then return normalized end
+                if normalized ~= nil and #normalized <= M.MAX_PAGE_TEXT_BYTES then
+                    return normalized
+                end
             end
         end
     end
@@ -156,7 +194,11 @@ local function crePageText(doc, page, page_count)
             local ok_text, result = pcall(doc.getTextFromPositions, doc, p0, p1, true)
             if ok_text then
                 local normalized = normalize(result)
-                if normalized ~= nil then return normalized end
+                -- ★★★ 39：矩形取文本理论上只覆盖一屏，但同样加长度闸门 ——
+                --   上游某些实现会忽略矩形直接返回整段。
+                if normalized ~= nil and #normalized <= M.MAX_PAGE_TEXT_BYTES then
+                    return normalized
+                end
             else
                 return nil, tostring(result)
             end
@@ -169,7 +211,14 @@ local function crePageText(doc, page, page_count)
         local ok, text = pcall(doc.getTextFromXPointer, doc, start_xp)
         if ok then
             local normalized = normalize(text)
-            if normalized ~= nil then return normalized end
+            -- ★★★ 39-jump-overcount：单指针版返回的是**整个包含它的文本节点**。
+            --   对「一章一个文本节点」的书，那就是**整章** —— 只有长度确实
+            --   还在「一页」的量级内（说明这个节点本来就很短）才敢用。
+            --   否则宁可返回 nil，让上层退回「按页均值估算」，也绝不把整章
+            --   当成一页记进「已读字数」。
+            if normalized ~= nil and #normalized <= M.MAX_PAGE_TEXT_BYTES then
+                return normalized
+            end
         end
     end
     return nil, "could not extract CRE page text"

@@ -36,6 +36,14 @@ KOReader 侧实现约束（逐条对着 koreader 源码核过，改动前请先�
   * `GestureRange.range` 允许传函数，用来延迟取 `self.dimen`（gesturerange.lua:29）。
   * `Blitbuffer:paintRect` 收的是 `Color8`，内部按 bb 实际类型转换，
     所以 `Blitbuffer.COLOR_*` 在 8bpp 和 RGB32 设备上都安全。
+  * ★ `Screen:scaleBySize(px)` = `ceil(px * min(屏宽,屏高) / 600)`
+    （`ffi/framebuffer.lua:414`），**不是** `floor(px * dpi/160)`，
+    也不是 `floor(px * 1.875)`。KPW4(1072×1448，无 `screen_dpi` 覆盖) 上：
+    `(1)=2  (2)=4  (3)=6  (4)=8  (5)=9  (10)=18`。
+    凡是要「算成几个像素」的地方，先按这个公式过一遍 —— 之前几轮
+    就是按 1.875 折算，把 4px 宽的点当成 3px，结论全偏了。
+  * `Blitbuffer:paintCircle(center_x, center_y, r, c, w)`（`ffi/blitbuffer.lua:1948`）
+    `w` 默认 = `r` ⇒ 实心。半径 1 的光栅是**十字**不是圆，最小可用半径 2。
   * `ScrollableContainer` 需要 `dimen` + `show_parent`。
   * 目标运行环境是 LuaJIT(5.1)：不要用 `//`、位运算、`goto`、`math.log(x, base)`。
 
@@ -209,18 +217,12 @@ local function formatDurationParts(seconds)
     return { { text = tostring(seconds % 60), big = true }, { text = _("秒"), big = false } }
 end
 
---- 图表 Y 轴刻度用的紧凑时长："2小时" / "30分" / "45秒"
-local function compactDuration(seconds)
-    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
-    if seconds >= 3600 then
-        local hours = seconds / 3600
-        if hours >= 10 then return tostring(math.floor(hours + 0.5)) .. _("小时") end
-        return trimZero(string.format("%.1f", hours)) .. _("小时")
-    elseif seconds >= 60 then
-        return tostring(math.floor(seconds / 60 + 0.5)) .. _("分")
-    end
-    return tostring(seconds) .. _("秒")
-end
+--- ★★★ 41-plain-chart：**删掉了 `compactDuration`**（原「图表 Y 轴刻度用的
+---   紧凑时长」）。它的唯一调用者是 `metricAxisText`，而 `metricAxisText`
+---   唯一的调用者是趋势图那行图例的「虚线＝本期平均 X」—— 41 把均值虚线
+---   连同图例那半句一起删了，这条调用链整条断掉，两个函数都成了死代码。
+---   柱顶标签的时长写法现在归 `chartUnit` + `chartBarLabel` 管（整张图
+---   统一一个单位，见下）。留这段注释是为了让后来者知道这里曾经有什么。
 
 --- 环比用的纯文本
 local function deltaText(kind, value)
@@ -261,29 +263,62 @@ local function metricValueText(value, metric)
     return formatCount(value) .. " " .. _("字")
 end
 
-local function metricAxisText(value, metric)
-    value = tonumber(value) or 0
+--- ★★★ 41-plain-chart：**删掉了 `metricAxisText`**（原「Y 轴刻度那种紧凑
+---   写法」）。它唯一的调用者是已删的均值虚线图例。列值文案现在只有两条路：
+---     · `metricValueText` —— 列表视图那种**带单位**的完整写法；
+---     · `chartBarLabel`   —— 柱顶那种**不带单位**的裸数字。
+---   不再需要第三种「给刻度用、能省字」的写法（Y 轴都没了）。
+
+--- ★★★ 40-unit-free：整张图**统一一个单位**，柱顶标签只写数字。
+---
+---   用户原话：「每个柱体上方都加上数值注释，单位统一的可以不带单位」。
+---   这两句其实是同一件事的两面 —— **标签越窄，能标上的柱子就越多**。
+---   每根柱子后面都重复一遍单位，纯粹是在跟横向空间过不去，而横向空间
+---   正是「能不能每根都标上」的**唯一**瓶颈。
+---
+---   做法：先给整张图定**一个**单位（本函数），标签只写数字
+---   （chartBarLabel），单位在**标题**里出现一次（「阅读时长趋势（分）」）。
+---
+---   ⚠ 旧方案是**逐值**挑单位的（那个函数 41 已删）：927 秒 →「15分」、
+---     83 秒 →「83秒」—— 同一张图里混着「分」和「秒」，那就不叫
+---     「单位统一」，也就没法省。所以这里改成**按整张图的量级选一次**：
+---     scale_max 决定这张图用秒 / 分 / 小时。
+---
+---   ⚠ 阈值 120 / 3600 的理由：scale_max < 120 秒时用「分」会把最高那根
+---     压成「1」「2」，刻度全挤在个位数、完全分不出高低；≥ 3600 秒
+---     （一小时）之后用「分」又会变成 60、90、120 这种三位数，
+---     不如直接换成小时。中间那一段（2 分钟 ~ 1 小时）用「分」最顺眼。
+local function chartUnit(metric, scale_max)
     if metric == "seconds" or metric == "average" then
-        return compactDuration(value)
+        local top = tonumber(scale_max) or 0
+        if top >= 3600 then
+            return { suffix = _("小时"), div = 3600 }
+        elseif top >= 120 then
+            return { suffix = _("分"), div = 60 }
+        end
+        return { suffix = _("秒"), div = 1 }
     elseif metric == "speed" then
-        return formatCount(value) .. _("字/分钟")
+        return { suffix = _("字/分钟"), div = 1 }
     end
-    return formatCount(value) .. _("字")
+    return { suffix = _("字"), div = 1 }
 end
 
---- ★★★ 37s：柱顶数值标签用的**紧凑**写法。
+--- 柱顶数值标签：**只写数字**，不带单位（单位由 chartUnit 决定、写在标题上）。
 ---
---- 和 `metricAxisText`（Y 轴刻度）的区别：**不带单位后缀**。
----   单位已经在 Y 轴刻度上给过一次了（如「1.2万字」），柱顶再重复一遍纯属浪费
----   横向空间 —— 而横向空间正是「能不能每根柱子都标上」的**唯一**瓶颈。
----   （时间类指标省不掉：compactDuration 的「2小时」里那个「小时」就是量纲本身。）
+---   · 时长按 chartUnit 选定的单位折算；折算后 < 10 保留一位小数（「1.4」），
+---     否则取整（「15」）—— 这样最短的那根也不会被压成「1」而失真，
+---     最长的那根又不会写成「15.4」白占两个字符的位置。
+---   · 其余指标直接走 formatCount，它自带「万 / 亿 / k / 千」的**量级**后缀
+---     —— 那是数字写法的一部分，不是单位，不能剥掉。
 ---
---- ⚠ 数值口径必须与 metricAxisText / 卡片完全一致（都走 formatCount），
----   否则同一根柱子上的数字会和卡片/刻度对不上。
-local function metricBarLabel(value, metric)
-    value = tonumber(value) or 0
-    if metric == "seconds" or metric == "average" then
-        return compactDuration(value)
+---   ⚠ 数值口径必须与卡片 / 列表完全一致（都走 formatCount），
+---     否则同一根柱子上的数字会和卡片对不上。
+local function chartBarLabel(value, unit)
+    value = math.max(0, tonumber(value) or 0)
+    if unit and unit.div and unit.div > 1 then
+        local v = value / unit.div
+        if v < 10 then return trimZero(string.format("%.1f", v)) end
+        return tostring(math.floor(v + 0.5))
     end
     return formatCount(value)
 end
@@ -298,12 +333,12 @@ local function faces()
     if FACES then return FACES end
     FACES = {
         -- ★★★ 32：用户要求「字体放大一点」。整体上调 2~4 px。
-        value_big = Font:getFace("cfont", 32),
-        value_small = Font:getFace("cfont", 19),
-        label = Font:getFace("smallinfofont", 19),
-        delta = Font:getFace("smallinfofont", 18),
-        tab = Font:getFace("cfont", 21),
-        period = Font:getFace("cfont", 23),
+        value_big = Font:getFace("cfont", 29),
+        value_small = Font:getFace("cfont", 18),
+        label = Font:getFace("smallinfofont", 17),
+        delta = Font:getFace("smallinfofont", 16),
+        tab = Font:getFace("cfont", 18),
+        period = Font:getFace("cfont", 20),
         section = Font:getFace("cfont", 24),
         axis = Font:getFace("x_smallinfofont", 17),
         footer = Font:getFace("smallinfofont", 19),
@@ -522,21 +557,19 @@ end
 -- 趋势图
 --==========================================================================
 
-local TREND_ROWS = 4 -- 4 条网格线 + 0 基线 => 5 个 Y 轴刻度
+--- ★★★ 41-plain-chart：网格线删掉之后，这个常量**只剩「图高 = 4 行」一个作用**
+---   （唯一用途是 buildTrendSection 的 `chart_h = row_h * TREND_ROWS`）。
+---   名字保留是因为改它仍然等比改图高；但它**不再代表任何刻度**了 ——
+---   以前它是「4 条网格线 + 1 条基线 = 5 个 Y 轴刻度」，那是 Y 轴还在时的算法。
+local TREND_ROWS = 4
 
-local function trendBucketLabels(period, count)
-    local labels = {}
-    for i = 1, count do
-        if period == "day" then
-            labels[i] = tostring(i - 1)
-        elseif period == "week" then
-            labels[i] = ({ _("一"), _("二"), _("三"), _("四"), _("五"), _("六"), _("日") })[i] or tostring(i)
-        else
-            labels[i] = tostring(i)
-        end
-    end
-    return labels
-end
+--- ★★★ 39-trend-axis：**删掉了 `trendBucketLabels(period, count)`**。
+---
+---   它原来是「按 period 现造一套 X 轴刻度」，而 `GlobalStats.trend` 生成的
+---   `bucket.label` 是**另一套** —— 两边根本对不上（见 `buildTickRow` 的注释）。
+---   现在 X 轴一律走 `bucket.label`，这个函数没有存在意义了。
+---   （留这段注释是为了让后来者知道「这里曾经有一份会造错刻度的代码」，
+---     别再照着写回来。）
 
 --- ★★★ 37s：一根柱子在给定绘图高度下的像素高度。
 ---
@@ -550,6 +583,24 @@ local function barPixelHeight(value, scale_max, plot_h, min_bar_h)
     return bar_h
 end
 
+--- ★★★ 41-plain-chart：**删掉了均值参考线**（`trendMean` + `meanLineY`）。
+---
+---   用户原话：「虚线去掉」。被删掉的是两样东西：
+---     · `trendMean(buckets)` —— 只平均「有数据」的桶（value > 0），
+---       口径刻意与 summarize 的「日均阅读时长」一致（除以**有阅读的天数**，
+---       不是除以全周期天数）；
+---     · `meanLineY(mean, scale_max, height)` —— 把它换算成绘图区里的 y。
+---   连带删掉的还有趋势图下方那行图例的后半句「· 虚线＝本期平均 X」
+---   （图例只剩「点柱子看具体数值」）。
+---
+---   ⚠ 删除理由（用户给过两次信号）：39 那轮把这条线从纯黑降成深灰
+---     （「不需要参照线加强」），41 直接说「去掉」。也就是说 ——
+---     用户并不需要「本期平均」这个参照：每根柱子顶上已经写着自己的数值
+---     （40-unit-free），而「日均阅读时长」这个**口径完全相同**的数字
+---     在总览页有专门的卡片。图里再来一条线，纯属重复表达。
+---   ⚠ 如果哪天想加回来：口径必须与 summarize 的 average_day_seconds 一致，
+---     否则同一页上卡片和线会给出两个「平均」，那比没有更糟。
+
 --- 把 buckets 画成位图。返回 ImageWidget。
 --- 用真实像素而不是字符网格：字符画依赖等宽字体，KOReader 默认字体不是等宽的，
 --- 一旦列宽漂移整张图就废了。
@@ -558,7 +609,13 @@ end
 ---   已经算过一次 niceMax 了）。传进来是为了让「柱顶数值标签」和柱子共用同一个
 ---   上限 —— 两边各算一次不只是白算，更危险的是以后改口径只改一处。
 ---   不传则退回「自己算」的老行为（保持本函数可单独调用/测试）。
-local function buildChartImage(buckets, metric, selected_index, width, height, scale_max)
+--- ★★★ 40-unit-free：**去掉了从未被使用的 `metric` 参数**。
+---   柱子只关心「多高」，不关心「什么指标」—— 单位是柱顶标签的事，
+---   而标签在 chartValueLabels 里单独算。留一个没人读的参数只会让人
+---   以为改单位要动这里。
+--- ★★★ 41-plain-chart：再**去掉 `mean` 参数**（均值虚线已删）。
+---   本函数现在只画两样东西：柱子 + 底部基线。
+local function buildChartImage(buckets, selected_index, width, height, scale_max)
     local bb_type = (Screen.bb and Screen.bb:getType()) or Blitbuffer.TYPE_BB8
     local bb = Blitbuffer.new(width, height, bb_type)
     bb:fill(Blitbuffer.COLOR_WHITE)
@@ -570,32 +627,42 @@ local function buildChartImage(buckets, metric, selected_index, width, height, s
         end
         scale_max = niceMax(maximum)
     end
-    local row_h = height / TREND_ROWS
-
-    -- 横向网格线（虚线），最后一条基线单独画实线
-    -- ★ 32：网格虚线原来是 LIGHT_GRAY。用户要求「尽量不要有灰色字」——
-    --   说的主要是**字**，但满屏灰线观感上也灰扑扑的。改成浅色点线
-    --   （用 1px 稀疏点画，靠密度而不是灰度来区分主次）。
-    local dash = math.max(1, Screen:scaleBySize(4))
-    for r = 1, TREND_ROWS - 1 do
-        local y = math.floor(r * row_h)
-        local x = 0
-        -- 稀疏度：每个 dash 之间空 dash*3，比原来的 dash*2 更淡
-        while x < width do
-            local w = math.min(dash, width - x)
-            if w > 0 then bb:paintRect(x, y, w, 1, Blitbuffer.COLOR_LIGHT_GRAY) end
-            x = x + dash * 3
-        end
-    end
+    -- ★★★ 41-plain-chart：**横向网格线也删掉了**（原来这里有 3 条浅灰点线）。
+    --
+    --   用户原话：「另外，y 轴的刻度怎么没去掉」——
+    --   他说的「刻度」就是这几条横线：它们的**唯一**含义是「Y 轴刻度值所在的
+    --   高度」（1 行 / 2 行 / 3 行处），而 40 那轮已经把 Y 轴那一列数字
+    --   （0秒 / 4分 / 8分 / 13分 / 17分）整列删掉了 ——
+    --   刻度值都没了，画着刻度线的位置也就成了纯粹的干扰线。
+    --
+    --   ⚠ 注意这里删的是**网格线**，不是基线：基线（最下面那条纯黑实线）
+    --     是「柱子的地面」，删了柱子会像浮在半空。见函数末尾的 paintRect。
+    --   ⚠ 顺带：`row_h = height / TREND_ROWS` 也因此没人用了，一起删掉
+    --     （TREND_ROWS 现在只被 buildTrendSection 用来算 chart_h）。
+    --   ⚠ 别再照着「网格线＝用密度区分主次」的老注释写回来：用户要的是
+    --     **干净**，不是「更淡的网格」。真要参照高度，看柱顶的数字标签。
 
     local count = math.max(1, #buckets)
     local slot = width / count
-    -- ★★★ 37s：柱子加粗（用户：「实心柱可以粗一点」）。
-    --   0.6 → 0.8：原来柱间空隙占 40%，在 e-ink 上看着像一根根细线；
-    --   0.8 之后空隙 20%，柱子明显更敦实，又仍留得下相邻柱的分界。
-    --   ⚠ 这个比例同时影响柱顶数值标签的观感（柱子越宽，标签越不显得飘），
-    --     但**不影响**标签抽稀的计算 —— 那边只看 slot，不看 bar_w。
-    local bar_w = math.max(1, math.floor(slot * 0.8))
+    -- ★★★ 37s：柱子加粗（用户：「实心柱可以粗一点」）。0.6 → 0.8。
+    --   ★★★ 39-bar-thicker：再 0.8 → **0.9**（用户看预览图后又说「柱子变粗」）。
+    --   ★★★ 40-bar-thickest：用户第三次要求「柱体尽量粗」。
+    --     这次不再「按比例留缝」，改成**至少留 2px 缝、其余全给柱子**：
+    --         旧：bar_w = floor(slot * 0.9)          —— 缝固定占 10%
+    --         新：bar_gap = max(2, floor(slot*0.08))
+    --             bar_w  = floor(slot) - bar_gap
+    --     两者在「桶多」时结果几乎一样（月视图 31 桶：slot≈29.5 ⇒ 都是 27px），
+    --     但在「桶少」时新写法明显更粗（年/累计 12 桶：70 → 74px；
+    --     周视图 7 桶：120 → 120px）。
+    --     ★ 真正让柱子变粗的其实是**另一件事**：40-no-y-axis 之后绘图区
+    --       从 704px 涨到 914px（整条 inner_w），月视图 slot 从 22.7 → 29.5，
+    --       柱宽从 20px → 27px（+35%）。光调比例拿不到这个量级。
+    --     ⚠ 下限 2px 是 e-ink 的安全线：300dpi 上约 0.17mm。再细相邻柱
+    --       在灰阶抖动下就糊成一片了 —— 所以不写 `floor(slot) - 1`。
+    --     ⚠ 这个宽度同时影响柱顶数值标签的观感（柱子越宽，标签越不显得飘），
+    --       但**不影响**标签抽稀的计算 —— 那边只看 slot，不看 bar_w。
+    local bar_gap = math.max(2, math.floor(slot * 0.08))
+    local bar_w = math.max(1, math.floor(slot) - bar_gap)
     local min_bar_h = math.max(2, Screen:scaleBySize(2))
     for i, bucket in ipairs(buckets) do
         local value = tonumber(bucket.value) or 0
@@ -625,7 +692,22 @@ local function buildChartImage(buckets, metric, selected_index, width, height, s
         end
     end
 
+    -- ★★★ 41-plain-chart：**均值虚线也删掉了**（原来这里有一段
+    --   「12px 长划线 + 8px 间隔、COLOR_DARK_GRAY(0x88)」的绘制代码）。
+    --
+    --   历史：39 先把它从纯黑降成深灰（39-mean-subtle，用户「不需要参照线加强」），
+    --   41 用户直接说「虚线去掉」。
+    --   删除后本函数的绘制层次只剩两层，非常干净：
+    --         选中柱 0x00  <  未选中柱 0xCC
+    --   ⚠ 顺带说明：`COLOR_DARK_GRAY(0x88)` 在本文件里**还有别的使用者**
+    --     （标题栏下划线、卡片样式说明文字、下钻浮窗的次要文字等 4 处），
+    --     所以只是本函数不再用它，别顺手把这个常量当成死代码。
+    --   ⚠ 想知道「哪几格高于平均」怎么办：柱顶现在每根都写着数值
+    --     （40-unit-free），而「日均阅读时长」在总览页有专门卡片，
+    --     口径与原来那条线完全一致 —— 用户已经明确表示不需要图内再画一条。
+
     local base_h = math.max(1, Size.line.medium)
+
     bb:paintRect(0, height - base_h, width, base_h, Blitbuffer.COLOR_BLACK)
 
     return ImageWidget:new{ image = bb }
@@ -665,17 +747,42 @@ end
 --- 返回 `{ { x = , y = , widget = ... }, ... }`，坐标相对**图表位图**左上角。
 ---
 --- y **允许为负**，而且这不是 bug：
----   `buildTrendSection` 里图表是 `HorizontalGroup{align="center"}` 居中在一个
----   6*row_h 高的带里的，而图本身只有 4*row_h 高 —— 图上、图下各空出一整行
----   （row_h，KPW4 上约 63px）。最高的柱子顶到图顶时，它的标签 y ≈ -(标签高+间距)，
----   正好落进**上方那行本来就空着**的区域：既不会盖住柱子，也不会顶到标题
----   （标题下面还隔着一个 vertical span）。
----   ⇒ 这正是「不挪动任何既有布局就能塞进标签」的原因，别改成给图加高。
----
---- ⚠ 由此带来一条**必须守住的约束**：`标签高 + 间距 ≤ 图上方那一行的高度`。
----   KPW4 上两者约 41 vs 62，余量够；但**以后若把 faces().value 的字号调大**，
----   必须回来重算这个约束 —— 一旦超出，标签就会顶到「阅读字数趋势」标题上。
+---   图本身只有 4*row_h 高，最高的柱子顶到图顶时，它的标签
+---   y ≈ -(标签高+间距)，也就是画到**图上方**去。
+---   ⇒ 前提是 `buildTrendSection` 在图的上面**显式留了一块** VerticalSpan
+---     （40-no-y-axis 之后由它负责，之前是 Y 轴刻度列比图高一行白送的 62px）。
+---     那块留白不够高，最高的那根柱子的数字就会压到标题上。
 ---   （y 的公式本身是自限的：bar_h ≤ height ⇒ y ≥ -(标签高+间距)，不会更远。）
+---
+--- ⚠ 由此带来一条**必须守住的约束**：
+---   `标签高 + 间距 ≤ buildTrendSection 里那个 VerticalSpan 的高度`。
+---   40 之后那个 span 是**按 `labelMetrics("0", f.value).h` 现算的**，
+---   所以只要字号是通过 faces() 改的，这条约束自动成立；
+---   但**别再手写死像素** —— 一改字号就会顶到标题上。
+---
+--- ★★★ 40-unit-free：现在的目标是**每根有数据的柱子都标上**。
+---
+---   用户原话：「每个柱体上方都加上数值注释，单位统一的可以不带单位」。
+---   上一轮（37s）只做到「尽量多标」，因为当时的标签是**带单位**的
+---   （「15分」「83秒」「153.1万」），横向空间根本不够。这一轮把三处
+---   一起改了，才真正接近「每根都标上」：
+---     ① 标签**不带单位**（chartBarLabel）—— 单这一项就窄掉 30~40%；
+---     ② 绘图区从 704px 涨到 914px（删掉 Y 轴列）—— slot +30%；
+---     ③ 标签最小缝 11px → 3px。
+---   实测（`_verify/zerolabel.lua`，标签宽度按 cfont 13px 建模：ASCII 7.2px、
+---   CJK 13px；月视图 31 桶、只有 01~04 四天有数据）：
+---     · 39 的**带单位**标签（「1.4分」→ 实际是「1分23秒」那种） + 旧宽度 704px
+---       ⇒ 4 根里只标得上 **2** 个（01、03）；
+---     · 40 的**无单位**标签 + 旧宽度 704px ⇒ 真实那 4 天的数据已经能 **4/4**；
+---     · 40 的无单位标签 + 新宽度 914px ⇒ 4/4，而且**余量明显更大**：
+---       换一组 3 位数字的标签做对照，704px 只有 2/4、914px 是 4/4。
+---   ⇒ 结论：真正把「标不满」解决掉的是**去掉单位**；把绘图区加宽是
+---     给更长的标签留余量（阅读字数那种「153.1万」就靠它）。
+---   ⚠ 但「每根都标上」在几何上**不是永远成立**的：当标签本身比一根柱子
+---     还宽时（典型：阅读字数月视图出现「153.1万」这种 5~6 字符标签、
+---     而一个月有 31 根柱子，slot 只有 29px），怎么摆都会叠。
+---     那种情况下仍然退回贪心抽稀 —— **宁可少标几根，也不让两个数字
+---     糊成一团**（那是不可读，比少标更糟）。
 ---
 --- 铺排策略：**贪心**，不是「隔 n 根标一个」。
 ---   从**当前选中那根**出发，向左右各扫一遍，只要跟上一个已放置的标签不重叠
@@ -687,18 +794,21 @@ end
 ---     2) 从选中柱出发（而不是从左端）是为了保证**当前选中那根一定有数值** ——
 ---        否则会出现「刚点了某根柱子，却在图上找不到它的数」的尴尬。
 ---   桶少时（周视图 7 根）贪心自然全部放得下，那就是用户要的「每根都有」。
----   放不下时宁可少标几根，也绝不让两个数字叠在一起糊成一团 —— 那是不可读。
-local function chartValueLabels(buckets, metric, selected_index, width, height, scale_max)
+local function chartValueLabels(buckets, unit, selected_index, width, height, scale_max)
     local f = faces()
     local count = #buckets
     if count == 0 then return {} end
     local slot = width / count
-    local gap = Screen:scaleBySize(6)
+    -- ★★★ 40-unit-free：标签之间的**最小缝**从 scaleBySize(6)=11px 收到 3px。
+    --   标签自己带白底（下面 place() 里那个 FrameContainer），两个数字之间
+    --   只要有 3px 白就分得开 —— 这 11px 以前白白吃掉了近半根柱子的宽度，
+    --   正是「明明放得下却标不上」的直接原因。
+    local gap = Screen:scaleBySize(3)
     local min_bar_h = math.max(2, Screen:scaleBySize(2))
 
     local texts = {}
     for i, bucket in ipairs(buckets) do
-        texts[i] = metricBarLabel(bucket.value, metric)
+        texts[i] = chartBarLabel(bucket.value, unit)
     end
     local label_h = labelMetrics(texts[1] or "0", f.value).h
 
@@ -732,25 +842,62 @@ local function chartValueLabels(buckets, metric, selected_index, width, height, 
         return x, x + w
     end
 
+    -- ★★★ 39-zero-label：**值为 0 的桶不标数值**。
+    --
+    --   用户反馈「趋势图看不懂」的**第三个**原因（前两个是 X 轴刻度造错、
+    --   图里没有参照）。这一条是「噪音太多」：
+    --
+    --     月视图 = 31 个桶，但通常只有几天真的读过书；
+    --     日视图 = 24 个桶，通常只有两三个小时在读书。
+    --     而这里**原先对 value == 0 的桶也照样摆标签** ——
+    --     于是底部会糊上一整排「0秒」/「0」，把真正有数的三四根柱子
+    --     彻底淹掉。这跟本函数注释里写的初衷（「绝不让两个数字叠在一起
+    --     糊成一团 —— 那是不可读」）是同一个毛病，只是换成了「重复」。
+    --
+    --   ★ 为什么是「跳过 0」而不是「全都不标」：37s 那条用户要求是
+    --     「每根柱子都标上」。**值为 0 的桶根本没有柱子**（barPixelHeight
+    --     返回 0，不画），给它标个 0 不在那条要求的范围内。
+    --     有柱子的桶（哪怕只有 1 秒）依旧照标，行为不变。
+    --
+    --   ★ 选中柱若是 0，也不再强标 —— 它的数值底部读数行里已经有了。
+    --     这是对 37s「选中柱一定有标签」那条的**有意放宽**，因为那个
+    --     保证的价值（「刚点了某根柱子却在图上找不到它的数」）在 0 柱上
+    --     并不成立：柱子本身就不存在，读者不会去找它的数。
+    local function has_value(i)
+        local v = buckets[i] and tonumber(buckets[i].value) or 0
+        return v > 0
+    end
+
     -- 锚点 = 选中柱（越界/缺省都夹回合法范围）
     local anchor = tonumber(selected_index) or 1
     anchor = math.max(1, math.min(count, anchor))
 
-    local left_edge, right_edge = place(anchor)
+    -- ★ 锚点的左右边沿**无论标不标都要先算出来** —— 左右两遍扫描
+    --   都是以「选中柱的位置」为起点向外走的，跳过 0 桶不能改变这个起点。
+    local anchor_x, anchor_w = label_x(anchor)
+    local left_edge, right_edge = anchor_x, anchor_x + anchor_w
+    if has_value(anchor) then place(anchor) end
 
     -- 向左：只要不压到已放置标签的左边沿就放
+    --   ⚠ 跳过 0 桶时**不要动 left_edge** —— left_edge 记的是「最左那个
+    --     已放置标签的左沿」，被跳过的桶什么都没放，不能拿它的位置去
+    --     收紧后面（更靠左）的判定，否则会把本来放得下的标签误判为重叠。
     for i = anchor - 1, 1, -1 do
-        local x, w = label_x(i)
-        if x + w + gap <= left_edge then
-            left_edge = place(i)
+        if has_value(i) then
+            local x, w = label_x(i)
+            if x + w + gap <= left_edge then
+                left_edge = place(i)
+            end
         end
     end
     -- 向右：同理
     for i = anchor + 1, count do
-        local x = label_x(i)
-        if x >= right_edge + gap then
-            local _unused, nr = place(i)
-            right_edge = nr
+        if has_value(i) then
+            local x = label_x(i)
+            if x >= right_edge + gap then
+                local _unused, nr = place(i)
+                right_edge = nr
+            end
         end
     end
     return items
@@ -760,54 +907,171 @@ end
 ---
 --- 抽稀（桶太密时少标几根）由 chartValueLabels 自己决定，这里不关心。
 --- 没有任何标签时直接返回裸位图，保持与改动前完全一致的对象结构。
-local function buildChartWidget(buckets, metric, selected_index, width, height, scale_max)
-    local image = buildChartImage(buckets, metric, selected_index, width, height, scale_max)
-    local labels = chartValueLabels(buckets, metric, selected_index, width, height, scale_max)
+---
+--- ★★★ 40-unit-free：第二个参数从 `metric` 改成 `unit`（chartUnit 的产物）。
+---   柱子本身不需要单位，只有**柱顶标签**需要 —— 所以单位一直传到
+---   chartValueLabels 那一层就够了。
+--- ★★★ 41-plain-chart：**去掉了 `mean` 参数**（它唯一的用途是透传给
+---   buildChartImage 画均值虚线，那条线已删）。参数表因此从 7 个缩到 6 个。
+local function buildChartWidget(buckets, unit, selected_index, width, height, scale_max)
+    local image = buildChartImage(buckets, selected_index, width, height, scale_max)
+    local labels = chartValueLabels(buckets, unit, selected_index, width, height, scale_max)
     if #labels == 0 then return image end
     local items = { { x = 0, y = 0, widget = image } }
     for _i, item in ipairs(labels) do items[#items + 1] = item end
     return AbsoluteContainer:new{ width = width, height = height, items = items }
 end
 
---- Y 轴刻度列。标签列比图高一行，靠 HorizontalGroup 的居中对齐落在网格线上。
-local function buildAxisColumn(labels, label_width, row_h, color)
-    local f = faces()
-    local group = VerticalGroup:new{}
-    group[#group + 1] = VerticalSpan:new{ width = math.floor(row_h / 2) }
-    for _i, label in ipairs(labels) do
-        group[#group + 1] = FixedBox:new{
-            width = label_width,
-            height = row_h,
-            align = "right",
-            vertical_align = "center",
-            text(label, f.axis, { color = color }),
-        }
+--- ★★★ 40-no-y-axis：**Y 轴刻度列已删除**。
+---
+---   用户原话：「统计图可以只要底部，不要 y 轴」。
+---   原来的 `buildAxisColumn(labels, label_width, row_h, color)` 把 5 个刻度
+---   （0秒 / 4分 / 8分 / 13分 / 17分）竖着排在图的左边，吃掉 `inner_w * 0.22`
+---   —— KPW4 上是 201px，比 31 根柱子里任何一根都宽。
+---   删掉之后：
+---     · 那 201px + 9px 间距**全部还给绘图区**（704 → 914px），
+---       月视图 slot 22.7 → 29.5px，柱宽 20 → 27px；
+---     · 整张图自然**往左移**（用户要的「适当往左一点」），
+---       左边界从「卡片内边距 + 210px」变成「卡片内边距」；
+---     · 代价是**没有刻度参照**了 —— 但用户同时要求「每个柱体上方都加上
+---       数值注释」，每根柱子自己带数，参照由标签承担（见 chartUnit）。
+---   ⚠ 上面这段是 40 那轮写的。**41 已经把横向网格虚线也删了** ——
+---     当时以为「网格线不是轴、是辅助线，可以留」，用户随后明确说
+---     「y 轴的刻度怎么没去掉」，指的就是这几条线（见 buildChartImage 里的注释）。
+---     所以现在图里只剩：柱子 + 柱顶数值 + 最底下那条纯黑基线。
+---     这里保留 40 的原文，是为了让后来者看到「当时的判断是什么、
+---     为什么后来被推翻」—— 别再照着它把网格线写回来。
+---
+---   （留这段注释是为了让后来者知道「这里曾经有一列 Y 轴刻度」，
+---     别再照着写回来 —— 需要它的人是没读懂上面那段。）
+
+--- ★★★ 41-tick-compact：X 轴刻度文字「**只写变化的部分**」。
+---
+---   用户原话：「只有12月和一月中间下方位置显示过渡的年份，日期和时间也是」。
+---
+---   问题出在**累计视图**：它的桶标签是 `os.date("%y年%m月", ts)`，12 格长这样 ——
+---       25年11月 25年12月 26年01月 26年02月 … 26年10月
+---   年份被重复了 12 次，而 12 格里真正有信息量的只有**跨年那一次**
+---   （12月 → 01月）。一排「25年」「26年」白白吃掉近一半横向空间，
+---   把真正要读的月份挤没了。
+---
+---   规则：去掉「%y年」前缀，**只在年份发生变化的那一格**保留。
+---       改前：25年11月 25年12月 26年01月 26年02月 …
+---       改后：11月      12月      26年01月 02月      …
+---
+---   ⚠ 三点刻意的取舍，都写在这里免得以后当成 bug 改掉：
+---     · **第一格也不留年份**。用户说的是「只有12月和一月中间下方位置
+---       显示过渡的年份」——「只有」把第一格也排除了。
+---       代价是累计视图看不出起点是哪一年；好在上一行周期导航写着当前
+---       年份（"2026年"），能倒推。若哪天想「第一格也带上年份」，
+---       把下面 `prev_year ~= nil` 这个条件去掉即可（就一行）。
+---     · 只认 `^%d%d年` 这种前缀，认不出的一律**原样返回**。
+---       月视图的 "01".."31"（日期）、日视图的 "00".."23"（时间）、
+---       周视图的 "一".."日"、年视图的 "01月".."12月" 都没有年份前缀，
+---       ⇒ 结果**就是不变**。这正是用户那句「日期和时间也是」的含义：
+---         同一套规则套到「日期」和「时间」刻度上，结论是它们本来就没在
+---         重复什么 —— 要的是**规则统一**，而不是给每种粒度各写一份特例。
+---     · 压缩后长度**只减不增**，所以绝不会把原来放得下的刻度挤掉；
+---       反而让累计视图从「12 格只标 6 格」变成「12 格全标」。
+---
+---   ⚠ 必须在**抽稀之前**调用：抽稀量的是刻度文本宽度，量压缩后的才对。
+local function compactTickLabels(labels)
+    local out = {}
+    local prev_year
+    for i, raw in ipairs(labels) do
+        local s = tostring(raw)
+        local yy, rest = s:match("^(%d%d)年(.+)$")
+        if yy then
+            if prev_year ~= nil and yy ~= prev_year then
+                out[i] = s        -- 跨年那一格：保留「26年01月」
+            else
+                out[i] = rest     -- 其余各格：只留「11月」
+            end
+            prev_year = yy
+        else
+            out[i] = s            -- 没有年份前缀的（日期/时间/星期/月）原样
+        end
     end
-    group[#group + 1] = VerticalSpan:new{ width = math.floor(row_h / 2) }
-    return group
+    return out
 end
 
 --- X 轴刻度行：按每个柱子的中心 x 绝对定位。
-local function buildTickRow(bucket_count, chart_width, tick_height, period, color)
+---
+--- ★★★ 39-trend-axis：**刻度必须用 `bucket.label`，绝不能按 period 现造**。
+---
+---   用户反馈「趋势图看不懂」。查下来这是**最直接的原因**：
+---   旧实现这里调 `trendBucketLabels(period, count)` 自己生成刻度，
+---   而 `GlobalStats.trend` 给每个 bucket 的 `label` 是另一套 —— 两边对不上：
+---
+---     | 粒度 | 真实 bucket.label        | 旧刻度（现造） | 后果 |
+---     |------|--------------------------|----------------|------|
+---     | 日   | "00".."23"（**每小时一根**）| 0..23 裸数字   | 看着像「日期」，其实是小时 |
+---     | 周   | 一..日                    | 一..日         | ✓ |
+---     | 月   | "01".."31"                | 1..31          | 丢前导零，勉强 |
+---     | 年   | "01月".."12月"            | 1..12          | **丢了「月」** |
+---     | 累计 | "25年10月" 这种            | 1..12          | **完全看不出是哪年哪月** |
+---
+---   更糟的是**列表视图用的是 `bucket.label`（正确）** ⇒ 同一份数据在
+---   「图表」和「列表」两个视图里 X 轴含义不一致，来回切一下就对不上了。
+---
+---   现在两个视图统一走 `bucket.label`，口径一致。
+---   抽稀逻辑不变，只是量的是**真实刻度文本**的宽度。
+---   ★ 41-tick-compact 之后累计视图的刻度变短了（"25年10月" → "10月"），
+---     所以它不再「自动少标几个」，12 个月能全标上 —— 这是顺带的好处。
+---
+--- ★★★ 41-tick-compact：刻度文字先过一遍 `compactTickLabels`，见上。
+local function buildTickRow(buckets, chart_width, tick_height, color)
     local f = faces()
-    local labels = trendBucketLabels(period, bucket_count)
-    local slot = chart_width / math.max(1, bucket_count)
+    local raw_labels = {}
+    for i, bucket in ipairs(buckets) do
+        raw_labels[i] = tostring((bucket and bucket.label) or i)
+    end
+    local labels = compactTickLabels(raw_labels)
+    local bucket_count = math.max(1, #labels)
+    local slot = chart_width / bucket_count
 
-    -- 先量一下最宽的刻度文本，决定要不要隔一个显示
-    local probe = text(labels[#labels] or "0", f.axis, { color = color })
-    local probe_w = probe:getSize().w
-    probe:free()
-    local min_slot = probe_w + Screen:scaleBySize(8)
-    local stride = math.max(1, math.ceil(min_slot / math.max(1, slot)))
-
+    -- ★★★ 43-tick-greedy：**改成「按实际宽度贪心摆放」**，不再用固定 stride 隔格丢。
+    --
+    --   用户报：「x 轴只显示 11月 26年1月，不显示 12月」。
+    --   老写法是 `stride = ceil((某格文本宽 + 15px) / slot)`，然后
+    --   `(i-1) % stride == 0` 的格子才显示。两个问题：
+    --     1) 量的是 `labels[#labels]`（**最后一格**）的宽度，而它未必是最宽的
+    --        （累计视图最后一格是「10月」，最宽的却是「26年01月」）；
+    --     2) 隔格丢是**机械的**：哪怕两格之间明明塞得下，只要序号不对就被丢掉。
+    --        累计视图 12 格 / 842px ⇒ slot≈70px；41-tick-compact 之前标签是
+    --        「25年11月」约 70px ⇒ stride=2 ⇒ 第 2 格（12月）**必被丢**，
+    --        而第 3 格（26年01月）靠「带年」后门被保住 —— 正好就是用户看到的样子。
+    --
+    --   现在：从左到右逐格试放，**只有当这一格真的会和上一格叠在一起才跳过**，
+    --   且 `min_gap` 用 scaleBySize(4)=8px（老写法的 8 折算出来是 15px，偏保守）。
+    --   ⇒ 压缩后的标签（「11月」约 35px）在 ≈70px 的 slot 里全都放得下，
+    --     12 个月一个不落。
+    --
+    --   ★ 两道**保底**（信息量最大的两格绝不允许被丢）：
+    --     · 带「年」的那一格 —— 跨年分界，丢了整张图看不出是哪年哪月；
+    --       ⚠ 判据用**压缩后**的 labels（压缩前累计视图每格都含「年」，
+    --         拿压缩前的判就等于强制全显，抽稀直接失效）。
+    --     · **最后一格** —— 也就是「最近的月份」，最常被看；
+    --       用户这次报的正是它前面那格被丢。
+    --   保底格如果和上一格撞了，就把**上一格**撤掉：宁可少标一个，
+    --   也不能让这两格消失。
+    local min_gap = Screen:scaleBySize(4)
     local items = {}
+    local placed_right = nil   -- 上一个已放下刻度的右边界（判重叠用）
     for i = 1, bucket_count do
-        if (i - 1) % stride == 0 then
-            local widget = text(labels[i] or tostring(i), f.axis, { color = color })
-            local w = widget:getSize().w
-            local x = math.floor((i - 1) * slot + slot / 2 - w / 2)
-            x = math.max(0, math.min(x, chart_width - w))
+        local widget = text(labels[i] or tostring(i), f.axis, { color = color })
+        local w = widget:getSize().w
+        local x = math.floor((i - 1) * slot + slot / 2 - w / 2)
+        x = math.max(0, math.min(x, chart_width - w))
+        local keep_year = labels[i] ~= nil and labels[i]:find("年", 1, true) ~= nil
+        local forced = keep_year or (i == bucket_count)
+        local fits = (placed_right == nil) or (x >= placed_right + min_gap)
+        if forced or fits then
+            if forced and not fits and #items > 0 then
+                table.remove(items)   -- 撤掉挡住保底格的那一格
+            end
             items[#items + 1] = { x = x, y = 0, widget = widget }
+            placed_right = x + w
         end
     end
     local row = AbsoluteContainer:new{
@@ -857,7 +1121,7 @@ end
 
 --- 卡片大数字的候选字号。宽度不够就整档降级，避免多列卡片互相压字。
 --- ★ 32：整体上调（用户要求字体更大）；同时因为改成多列，降级档位也保留。
-local VALUE_SIZE_PAIRS = { { 32, 19 }, { 28, 17 }, { 23, 15 }, { 19, 13 }, { 16, 11 } }
+local VALUE_SIZE_PAIRS = { { 29, 18 }, { 26, 16 }, { 22, 14 }, { 18, 12 }, { 15, 10 } }
 local VALUE_FACES
 
 local function valueFaces()
@@ -900,14 +1164,25 @@ local function buildCardContent(spec, inner_width)
     group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
 
     -- 第二行：标签（+ 可下钻的 ">"）
-    -- ★ 32：图标不再 dim（那是灰化）；标签文字本来就是黑色，这里保持不变。
+    --
+    -- ★★★ 41-no-card-icon：**卡片左侧的小图标删掉了**（用户：「总览页的卡片
+    --   不要图标」）。
+    --   · 删的是行首那个 `icon(spec.icon, ...)`。行尾那个 `chevron.right`
+    --     **保留** —— 它是「这张卡能点进去下钻」的**唯一**线索（卡片没有
+    --     边框、没有按钮外观），和行首那个纯装饰性图标不是一回事。
+    --   · 顺带把 `icon_size` 和它参与的 max_width 算术一起收掉：标签文字
+    --     现在直接从卡片内边距起排，可用宽度多了 icon_size + 5px
+    --     （KPW4 上 15+5 经 scaleBySize 后约 33px）——
+    --     最长的两个标签「日均阅读时长」「单日阅读最久」因此少折一行。
+    --   · 卡片 spec 里的 `icon = "..."` 字段**留着没删**：删它要动 9 处数据
+    --     定义、风险不成比例；而且万一哪天想加回来，恢复上面这一行就够。
+    --     留一个没人读的字段，比留一段被注释掉的代码干净。
+    --   ⚠ 不要再给 label_row 加 `HorizontalSpan` 去「补」左边那块空位 ——
+    --     那等于把图标换成了空白，用户要的是**标签整体靠左**。
     local label_row = HorizontalGroup:new{ align = "center" }
-    local icon_size = Screen:scaleBySize(15)
-    label_row[#label_row + 1] = icon(spec.icon, icon_size)
-    label_row[#label_row + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(5) }
     label_row[#label_row + 1] = text(spec.label, f.label, {
         color = Blitbuffer.COLOR_BLACK,
-        max_width = inner_width - icon_size - Screen:scaleBySize(20),
+        max_width = inner_width - Screen:scaleBySize(20),
     })
     if spec.drill then
         label_row[#label_row + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(2) }
@@ -952,13 +1227,47 @@ end
 --                「attempt to index a nil value」**直接崩**。用户报的
 --                「卡片样式标签 koreader 闪退」就是它。
 --                自造控件只按给定的 width/height 画矩形，不依赖子控件。
+-- ★★★ 42-round-dot：分隔线的圆点参数（**只改这两个常量就能调密度**）
+--
+--   用户原话：「分隔线密集一点，不是圆点吗，怎么都是方的」。
+--
+--   先说清楚**真实像素** —— 前面几轮一直算错了：
+--     KOReader 的换算在 `ffi/framebuffer.lua:414`：
+--         scaleBySize(px) = ceil(px * (size_scale + dpi_scale) / 2)
+--         size_scale = min(屏宽, 屏高) / 600
+--         dpi_scale = size_scale   -- 没设 `screen_dpi` 覆盖时两者相等
+--     ⇒ **scaleBySize(px) = ceil(px * min(W, H) / 600)**
+--     KPW4 是 1072×1448（crash.log 里 `initializing for device KindlePaperWhite4`
+--     紧跟着就是 w=1072 / h=1448），且 settings 里**没有** `screen_dpi`
+--     ⇒ 系数 = 1072/600 = 1.78667，并且**向上取整**：
+--         scaleBySize(1)=2   (2)=4   (3)=6   (4)=8   (5)=9
+--     （不是 `floor(n * 1.875)` —— 那是按 300dpi 直接折算，KOReader 不这么算。）
+--
+--   所以「现状」那条线的真实尺寸是：
+--     **4px 宽 × 2px 高的小方块，间隔 8px，周期 12px**
+--   宽高比 2:1 ⇒ 在 300dpi 上就是一排小方块 —— 这就是「怎么都是方的」。
+--
+--   改法：圆点改用 `bb:paintCircle`（`ffi/blitbuffer.lua:1948`，
+--   `w` 默认 = `r` ⇒ 实心）。半径 2 ⇒ 直径 5px 的实心圆
+--   （光栅 3/5/5/5/3 的圆角方块；1× 下就是个圆点）。
+--   ⚠ 半径 1（3px）的光栅是**十字**（1/3/1），不是圆 ⇒ 最小可用半径就是 2。
+--   ⚠ 半径 3（7px）最圆，但直径 7px 的点在 300dpi 上已经偏重，
+--     而且横屏（`avail=376`）每页行数会从 5 掉到 4 ⇒ 不用。
+--
+--   密度：点 5px + 隔 4px ⇒ **周期 9px**，比原来的 12px 密 25%。
+--   ⚠ 间隔别调到 3px 以下（点会粘连成「串珠」）；想更疏就往 5~6px 调。
+local SEP_DOT_R   = 2                       -- 圆点半径(px)：2 ⇒ 直径 5px
+local SEP_DOT_GAP = Screen:scaleBySize(2)   -- 点间隔(px)：KPW4 上 = 4px
+
 local HRule = WidgetContainer:extend{
     width = nil,
     height = nil,
     color = Blitbuffer.COLOR_BLACK,
     dotted = false,
-    dot_len = nil,   -- 点长（dotted 时用）
-    gap_len = nil,   -- 间隔
+    dot_r = SEP_DOT_R,   -- ★ 42：圆点半径。>0 ⇒ 画实心圆点；置 0 ⇒ 回退成横条
+    dot_gap = nil,       -- ★ 42：圆点间隔（nil ⇒ 用 SEP_DOT_GAP）
+    dot_len = nil,       -- 旧「横条」参数，已无调用点，保留只为兼容
+    gap_len = nil,       -- 同上
 }
 
 function HRule:getSize()
@@ -973,8 +1282,54 @@ function HRule:paintTo(bb, x, y)
         bb:paintRect(x, y, size.w, size.h, self.color)
         return
     end
-    local dot = self.dot_len or Screen:scaleBySize(4)
-    local gap = self.gap_len or Screen:scaleBySize(6)
+    -- ★★★ 42-round-dot：圆点模式（参数见文件上方的 SEP_DOT_R / SEP_DOT_GAP）。
+    --
+    --   ⚠ 圆点**故意画得比 size.h 高**：size.h 还是 2px（scaleBySize(1)），
+    --     而圆点直径是 5px。行高保持 2px 是**为了不动分页预算** ——
+    --     buildUnitsPage 里 `rows_per_page = avail / (row_h + line_w)`。
+    --     ★ 42b 更正：这里原来写「把 line_w 从 2 抬到 5 会让 KPW4 上每页
+    --       从 9 行掉到 8 行」，**算错了**。按本文件常量复算：
+    --         竖屏 avail=715 / row_h=72 ⇒ 分隔带 2px: 715/74=9.66 → 9 行
+    --                                     分隔带 5px: 715/77=9.29 → **还是 9 行**
+    --         横屏 avail=376 / row_h=72 ⇒ 分隔带 2px: 376/74=5.08 → 5 行
+    --                                     分隔带 5px: 376/77=4.88 → **掉到 4 行**
+    --       所以「不抬行高」的真正理由是**横屏**会掉一行，竖屏其实无所谓。
+    --     多出来的 ±2px 溢到相邻行的**空白**里，三处调用点都安全：
+    --       · 阅读字数列表行 / 下钻浮窗行 = 透明 FixedBox（文字在 row_h 里
+    --         垂直居中，上下各留 ~20px 空白）；
+    --       · 「点线」卡片样式那处，行间距是 9px 的透明 VerticalSpan（cell_gap）。
+    --     而且**没有任何东西会擦掉它**（42b 已核）：
+    --       · 全 KOReader 树里 `setClipRect` 出现 **0 次** —— 不存在裁剪矩形；
+    --       · 唯一的「裁剪」是 ScrollableContainer 把子控件画到白画布再 blit
+    --         一块，而分隔线在容器 dimen 之内（列表页更是不用滚动容器）；
+    --       · 列表行都是透明 FixedBox，不画底色 ⇒ 后画的行不会盖住上一条点。
+    --
+    --   ⚠ 42b：`r` 取整、`gap` 夹到 >= 0。两者都是**防呆**：
+    --     `paintCircle` 内部按像素步进，`r` 传小数会在 FFI 索引处报
+    --     「number has no integer representation」；而 `dot_gap` 是公开字段，
+    --     传负值会让 `step <= 0` ⇒ 下面这个 while **死循环**（当前无调用点传，
+    --     但一个公开字段不该留这种地雷）。
+    local r = math.floor(self.dot_r or 0)
+    if r > 0 then
+        local gap = math.max(0, self.dot_gap or SEP_DOT_GAP)
+        local cy = y + math.floor((size.h - 1) / 2)   -- 在分隔带里垂直居中
+        local step = 2 * r + 1 + gap                  -- 周期 = 直径 + 间隔
+        local px = r
+        -- 条件必须是 `px + r < size.w`（不是 `<=`）：paintCircle 点亮的列是
+        -- `px-r .. px+r`，而本控件占的列是 `0 .. size.w-1`，所以最右点亮的列
+        -- 必须 <= size.w-1。写成 `<= size.w` 会在 size.w ≡ 4 (mod 9) 时右溢 1px
+        -- （950 / 821 这两个真实宽度不触发，但卡片样式那条 310px 的会）。
+        while px + r < size.w do
+            bb:paintCircle(x + px, cy, r, self.color)
+            px = px + step
+        end
+        return
+    end
+
+    -- 旧的「横条」回退路径（当前无调用点；只有外部传 dot_r = 0 时才会走到）
+    -- 42b：和圆点分支一样夹一下 —— `gap_len` 传负值在这里同样是死循环。
+    local dot = math.floor(self.dot_len or Screen:scaleBySize(2))
+    local gap = math.max(0, self.gap_len or Screen:scaleBySize(4))
     local px = 0
     while px < size.w do
         local w = math.min(dot, size.w - px)
@@ -1050,7 +1405,7 @@ end
 
 local function wrapCard(content, card_width, card_height, style, on_tap)
     local border = Screen:scaleBySize(1)
-    local pad = Size.padding.default
+    local pad = Size.padding.small
     local card
 
     if style == "grid" then
@@ -1172,13 +1527,28 @@ end
 --   · 竖屏/横屏都用 min/max 取，不写死。
 local POPUP_MARGIN = Size.padding.large           -- 窗口与屏幕边缘的缝隙
 local POPUP_SIDE_PADDING = Size.padding.large     -- 窗口内部左右内边距
-local POPUP_MAX_WIDTH_RATIO = 0.92                -- 宽度不超过屏宽的 92%
-local POPUP_MAX_HEIGHT_RATIO = 0.90               -- 高度不超过屏高的 90%
+-- ★★★ 44-shrink：用户原话「整体的阅读统计能不能缩小一点」⇒ 88%/80% → 84%/76%。
+--   KPW4（1072×1448）上的实际结果：
+--     卡片宽 = floor(1072 * 0.84) = 900（原 943）
+--     内容宽 = 900 - 2*18 = 864（原 907）
+--     趋势图宽 = 864 - 2*18 = 828（原 871）
+--     可用高 = floor(1448 * 0.76) = 1100（原 1158）
+--   ⇒ 窗口四周留白增加，内容区仍保留适合阅读的尺寸。
+local POPUP_MAX_WIDTH_RATIO = 0.84                -- 宽度不超过屏宽的 84%
+local POPUP_MAX_HEIGHT_RATIO = 0.76               -- 高度不超过屏高的 76%
 
--- ★★★ 36：下钻浮窗的尺寸比例 —— 必须**明显小于**主浮窗（0.92 / 0.90），
+-- ★★★ 36：下钻浮窗的尺寸比例 —— 必须**明显小于**主浮窗（0.88 / 0.80），
 --   这样点卡片进去时，能看到下钻框四周还露出主浮窗，一眼就是「叠在上面一层」。
-local DRILL_MAX_WIDTH_RATIO = 0.80
-local DRILL_MAX_HEIGHT_RATIO = 0.72
+local DRILL_MAX_WIDTH_RATIO = 0.78
+local DRILL_MAX_HEIGHT_RATIO = 0.66
+
+-- ★★★ 44-compact：两排标签的**统一高度**（视图排 + 周期排）。
+--   以前是两处硬编码：`buildViewTabs` 里 `scaleBySize(38)`、`buildTabs` 里
+--   `scaleBySize(36)`，而 `buildUnitsPage` 的高度预算里又各抄了一份
+--   （VIEWTAB_H / TABS_H）—— 改一处就会算错可用高、把内容挤出去。
+--   现在统一成一个常量，三处都引用它。
+--   KPW4：scaleBySize(23) = 42（原 47 / 65）。
+local ROW_TAB_H_PX = 23
 
 --==========================================================================
 -- 下钻浮窗（★★★ 34：从全屏 KeyValuePage 改成**悬浮在上层的浮窗**）
@@ -1256,7 +1626,7 @@ end
 function DrillDownPopup:build()
     -- ★★★ 36：下钻浮窗要**明显小于**阅读统计主浮窗（用户要求
     --   「卡片点击进去的显示框比阅读统计要小一点」）。
-    --   主浮窗宽 = 屏宽 * POPUP_MAX_WIDTH_RATIO(0.92)，高 = 屏高 * 0.90；
+    --   主浮窗宽/高分别由 POPUP_MAX_WIDTH_RATIO / POPUP_MAX_HEIGHT_RATIO 限制。
     --   下钻取 0.80 / 0.72 —— 一眼就能看出「这是叠在上面的一层」。
     local frame_w = Screen:getWidth() * DRILL_MAX_WIDTH_RATIO
     frame_w = math.max(Screen:scaleBySize(200),
@@ -1578,7 +1948,48 @@ function StatisticsPage:reload(opts)
     --   让 onCloseWidget 跳过这次刷新，由紧接着的 show(next_page) 一次画完。
     self._skip_close_repaint = true
     UIManager:close(self)
-    UIManager:show(next_page)
+
+    -- ★★★ 43-no-flash：**显式**给「浮窗矩形」一个 `"ui"` 刷新。
+    --
+    --   用户报的「日周切换的时候年月日总会出现一个黑框然后消失」根因在这。
+    --
+    --   老写法是 `UIManager:show(next_page)`（不带刷新参数）。上游 `show()`
+    --   会把它转成 `setDirty(widget, nil, nil)`，而 `_refresh(nil, …)` 是**直接
+    --   返回**的（uimanager.lua:1122-1127：「show/close 没带刷新细节时丢弃，
+    --   免得排一次没用的全屏刷新」）。于是刷新队列一直是空的，最终靠
+    --   `_repaint()` 的兜底（uimanager.lua:1291-1294）补一次
+    --   **`_refresh("partial")`** —— 注意：**没有 region**。
+    --
+    --   ⇒ 两个后果：
+    --     1) region 为 nil ⇒ `_refresh` 把区域填成整屏（:1178），
+    --        所以刷的是整屏而不是浮窗那一块；
+    --     2) 更要命的是 :1163-1175 的**提升规则**：没有 region 的 "partial"
+    --        每 `FULL_REFRESH_COUNT` 次会被提升成 **`"full"`** ——
+    --        `refresh_methods["full"]` 是**带黑闪的整屏全刷**。
+    --        统计页每点一下周期/视图都重建一次，这个计数器涨得飞快，
+    --        于是「总会」看到黑框闪一下再消失。
+    --
+    --   改法：把刷新**提前、显式、带区域**地排进队列 ——
+    --     · 区域 = `self.popup_frame.dimen`（旧浮窗矩形）。
+    --       ✅ 这个矩形在所有视图/周期下**完全一致**，可以放心复用：
+    --          `popup_frame` 的唯一子控件是 `FixedPane`（ScrollableContainer），
+    --          而 `ScrollableContainer` 有 `dimen`（= frame_w × available_h），
+    --          `WidgetContainer:getSize()` 见 dimen 就直接返回它 ——
+    --          所以浮窗尺寸与内容高矮无关，`CenterContainer` 的居中位置也不变。
+    --     · 模式 = `"ui"`（不是 "partial"）。
+    --       ✅ "ui" **不在**提升名单里（名单里只有 "partial"），永远不会被
+    --          提升成带黑闪的 "full"；同时它仍是 e-ink 上的灰阶局部刷新，
+    --          不是 "flashui" 那种闪。
+    --     · 排了刷新 ⇒ `_repaint()` 的兜底不再触发，也就不会再有整屏刷新。
+    --
+    --   ⚠ `popup_frame` 拿不到时（构建失败等极端情形）退回老写法，
+    --     宁可多刷一次也不能不刷。
+    local refresh_region = self.popup_frame and self.popup_frame.dimen or nil
+    if refresh_region then
+        UIManager:show(next_page, "ui", refresh_region)
+    else
+        UIManager:show(next_page)
+    end
     return next_page
 end
 
@@ -1764,11 +2175,11 @@ function StatisticsPage:build()
     --   specs 的顺序（把这两张卡挪到数组头部）—— 它们是「卡片网格」里
     --   的同级卡片，位置就该在网格内部体现，而不是在网格外面另起一块。
     body[#body + 1] = self:buildViewTabs(content_w)
-    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
+    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
     body[#body + 1] = self:buildTabs(content_w)
     body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
     body[#body + 1] = self:buildPeriodNav(content_w, range_label)
-    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
+    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
     if self.view == "overview" then
         -- ★★★ 34：卡片样式切换行（只在总览视图出现，换来换去才有意义）
         body[#body + 1] = self:buildCardStyleRow(content_w)
@@ -1852,100 +2263,179 @@ end
 ---     · 选中   = **黑底白字**（对比强烈，e-ink 上一眼能分辨）
 ---   注意：e-ink 上黑底是「实心反白」，比任何灰度填充都清楚，
 ---   而且不需要灰阶抖动，反而更省刷新。
-function StatisticsPage:buildViewTabs(width)
-    local gap = Size.padding.default
-    -- ★ 32：四个视图按钮排**一行**，不再折成两行两列。
-    local cell_w = math.floor((width - gap * (#VIEW_TABS - 1)) / #VIEW_TABS)
-    local cell_h = Screen:scaleBySize(38)
+--- ★★★ 44-segmented：干净的「分段控件」（**单圈外框 + 单条分隔线**）。
+---
+--- 为什么需要它 —— 用户原话：
+---   「导航和导航各有一张卡片，然后中间会有一个接近重合的线不好看」
+---
+---   老画法给**每一格**都套了一个 `bordersize = scaleBySize(1)`（2px）
+---   的圆角 `FrameContainer`，格子之间又**紧挨着**（没有 span）⇒
+---     · 相邻两格的边框叠在一起 → 接缝变成 **4px 粗线**；
+---     · 两格的圆角在接缝的上下端**几乎重合但不完全重合** → 挤出一个小「腰」。
+---   这就是那条「接近重合的线」。视图排那边因为格子间留了 9px 缝，
+---   反而没有这个问题（所以只有周期排看起来脏）—— 但两排观感不一致。
+---
+---   现在两排统一走标准分段控件：
+---     · 外框**只画一圈**（2px 黑边 + `radius` 圆角 + 白底）；
+---     · 格子内部**不画边框**，格与格之间插一条 2px 黑竖线（单线，不叠）；
+---     · 选中格填黑，圆角取 `radius - 边宽` ⇒ 贴到两端时正好与外框内缘吻合，
+---       不会在角上露出白缝。
+local function buildSegmentedRow(opts)
+    local width = opts.width
+    local height = opts.height
+    local radius = opts.radius or Size.radius.button
+    local items = opts.items or {}
+    local border = Screen:scaleBySize(1)              -- 2px
+    local inner_w = math.max(1, width - 2 * border)
+    local inner_h = math.max(1, height - 2 * border)
+    local n = math.max(1, #items)
+    local sep_w = border
+    local cell_w = math.floor((inner_w - sep_w * (n - 1)) / n)
+
     local row = HorizontalGroup:new{ align = "center" }
+    for i, it in ipairs(items) do
+        if i > 1 then
+            -- 分隔线：一个填黑的窄条。
+            -- ⚠ `FrameContainer` 必须有子控件（`getSize()` 会取 `self[1]`），
+            --   所以塞一个 1×1 的 `FixedBox` 占位；实际尺寸由 `width/height` 决定。
+            row[#row + 1] = FixedBox:new{
+                width = sep_w, height = inner_h,
+                FrameContainer:new{
+                    width = sep_w, height = inner_h,
+                    bordersize = 0, margin = 0, padding = 0,
+                    background = Blitbuffer.COLOR_BLACK,
+                    FixedBox:new{ width = 1, height = 1 },
+                },
+            }
+        end
+        local label = text(it.label, it.face, {
+            color = it.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+            bold = it.active,
+            max_width = math.max(1, cell_w - Screen:scaleBySize(6)),
+        })
+        local inner = FixedBox:new{
+            width = cell_w, height = inner_h,
+            align = "center", vertical_align = "center", label,
+        }
+        if it.active then
+            inner = FixedBox:new{
+                width = cell_w, height = inner_h,
+                align = "center", vertical_align = "center",
+                FrameContainer:new{
+                    width = cell_w, height = inner_h,
+                    bordersize = 0, margin = 0, padding = 0,
+                    background = Blitbuffer.COLOR_BLACK,
+                    radius = math.max(0, radius - border),
+                    FixedBox:new{
+                        width = cell_w, height = inner_h,
+                        align = "center", vertical_align = "center", label,
+                    },
+                },
+            }
+        end
+        if it.on_tap then
+            inner = TapBox:new{ inner, on_tap = it.on_tap }
+        end
+        row[#row + 1] = FixedBox:new{ width = cell_w, height = inner_h, inner }
+    end
+
+    return FixedBox:new{
+        width = width, height = height,
+        align = "center", vertical_align = "center",
+        FrameContainer:new{
+            width = width, height = height,
+            bordersize = border,
+            color = Blitbuffer.COLOR_BLACK,
+            radius = radius,
+            margin = 0, padding = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            row,
+        },
+    }
+end
+
+--- 总览 / 趋势 / 阅读字数 / 阅读速度。
+---
+--- ★★★ 32 用户明确要求：
+---   「我要的是不选中有边框（不要填充颜色），选中的区别开」
+---   ⇒ 未选中 = 白底黑框；选中 = 黑底白字。
+--- ★★★ 44-segmented：整排改成**一个分段控件**（外框一圈 + 单条分隔线），
+---   不再是一格一个圆角框、也不再有 9px 缝 —— 和周期排观感统一。
+function StatisticsPage:buildViewTabs(width)
+    local face = Font:getFace("cfont", 16)
+    local items = {}
     for j = 1, #VIEW_TABS do
         local tab = VIEW_TABS[j]
         local active = tab.value == self.view
-        local label = text(tab.label, Font:getFace("cfont", 17), {
-            color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-            bold = active,
-            max_width = cell_w - Screen:scaleBySize(6),
-        })
         local target = tab.value
-        if j > 1 then row[#row + 1] = HorizontalSpan:new{ width = gap } end
-        row[#row + 1] = FrameContainer:new{
-            width = cell_w, height = cell_h,
-            bordersize = Screen:scaleBySize(1),
-            bordercolor = Blitbuffer.COLOR_BLACK,
-            background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
-            radius = Size.radius.button,
-            padding = 0,
-            TapBox:new{
-                FixedBox:new{ width = cell_w, height = cell_h,
-                    align = "center", vertical_align = "center", label },
-                on_tap = function()
-                    if target ~= self.view then self:reload{ view = target } end
-                    return true
-                end,
-            },
+        items[#items + 1] = {
+            label = tab.label,
+            face = face,
+            active = active,
+            on_tap = function()
+                if target ~= self.view then self:reload{ view = target } end
+                return true
+            end,
         }
     end
-    return FixedBox:new{ width = width, height = cell_h, align = "center", vertical_align = "center", row }
+    return buildSegmentedRow{
+        width = width,
+        height = Screen:scaleBySize(ROW_TAB_H_PX),
+        radius = Size.radius.button,
+        items = items,
+    }
 end
 
 --- 日 / 周 / 月 / 年 / 总
 --- ★★ 32：同「不选中描边、选中反白」的规则。
 ---   外层的 LIGHT_GRAY 底也去掉 —— 用户明确说不要灰色。
+--- ★★★ 44-segmented：改走 `buildSegmentedRow`（单圈外框 + 单条分隔线）。
+---   老画法每格各画 2px 圆角边框、格子紧挨 ⇒ 接缝叠成 4px、圆角挤出小「腰」，
+---   就是用户说的「中间会有一个接近重合的线不好看」。
 function StatisticsPage:buildTabs(width)
     local f = faces()
-    local tab_h = Screen:scaleBySize(36)
-    local tab_w = math.floor(width / #TABS)
-    local row = HorizontalGroup:new{ align = "center" }
+    local items = {}
     for _i, tab in ipairs(TABS) do
         local active = (tab.value == self.period)
-        local label = text(tab.label, f.tab, {
-            bold = active,
-            color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-        })
         local target = tab.value
-        local button = TapBox:new{
-            FixedBox:new{
-                width = tab_w, height = tab_h,
-                align = "center", vertical_align = "center",
-                label,
-            },
+        items[#items + 1] = {
+            label = tab.label,
+            face = f.tab,
+            active = active,
+            -- ★★★ 43-pickers：**点已选中的周期标签 = 弹出该粒度的选择器**。
+            --
+            --   用户原话：「阅读统计里的日周月年以及总览选择能不能重新弄好
+            --     （年的点击可以选择年份，月的点击可以选择月份，日的点击可以
+            --      选择月份，周的点击可以选择第几周（第几周后面跟着时间））」
+            --   并确认交互是「点已选中的才弹选择器」。
+            --
+            --   ⇒ 两级语义：
+            --     · 点**未选中**的标签 → 只切粒度（不打断，不弹窗）
+            --     · 点**已选中**的标签 → 弹该粒度的选择器
+            --       （年→年份列表 / 月→月份列表 / 日→日期列表 / 周→周列表）
+            --   ⚠ 「总」没有可选的格子（累计就是全部），点了什么都不做 ——
+            --     但**不能**什么都不返回：那会让点击穿透到底下的「点空白关闭」。
+            --
+            --   ⚠ 切粒度时**不再**把 anchor 重置成 os.time()。
+            --     老写法 `anchor = os.time()` 有个坑：用户翻到「2021年10月」，
+            --     想切到「月」看一眼，结果被一脚踹回今天 —— 而选择器本身
+            --     就是用来导航到指定年月的，重置只会让人重新翻一遍。
+            --     保持 anchor 也和第 2 行的月/日箭头语义一致（那边也保留 anchor）。
             on_tap = function()
-                if not active then self:reload{ period = target, anchor = os.time() } end
+                if active then
+                    self:showPeriodPicker(target)
+                else
+                    self:reload{ period = target, anchor = self.anchor }
+                end
                 return true
             end,
         }
-        -- 相邻格子共享一条竖边：只给非第一格画左边框，
-        -- 这样整排看起来是一根连续的分段控件，而不是 5 个独立小方块。
-        row[#row + 1] = FixedBox:new{
-            width = tab_w,
-            height = tab_h,
-            FrameContainer:new{
-                width = tab_w,
-                height = tab_h,
-                radius = Size.radius.button,
-                bordersize = Screen:scaleBySize(1),
-                bordercolor = Blitbuffer.COLOR_BLACK,
-                padding = 0,
-                margin = 0,
-                background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
-                button,
-            },
-        }
     end
-    return FixedBox:new{
+    return buildSegmentedRow{
         width = width,
-        height = tab_h,
-        FrameContainer:new{
-            width = width,
-            height = tab_h,
-            radius = Size.radius.button,
-            bordersize = 0,
-            padding = 0,
-            margin = 0,
-            -- ★ 32：不再是 LIGHT_GRAY 底；底色交给每个格子的黑/白。
-            background = Blitbuffer.COLOR_WHITE,
-            row,
-        },
+        height = Screen:scaleBySize(ROW_TAB_H_PX),
+        radius = Size.radius.button,
+        items = items,
     }
 end
 
@@ -1985,7 +2475,7 @@ end
 ---   ★ 「总」粒度：所有箭头置灰（没有可翻的格子）。
 function StatisticsPage:buildPeriodNav(width, range_label)
     local f = faces()
-    local line_h = Screen:scaleBySize(34)
+    local line_h = Screen:scaleBySize(30)
     -- ★★★ 37f/37i：**两行**（年 / 月日）—— nav_h 相应改成 2 行高。
     --   ⚠ 改这里必须同步改 buildUnitsPage 的 PERIODNAV_H 预算，见那里的注释。
     local nav_h = line_h * 2 + Size.padding.tiny
@@ -1995,6 +2485,32 @@ function StatisticsPage:buildPeriodNav(width, range_label)
     if not year_label then year_label = range_label or "" end
     if self.period == "total" then
         year_label, month_day_label = _("累计"), nil
+    end
+
+    -- ★★★ 41-nav-compact：第二行**只说「比第一行更细」的那部分**。
+    --
+    --   用户原话：「日期和时间也是」—— 跟 X 轴刻度（compactTickLabels）
+    --   同一套「只写变化的部分」。导航这里的问题不是重复年份，而是
+    --   **第二行说了比当前粒度更细的东西**：
+    --     · 第一行「2026年」，第二行「10月04日」——
+    --       那个「04日」是**锚点那一天**（global_stats.navLabels 有意如此，
+    --       为了让「内=日 / 外=月」两个热区在所有粒度下语义一致）。
+    --       可切到「年」粒度时，导航明明在说「2026 这一年」，
+    --       第二行却还在报「10月04日」，看着像被切到了某一天。
+    --   所以按粒度把「比粒度更细的部分」去掉：
+    --     · 年    → 「全年」 （年粒度下月、日都不该出现）
+    --     · 月    → 「10月」 （月粒度下「日」是噪声）
+    --     · 周/日 → 保持「10月04日」（日就是它的粒度；周需要一个起点）
+    --
+    --   ⚠ 只改**文字**，控件结构与热区一律不动：第二行里「内=日 / 外=月」
+    --     两个下钻热区的位置、大小、点击语义全部原样保留 ——
+    --     改的是显示，不是交互。所以这里不碰 navLabels 本身
+    --     （那个函数同时被别处用来做「今天是几号」的判断，改它会连坐）。
+    if self.period == "year" then
+        month_day_label = _("全年")
+    elseif self.period == "month" then
+        local mm = tonumber(os.date("%m", self.anchor))
+        if mm then month_day_label = string.format("%d月", mm) end
     end
 
     -- ★★★ 37f/37i：用户要的方案（两行 + 六箭头，由外到内对称）。
@@ -2035,8 +2551,11 @@ function StatisticsPage:buildPeriodNav(width, range_label)
     --   1px 灰边框 + 7px 圆角 —— 用户一眼就知道「这里能点」。
     --   ⚠ 边框色字段是 **`color`**，不是 `bordercolor`
     --     （upstream framecontainer.lua:29 声明 `color`、:139 `paintBorder(..., self.color, ...)`）。
-    --     写成 `bordercolor` 会被**静默忽略**、落回默认黑框 —— 本文件另有 7 处
-    --     写的是 `bordercolor`（grep 可见），因为恰好都想要黑色才一直没暴露。
+    --     写成 `bordercolor` 会被**静默忽略**、落回默认黑框 —— 本文件另有 5 处
+    --     写的是 `bordercolor`（43 轮复查时 grep 得到：2223 / 2361 / 2712 /
+    --     3051 / 3489），因为恰好都想要黑色、与默认值一致才一直没暴露。
+    --     （43 轮**故意没动**这 5 处：改名 `color` 与默认值等价、零行为差异，
+    --     但会扩大无关 diff，不值当。知道是雷即可。）
     --     这里必须写对，否则「灰边框」会变成黑框。
     local year_center_widget
     if disabled then
@@ -2105,8 +2624,21 @@ function StatisticsPage:buildPeriodNav(width, range_label)
         --   点文字下钻到「日」（保留 37c 手感）。
         local md_text_widget = md_text
         if not disabled then
+            -- ★★★ 43-pickers：点第 2 行文字 = 弹**当前粒度**的选择器。
+            --
+            --   37b 时这里是 `cycleToGranularity("day")`（「点月日下钻到日」）。
+            --   用户这轮要的是「点一下就选格子」，所以换成选择器，并且
+            --   **按当前粒度决定弹哪个**，语义才一致：
+            --     年（第二行显示「全年」）→ 年份列表
+            --     月（第二行显示「10月」）  → 月份列表
+            --     周/日（显示「10月12日」） → 周列表 / 月份列表
+            --   ⇒ 一句话：「点这行文字，就是选这一行代表的那个格子」。
+            --
+            --   ⚠ 第 2 行左右两个**日**箭头、最外端两个**月**箭头的行为
+            --     一个字都没动（它们仍是精确翻格）；这里只是把「中间那块文字」
+            --     从「切粒度」改成「弹选择器」。
             md_text_widget = TapBox:new{ md_text, on_tap = function()
-                self:cycleToGranularity("day")
+                self:showPeriodPicker(self.period)
                 return true
             end }
         end
@@ -2216,7 +2748,7 @@ function StatisticsPage:buildCardStyleRow(width)
     -- 左侧小标题「卡片样式」，右侧四个样式按钮
     local label_w = Screen:scaleBySize(76)
     row[#row + 1] = FixedBox:new{
-        width = label_w, height = Screen:scaleBySize(32),
+        width = label_w, height = Screen:scaleBySize(27),
         align = "left", vertical_align = "center",
         text(_("卡片样式"), f.footer, { color = Blitbuffer.COLOR_DARK_GRAY }),
     }
@@ -2227,7 +2759,7 @@ function StatisticsPage:buildCardStyleRow(width)
     if btn_w < Screen:scaleBySize(40) then
         btn_w = math.max(Screen:scaleBySize(28), math.floor(width / n))
     end
-    local btn_h = Screen:scaleBySize(32)
+    local btn_h = Screen:scaleBySize(27)
     local current = cardStyleValid(self.card_style) and self.card_style or "box"
 
     for i, style in ipairs(CARD_STYLES) do
@@ -2243,7 +2775,7 @@ function StatisticsPage:buildCardStyleRow(width)
             TapBox:new{
                 FixedBox:new{ width = btn_w, height = btn_h,
                     align = "center", vertical_align = "center",
-                    text(style.label, Font:getFace("cfont", 15), {
+                    text(style.label, Font:getFace("cfont", 14), {
                         color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
                         bold = active,
                     }) },
@@ -2346,7 +2878,7 @@ function StatisticsPage:buildCardGrid(width, summary, previous)
         contents[i] = buildCardContent(spec, inner_w)
         card_h = math.max(card_h, contents[i]:getSize().h)
     end
-    card_h = card_h + 2 * Size.padding.default
+    card_h = card_h + 2 * Size.padding.small
 
     local grid = VerticalGroup:new{ align = "left" }
 
@@ -2529,21 +3061,25 @@ function StatisticsPage:buildUnitsPage(width)
     -- ── 列表**上方**的固定占高 ──────────────────────────────────────────
     -- 逐项对应 build() 里的 body 与 buildUnitsPage 开头：
     --   浮窗边框(2×border) + title_bar + span.v_def + viewTabs(38)
-    --   + span.v_large + tabs(36) + span.v_def + periodNav(line_h+btn_h+pad.tiny)
+    --   + span.v_def + tabs + span.v_def + periodNav(line_h+btn_h+pad.tiny)
     --   + span.v_large + sortRow(36) + span.v_def + status(30) + pad.small
     local TITLEBAR_H = Screen:scaleBySize(34)    -- TitleBar 标题文字行高（含下划线内边距的保守值）
-    local VIEWTAB_H  = Screen:scaleBySize(38)
-    local TABS_H     = Screen:scaleBySize(36)
-    --   ★ 37i：buildPeriodNav 现在是「**三**行 × line_h(34)」= scaleBySize(102)，
+    --   ★★★ 44-compact：视图排 / 周期排都改引用统一的 `ROW_TAB_H_PX`。
+    --     以前这里是 `scaleBySize(38)` / `scaleBySize(36)` 两处硬编码，
+    --     和 buildViewTabs / buildTabs 里的值必须手动保持一致 ——
+    --     改一处忘另一处，预算就算错、内容被顶出去（老病根）。
+    local VIEWTAB_H  = Screen:scaleBySize(ROW_TAB_H_PX)
+    local TABS_H     = Screen:scaleBySize(ROW_TAB_H_PX)
+    --   ★ 37i：buildPeriodNav 现在是「**两**行 × line_h(30)」= scaleBySize(60)，
     --     这里必须跟着改，否则预算又对不上（这正是翻页栏被顶掉的老病根）。
-    local PERIODNAV_H = Screen:scaleBySize(34)   -- ← 与 buildPeriodNav 的 line_h 一致
+    local PERIODNAV_H = Screen:scaleBySize(30)   -- ← 与 buildPeriodNav 的 line_h 一致
                       * 2                        -- ← 37f/37i 两行（年一行 + 月日一行）
                       + Size.padding.tiny
     local SORTROW_H  = Screen:scaleBySize(36)
     local STATUS_H   = Screen:scaleBySize(30)
     local POPUP_BORDER_H = 2 * Screen:scaleBySize(2)
     local chrome_top = POPUP_BORDER_H + TITLEBAR_H
-        + v_def + VIEWTAB_H + v_large + TABS_H + v_def + PERIODNAV_H
+        + v_def + VIEWTAB_H + v_def + TABS_H + v_def + PERIODNAV_H
         + v_large + SORTROW_H + v_def + STATUS_H + Size.padding.small
     -- ── 列表**下方**的固定占高（点线 + span + 翻页栏 + 底部大间距）─────
     local NAVBAR_H = Screen:scaleBySize(44)      -- ← 与 buildUnitsPage 翻页栏 nav_h 一致
@@ -2777,28 +3313,70 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     local metric_label = metric == "speed" and _("阅读速度") or self:metricLabel()
     local row_h = Screen:scaleBySize(34)
     local chart_h = row_h * TREND_ROWS
+    local is_chart = self.trend_view ~= "list"
+
+    -- ★★★ 40-unit-free：上限和「这张图用哪个单位」都**提前**算 ——
+    --   因为下面的**标题**要拿单位（「阅读时长趋势（分）」）。
+    --   原来 scale_max 是在 `if is_chart` 里算的，标题那时还没建，拿不到。
+    local maximum = 0
+    for _i, bucket in ipairs(buckets) do
+        maximum = math.max(maximum, tonumber(bucket.value) or 0)
+    end
+    local scale_max = niceMax(maximum)
+    local unit = chartUnit(metric, scale_max)
+
+    -- 标题 + 单位。只在**图表视图**里把单位拼进标题：
+    --   · 图表视图的柱顶标签是**不带单位**的裸数字（chartBarLabel），
+    --     单位总得有个地方说一次 —— 标题最省地方、而且永远看得见；
+    --   · 列表视图每行都写着「14分钟」，标题上再重复一遍纯属啰嗦；
+    --   · 指标名里已经含这个单位时不重复（「阅读字数」里已经有「字」）。
+    local title_text = metric_label .. _("趋势")
+    if is_chart and not string.find(title_text, unit.suffix, 1, true) then
+        title_text = title_text .. "（" .. unit.suffix .. "）"
+    end
 
     -- 标题行 + 图表/列表切换
     local icon_size = Screen:scaleBySize(22)
     local header = HorizontalGroup:new{ align = "center" }
-    header[#header + 1] = text(metric_label .. _("趋势"), f.section, {
+    header[#header + 1] = text(title_text, f.section, {
         bold = true,
         max_width = inner_w - 2 * icon_size - Size.padding.large,
     })
     local spacer_w = math.max(0, inner_w - 2 * icon_size
         - Size.padding.large - header[1]:getSize().w)
     header[#header + 1] = HorizontalSpan:new{ width = spacer_w }
-    local is_chart = self.trend_view ~= "list"
     header[#header + 1] = IconButton:new{
         icon = "column.three",
         width = icon_size, height = icon_size, padding = 0,
         show_parent = self,
+        -- ★★★ 43-no-flash：**必须** `allow_flash = false`（上游源码里的原话：
+        --   `allow_flash = true, -- set to false for any IconButton that may close
+        --   its container`）。
+        --
+        --   用户报的「点击阅读字数趋势后就没办法返回柱状图形式了」根因就在这：
+        --   `IconButton:onTapIconButton()`（upstream iconbutton.lua:101-147）在
+        --   flash 路径下会这么做 ——
+        --       1. 反色图标 + `setDirty(nil,"fast",图标矩形)` + forceRePaint
+        --       2. 恢复图标
+        --       3. **调用 callback**（也就是我们的 `reload`）
+        --       4. 再 `setDirty(nil,"fast",图标矩形)` + forceRePaint
+        --   第 4 步是关键：它把刷新队列里**塞了一个只有图标大小的矩形**。
+        --   而 `UIManager:_repaint()`（upstream uimanager.lua:1289-1294）的兜底
+        --   「画了东西却没有任何刷新请求 → 补一次全屏 partial」因此**不会触发**
+        --   ⇒ 新页面的像素已经画进帧缓冲，但只有那 40×40 的小方块被推给面板，
+        --     **整页看起来纹丝不动** —— 而 chart/list 两种模式下那个小方块长得
+        --     一模一样，所以「点了没反应」。
+        --   ⇒ 更坑的是 callback **真的执行了**：`trend_view` 已经被悄悄改成
+        --     "list"，只是屏幕没更新。于是用户以为「回不去柱状图」，
+        --     实际是「回得去，但整页不刷新」。
+        allow_flash = false,
         callback = function() self:reload{ trend_view = "chart" } end,
     }
     header[#header + 1] = IconButton:new{
         icon = "align.justify",
         width = icon_size, height = icon_size, padding = 0,
         show_parent = self,
+        allow_flash = false,   -- ★ 43-no-flash：同上
         callback = function() self:reload{ trend_view = "list" } end,
     }
 
@@ -2806,46 +3384,59 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     section[#section + 1] = header
     section[#section + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
 
+    -- ★★★ 41-plain-chart：这里原来有个 `local mean = nil`（本周期均值），
+    --   因为「图表画虚线」和「图例写『虚线＝本期平均 X』」两处都要用它。
+    --   均值虚线删掉之后它没有任何读者了，一并删除。
+
     if is_chart then
-        -- Y 轴刻度列 + 图
-        local axis_w = math.floor(inner_w * 0.22)
-        local chart_w = inner_w - axis_w - Size.padding.default
-        local labels = {}
-        local maximum = 0
-        for _i, bucket in ipairs(buckets) do
-            maximum = math.max(maximum, tonumber(bucket.value) or 0)
-        end
-        local scale_max = niceMax(maximum)
-        for i = 0, TREND_ROWS do
-            labels[#labels + 1] = metricAxisText(scale_max * (TREND_ROWS - i) / TREND_ROWS, metric)
-        end
+        -- ★★★ 40-no-y-axis：**没有 Y 轴刻度列了**。
+        --
+        --   原来这里是：
+        --       axis_w  = floor(inner_w * 0.22)          -- KPW4 上 201px
+        --       chart_w = inner_w - axis_w - padding     -- 704px
+        --       axis    = buildAxisColumn(labels, axis_w, row_h, ...)
+        --       HorizontalGroup{ align="center", axis, span, chart }
+        --   用户要求「统计图可以只要底部，不要 y 轴」，整列刻度连同它的
+        --   201px + 9px 间距一起删掉，绘图区直接吃满 inner_w（914px）。
+        --   ⇒ 柱子变粗（月视图 slot 22.7 → 29.5px）、整张图**往左移**
+        --     （用户要的「适当往左一点」）—— 一个改动同时满足两条要求。
+        --   ⇒ 代价是没了刻度参照，但每根柱子自己带数值标签（见 chartUnit）。
+        local chart_w = inner_w
+
+        -- ★★★ 40-no-y-axis（连带修的坑）：**必须显式给柱顶标签留出上方空间**。
+        --
+        --   柱顶标签的 y **可以是负数**（见 chartValueLabels 的注释）：
+        --   最高的那根柱子顶到图顶时，它的数字会画到**图上方**去。
+        --   39 那版这块空间是**白捡**的 —— Y 轴刻度列高 377px、图只有 252px，
+        --   图在 `HorizontalGroup{align="center"}` 里居中，上下各空出 62px，
+        --   标签正好落进上面那 62px。
+        --   40 把 Y 轴列删了 ⇒ 这 62px 一起没了 ⇒ 不留白的话，
+        --   最高的那根柱子的数字会**直接压到标题上**。
+        --   所以这里显式补一个 span，高度 = 标签高 + 标签与柱顶的间距 + 余量。
+        --   ⚠ 别图省事写死像素：字号一改就不够了（labelMetrics 量的就是真字号）。
+        local label_h = labelMetrics("0", f.value).h
+        section[#section + 1] = VerticalSpan:new{
+            width = label_h + Screen:scaleBySize(3) + Screen:scaleBySize(2),
+        }
 
         -- ★★★ 37s：图 = 柱状位图 + **每根柱子顶上的数值标签**（用户要求）。
         --
-        --   ⚠ 这里**故意不给图加高**：图仍是 4*row_h、仍由下面这个
-        --     `align="center"` 居中在 6*row_h 的带里，所以标签落进图上方
+        --   ⚠ 这里**故意不给图加高**：图仍是 4*row_h，标签落进图上方
         --     那一行本来就空着的区域，整个页面布局**一行没动**
         --     （x 轴刻度行、周期导航、翻页栏的位置都不会被顶走）。
         --     详见 chartValueLabels 的注释。
         --
-        --   scale_max 复用上面排 Y 轴刻度时算出来的值 —— 标签和柱子必须
-        --   共用同一个上限，否则标签会跟柱顶错位。
-        local chart = buildChartWidget(buckets, metric, selected, chart_w, chart_h, scale_max)
-        local axis = buildAxisColumn(labels, axis_w, row_h, Blitbuffer.COLOR_BLACK)
-        section[#section + 1] = HorizontalGroup:new{
-            align = "center",
-            axis,
-            HorizontalSpan:new{ width = Size.padding.default },
-            chart,
-        }
+        -- ★★★ 40-unit-free：传的是 `unit`（chartUnit 的产物）而不是 `metric` ——
+        --   柱顶标签只写数字，单位由 chartUnit 统一决定、并写进标题。
+        -- ★★★ 41-plain-chart：不再传 `mean`（均值虚线已删，见 buildChartImage）。
+        local chart = buildChartWidget(buckets, unit, selected, chart_w, chart_h, scale_max)
+        section[#section + 1] = chart
 
         local tick_h = Screen:scaleBySize(24)
-        local tick_row = buildTickRow(#buckets, chart_w, tick_h, self.period, Blitbuffer.COLOR_BLACK)
-        section[#section + 1] = HorizontalGroup:new{
-            align = "top",
-            HorizontalSpan:new{ width = axis_w + Size.padding.default },
-            tick_row,
-        }
+        -- ★★★ 39-trend-axis：刻度走**真实 bucket.label**（详见 buildTickRow 的注释）。
+        -- ★★★ 40-no-y-axis：不再需要给 Y 轴列让位，刻度行直接铺满。
+        local tick_row = buildTickRow(buckets, chart_w, tick_h, Blitbuffer.COLOR_BLACK)
+        section[#section + 1] = tick_row
     else
         section[#section + 1] = buildTrendList(buckets, metric, selected, inner_w)
     end
@@ -2867,6 +3458,30 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
             max_width = inner_w,
         }),
     }
+
+    -- ★★★ 39-trend-mean：图表视图下补一行**图例**。
+    --   用户说「趋势图看不懂」，第三个原因就是：那条虚线是什么、
+    --   柱子到底能不能点，界面上一个字都没说。一句话讲清楚，成本只有一行。
+    --   （列表视图没有虚线，也就不需要这行。）
+    --   ★ 用最小的 `f.axis`（17px）但仍是**黑色** —— 用户明确要求
+    --     「尽量不要有灰色字」，靠字号而不是灰度来降级。
+    --
+    -- ★★★ 41-plain-chart：图例**只剩前半句**了。
+    --   原来是 `点柱子看具体数值 · 虚线＝本期平均 X`，两个分句各解释一个东西；
+    --   虚线删了 ⇒ 后半句成了一句**指向不存在的东西**的说明，必须一起去掉。
+    --   留下「点柱子看具体数值」这半句仍然必要：柱子能点这件事，界面上
+    --   没有别的线索（没有边框、没有按钮外观）。
+    if is_chart then
+        local hint = _("点柱子看具体数值")
+        section[#section + 1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
+        section[#section + 1] = HorizontalGroup:new{
+            align = "center",
+            text(hint, f.axis, {
+                color = Blitbuffer.COLOR_BLACK,
+                max_width = inner_w,
+            }),
+        }
+    end
 
     return FixedBox:new{
         width = width,
@@ -3054,6 +3669,304 @@ function StatisticsPage:showYearPicker()
         title = _("选择年份"),
         -- ★ 这两项照抄补丁：宽度收到「刚好放下最宽的那行」，
         --   并置 modal 让它盖住统计浮窗（否则点击会穿透到底下的页面）。
+        shrink_unneeded_width = true,
+        modal = true,
+        buttons = buttons,
+    }
+    UIManager:show(self.dialog)
+end
+
+--==========================================================================
+-- ★★★ 43-pickers：周期选择器（年 / 月 / 周）
+--==========================================================================
+--
+-- 用户原话：「阅读统计里的日周月年以及总览选择能不能重新弄好（年的点击
+--   可以选择年份，月的点击可以选择月份，日的点击可以选择月份，周的点击
+--   可以选择第几周（第几周后面跟着时间））」+ 确认「点已选中的才弹选择器」。
+--
+-- 三个选择器都是**竖排 ButtonDialog**（与 37t 的年份列表同形）：
+--   · 一条一行，`shrink_unneeded_width` 让弹窗宽度收到「刚好放下最宽那行」；
+--   · `modal = true` 盖住统计浮窗，否则点击会穿透到底下的页面；
+--   · 内容高于屏幕时上游 ButtonDialog 会自己套 ScrollableContainer 整行翻页
+--     （upstream buttondialog.lua:186-233），所以行数多也安全。
+
+--- 把 anchor 挪到「目标年月的同一天」，**保留日**。
+---
+--- ⚠ 不能直接用 `GlobalStats.shiftAnchor("month", anchor, delta)`：
+---   那个函数是 `dayTimestamp(year, month + delta, 1)` —— 日被写死成 1。
+---   翻月箭头那样做没问题（用户本来就在逐月翻），但**选择器**是「我要跳到
+---   2021 年 7 月」：把日重置成 1 号，等于顺手把用户当前看的这天弄丢了。
+---   所以这里自己算：保留原来的日，目标月天数不够时夹到该月最后一天。
+local function anchorAtMonth(anchor, year, month)
+    local _y, _m, day = tonumber(os.date("%Y", anchor)), tonumber(os.date("%m", anchor)),
+        tonumber(os.date("%d", anchor))
+    day = day or 1
+    -- 目标月的天数：下个月 1 号往前一天
+    local last_day = tonumber(os.date("%d", os.time{
+        year = year, month = month + 1, day = 0, hour = 12, min = 0, sec = 0,
+    })) or day
+    if day > last_day then day = last_day end
+    return os.time{ year = year, month = month, day = day, hour = 12, min = 0, sec = 0 }
+end
+
+--- 统一的入口：按粒度弹对应的选择器。
+---   「总」没有可选的格子（累计就是全部）⇒ 什么都不做。
+---
+--- ★★★ 44-day-picker：`day` 从「弹月份列表」改成**弹日期列表**。
+---   用户原话：「日的没有选择日的选择器吗」。
+---   以前 43 轮把「日」也接到月份列表上（理由：一个月 28~31 天，列表太长），
+---   但那样「日」这个粒度其实**选不了具体的日**，只能靠第 2 行内圈箭头一天天翻。
+---   现在补上真正的日列表；翻月仍然靠第 2 行的外圈（月）箭头，没丢功能。
+function StatisticsPage:showPeriodPicker(granularity)
+    granularity = granularity or self.period
+    if granularity == "year" then
+        self:showYearPicker()
+    elseif granularity == "month" then
+        self:showMonthPicker(granularity)
+    elseif granularity == "day" then
+        self:showDayPicker()
+    elseif granularity == "week" then
+        self:showWeekPicker()
+    end
+end
+
+--- ★★★ 43-pickers：月份列表（点「月」/「日」标签或第 2 行文字时弹出）。
+function StatisticsPage:showMonthPicker(target_period)
+    local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
+    local months = GlobalStats.availableMonths(store, self.anchor)
+    local anchor = tonumber(self.anchor) or os.time()
+    local current_year = tonumber(os.date("%Y", anchor)) or 1970
+    local current_month = tonumber(os.date("%m", anchor)) or 1
+
+    local buttons = {}
+    for _i, item in ipairs(months) do
+        local label = item.label
+        local is_current = (item.year == current_year and item.month == current_month)
+        if is_current then label = label .. " ✓" end
+        -- 每个按钮各自捕获自己的年月（别用循环变量闭包）
+        local year, month = item.year, item.month
+        buttons[#buttons + 1] = {
+            {
+                text = label,
+                callback = function()
+                    if self.dialog then
+                        UIManager:close(self.dialog)
+                        self.dialog = nil
+                    end
+                    if is_current then return end
+                    self:reload{
+                        period = target_period or self.period,
+                        anchor = anchorAtMonth(anchor, year, month),
+                    }
+                end,
+            },
+        }
+    end
+
+    -- ★★★ 44-month-label：行文字现在只有「10月」（用户要的「只显示月份」），
+    --   所以**跨年时**在标题里补一句范围，免得两行「1月」看着一模一样。
+    local title = _("选择月份")
+    local y_min, y_max
+    for _i, item in ipairs(months) do
+        y_min = (not y_min or item.year < y_min) and item.year or y_min
+        y_max = (not y_max or item.year > y_max) and item.year or y_max
+    end
+    if y_min and y_max and y_min ~= y_max then
+        title = T(_("选择月份（跨 %1–%2 年）"), y_min, y_max)
+    end
+
+    local ButtonDialog = require("ui/widget/buttondialog")
+    self.dialog = ButtonDialog:new{
+        title = title,
+        shrink_unneeded_width = true,
+        modal = true,
+        buttons = buttons,
+    }
+    UIManager:show(self.dialog)
+end
+
+--- ★★★ 44-day-picker：**月历网格**（点「日」标签或第 2 行文字时弹出）。
+---
+--- 用户原话：「日的没有选择日的选择器吗」。
+---
+--- 列 anchor 所在**月**的每一天，按周一至周日排成 7 列月历，当前那天带 ✓。
+--- 选中某一行 ⇒ `period` 仍是 `day`，只把 anchor 挪到那一天（年月不变）。
+---
+--- 顶部的 ‹ / › 翻月、« / » 翻年只改变日历显示；选中日期才更新统计锚点。
+--- 首日之前的空位用于保持自然的星期对齐。
+function StatisticsPage:showDayPicker(display_year, display_month)
+    local anchor = tonumber(self.anchor) or os.time()
+    local anchor_year = tonumber(os.date("%Y", anchor)) or 1970
+    local anchor_month = tonumber(os.date("%m", anchor)) or 1
+    local anchor_day = tonumber(os.date("%d", anchor)) or 1
+    local year = tonumber(display_year) or anchor_year
+    local month = tonumber(display_month) or anchor_month
+    -- 本月天数：下个月 1 号往前一天
+    local last_day = tonumber(os.date("%d", os.time{
+        year = year, month = month + 1, day = 0, hour = 12, min = 0, sec = 0,
+    })) or 31
+
+    local buttons = {}
+    local function showAdjacentMonth(month_delta)
+        local target = os.time{
+            year = year, month = month + month_delta, day = 1,
+            hour = 12, min = 0, sec = 0,
+        }
+        local target_year = tonumber(os.date("%Y", target))
+        local target_month = tonumber(os.date("%m", target))
+        if self.dialog then
+            UIManager:close(self.dialog)
+            self.dialog = nil
+        end
+        self:showDayPicker(target_year, target_month)
+    end
+    local function showAdjacentYear(year_delta)
+        showAdjacentMonth(year_delta * 12)
+    end
+    local calendar_nav = {
+        {
+            text = "«",
+            callback = function()
+                showAdjacentYear(-1)
+                return true
+            end,
+        },
+        {
+            text = "‹",
+            callback = function()
+                showAdjacentMonth(-1)
+                return true
+            end,
+        },
+        {
+            text = string.format("%d年%d月", year, month),
+            callback = function() return true end,
+        },
+        {
+            text = "›",
+            callback = function()
+                showAdjacentMonth(1)
+                return true
+            end,
+        },
+        {
+            text = "»",
+            callback = function()
+                showAdjacentYear(1)
+                return true
+            end,
+        },
+    }
+    buttons[#buttons + 1] = calendar_nav
+
+    local weekdays = { _("一"), _("二"), _("三"), _("四"), _("五"), _("六"), _("日") }
+    local heading = {}
+    for i, name in ipairs(weekdays) do
+        heading[i] = {
+            text = name,
+            callback = function() return true end,
+        }
+    end
+    buttons[#buttons + 1] = heading
+
+    local row = nil
+    local first_day = os.time{
+        year = year, month = month, day = 1,
+        hour = 12, min = 0, sec = 0,
+    }
+    local first_weekday = tonumber(os.date("%w", first_day)) or 0 -- Sunday = 0
+    local leading_blanks = (first_weekday + 6) % 7
+    for _i = 1, leading_blanks do
+        row = row or {}
+        row[#row + 1] = {
+            text = "",
+            callback = function() return true end,
+        }
+    end
+    for d = 1, last_day do
+        local label = tostring(d)
+        local is_current = year == anchor_year and month == anchor_month and d == anchor_day
+        if is_current then label = label .. " ✓" end
+        -- 每个按钮各自捕获自己的「日」（别用循环变量闭包）
+        local day = d
+        row = row or {}
+        row[#row + 1] = {
+            text = label,
+            callback = function()
+                if self.dialog then
+                    UIManager:close(self.dialog)
+                    self.dialog = nil
+                end
+                if is_current then return end
+                self:reload{
+                    period = "day",
+                    anchor = os.time{
+                        year = year, month = month, day = day,
+                        hour = 12, min = 0, sec = 0,
+                    },
+                }
+            end,
+        }
+        if #row >= 7 then
+            buttons[#buttons + 1] = row
+            row = nil
+        end
+    end
+    if row then buttons[#buttons + 1] = row end
+
+    local ButtonDialog = require("ui/widget/buttondialog")
+    self.dialog = ButtonDialog:new{
+        title = T(_("选择日期（%1年%2月）"), year, month),
+        shrink_unneeded_width = true,
+        modal = true,
+        buttons = buttons,
+    }
+    UIManager:show(self.dialog)
+end
+
+--- ★★★ 43-pickers：周列表（点「周」标签或第 2 行文字时弹出）。
+---
+--- 每行 = 「第N周  MM.DD–MM.DD」（用户明确要求「第几周后面跟着时间」，
+---   44 轮把日期区间从「10月05日–10月11日」改成「10.05–10.11」）。
+--- 只列 anchor 所在年（最多 53 行）—— 理由见 GlobalStats.availableWeeks 的注释。
+function StatisticsPage:showWeekPicker()
+    local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
+    local anchor = tonumber(self.anchor) or os.time()
+    local anchor_year = tonumber(os.date("%Y", anchor)) or 1970
+    local weeks = GlobalStats.availableWeeks(store, anchor)
+    local current_monday = GlobalStats.weekStart(anchor)
+
+    local buttons = {}
+    for _i, item in ipairs(weeks) do
+        -- ★ 标签里不再重复年份（标题已经写了「（2026年）」）——
+        --   省下的宽度让「第41周 10月05日–10月11日」这一行在 KPW4 上不至于被裁。
+        local label = item.label .. "  " .. item.range
+        local is_current = (item.monday == current_monday)
+        if is_current then label = label .. " ✓" end
+        local monday = item.monday
+        buttons[#buttons + 1] = {
+            {
+                text = label,
+                callback = function()
+                    if self.dialog then
+                        UIManager:close(self.dialog)
+                        self.dialog = nil
+                    end
+                    if is_current then return end
+                    -- 用 shiftAnchor("week", …) 平移：**保留星期几**（它加的是 7 天整数倍）
+                    local delta = math.floor((monday - current_monday) / (7 * 86400) + 0.5)
+                    self:reload{
+                        period = "week",
+                        anchor = GlobalStats.shiftAnchor("week", anchor, delta),
+                    }
+                end,
+            },
+        }
+    end
+
+    local ButtonDialog = require("ui/widget/buttondialog")
+    self.dialog = ButtonDialog:new{
+        title = T(_("选择周（%1年）"), anchor_year),
         shrink_unneeded_width = true,
         modal = true,
         buttons = buttons,
