@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KPW4 阅读统计预览</title>
+<style>
+  * { box-sizing: border-box; }
+  :root { color-scheme: light; font-family: Arial, "Microsoft YaHei", sans-serif; }
+  body {
+    margin: 0; min-height: 100vh; padding: 22px;
+    background: #dedede; color: #111;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .device {
+    width: min(790px, 100%); min-height: 1020px; padding: 30px;
+    border: 3px solid #111; border-radius: 20px;
+    background: #f7f7f7; box-shadow: 0 8px 25px #0003;
+    display: flex; flex-direction: column;
+  }
+  .topline { display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
+  h1 { margin:0; font-size:30px; letter-spacing:.02em; }
+  .badge { border:2px solid #111; padding:7px 12px; border-radius:14px; font-size:15px; font-weight:700; }
+  .navbox { border:3px solid #111; border-radius:17px; overflow:hidden; background:#fff; }
+  .navrow { display:grid; grid-template-columns:repeat(2,1fr); min-height:66px; }
+  .navrow.period { grid-template-columns:repeat(5,1fr); border-top:2px solid #111; }
+  .navitem { display:flex; align-items:center; justify-content:center; min-width:0; padding:10px 5px; font-size:19px; font-weight:700; }
+  .navitem + .navitem { border-left:1px solid #888; }
+  .period .navitem { font-size:18px; }
+  .navitem.active { background:#111; color:#fff; }
+  .datebar { display:flex; align-items:center; justify-content:space-between; margin:17px 0 15px; }
+  button { font:inherit; color:inherit; cursor:pointer; }
+  .arrow { width:58px; height:56px; border:0; background:transparent; font-size:35px; font-weight:700; }
+  .date-label { flex:1; text-align:center; font-size:23px; font-weight:700; text-decoration:underline; text-underline-offset:5px; cursor:pointer; }
+  .overview { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:20px; }
+  .stat { border:2px solid #111; border-radius:13px; min-height:98px; padding:12px 14px; background:#fff; }
+  .stat strong { display:block; font-size:25px; margin-bottom:4px; }
+  .stat span { font-size:15px; font-weight:700; }
+  .trend { flex:1; border-top:2px solid #111; padding-top:16px; display:flex; flex-direction:column; }
+  .trend-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  h2 { margin:0; font-size:23px; }
+  .switch { display:flex; gap:16px; }
+  .switch button { border:0; background:transparent; width:50px; height:48px; font-size:26px; }
+  .switch button.selected { text-decoration:underline; text-decoration-thickness:3px; text-underline-offset:7px; }
+  .summary { margin:12px 0 14px; font-size:16px; font-weight:700; }
+  .hour-list { display:flex; flex-direction:column; gap:9px; }
+  .hour { display:grid; grid-template-columns:95px 1fr auto; align-items:center; gap:12px; min-height:64px; padding:8px 12px; border:2px solid #111; border-radius:12px; background:#fff; }
+  .hour time { font-size:17px; font-weight:700; }
+  .bar-wrap { height:22px; border:1px solid #111; background:#eee; }
+  .bar { height:100%; background:#111; }
+  .amount { min-width:100px; text-align:right; font-size:15px; font-weight:700; line-height:1.45; }
+  .footer { margin-top:auto; padding-top:17px; text-align:center; color:#444; font-size:13px; }
+  .overlay { display:none; position:fixed; inset:0; padding:24px; background:#0006; align-items:center; justify-content:center; }
+  .overlay.open { display:flex; }
+  .dialog { width:min(590px,100%); max-height:84vh; overflow:auto; padding:22px; border:3px solid #111; border-radius:16px; background:#f7f7f7; box-shadow:0 8px 30px #0005; }
+  .dialog h3 { margin:0 0 16px; font-size:22px; }
+  .week-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .week { padding:12px 10px; border:2px solid #111; border-radius:9px; background:#fff; text-align:center; font-size:15px; font-weight:700; }
+  .week.current { background:#111; color:#fff; }
+  .calendar-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; font-size:18px; font-weight:700; }
+  .calendar { display:grid; grid-template-columns:repeat(7,1fr); gap:5px; text-align:center; }
+  .calendar span { padding:9px 0; font-size:15px; }
+  .calendar .day { border:1px solid #777; border-radius:7px; background:#fff; cursor:pointer; }
+  .calendar .today { background:#111; color:#fff; font-weight:700; }
+  .dismiss { margin-top:14px; padding:9px 15px; border:2px solid #111; border-radius:9px; background:#fff; font-weight:700; }
+  .chart { display:none; height:280px; padding:18px 10px 4px; align-items:end; justify-content:space-around; border-bottom:2px solid #111; }
+  .chart.show { display:flex; }
+  .chart div { width:9%; background:#111; position:relative; }
+  .chart div:after { content:attr(data-label); position:absolute; bottom:-28px; width:100%; text-align:center; font-size:13px; }
+  @media (max-width:600px) {
+    body { padding:0; background:#f7f7f7; }
+    .device { width:100%; min-height:100vh; padding:18px; border:0; border-radius:0; box-shadow:none; }
+    .overview { gap:7px; }
+    .stat { padding:10px 8px; min-height:86px; }
+    .stat strong { font-size:20px; }
+    .stat span { font-size:13px; }
+    .hour { grid-template-columns:76px 1fr; gap:8px; }
+    .amount { grid-column:2; min-width:0; text-align:left; }
+    .bar-wrap { grid-column:2; grid-row:1; }
+    .week-grid { gap:6px; }
+    .week { font-size:13px; }
+  }
+</style>
+</head>
+<body>
+<main class="device">
+  <div class="topline"><h1>阅读统计</h1><span class="badge">KPW4 模拟预览</span></div>
+  <div class="navbox" aria-label="统计视图和周期">
+    <div class="navrow">
+      <div class="navitem">总览</div><div class="navitem active">阅读趋势</div>
+    </div>
+    <div class="navrow period">
+      <div class="navitem active">日</div><div class="navitem" id="openWeek">周</div>
+      <div class="navitem">月</div><div class="navitem">年</div><div class="navitem">总</div>
+    </div>
+  </div>
+  <div class="datebar">
+    <button class="arrow" aria-label="前一天">‹</button>
+    <div class="date-label" id="openDate">2026年10月12日　⌄</div>
+    <button class="arrow" aria-label="后一天">›</button>
+  </div>
+  <section class="overview" aria-label="当日概览">
+    <div class="stat"><strong>2,486</strong><span>阅读字数</span></div>
+    <div class="stat"><strong>1小时 12分</strong><span>阅读时间</span></div>
+    <div class="stat"><strong>34.5</strong><span>字 / 分钟</span></div>
+  </section>
+  <section class="trend">
+    <div class="trend-head">
+      <h2>按小时阅读记录</h2>
+      <div class="switch" aria-label="趋势显示方式">
+        <button id="listToggle" class="selected" aria-label="列表视图">☷</button>
+        <button id="chartToggle" aria-label="图表视图">▥</button>
+      </div>
+    </div>
+    <p class="summary">今日共阅读 2,486 字，阅读 1 小时 12 分钟</p>
+    <div class="hour-list" id="hourList">
+      <div class="hour"><time>08:00–09:00</time><div class="bar-wrap"><div class="bar" style="width:82%"></div></div><div class="amount">42 分钟<br>1,106 字</div></div>
+      <div class="hour"><time>12:00–13:00</time><div class="bar-wrap"><div class="bar" style="width:49%"></div></div><div class="amount">18 分钟<br>612 字</div></div>
+      <div class="hour"><time>20:00–21:00</time><div class="bar-wrap"><div class="bar" style="width:61%"></div></div><div class="amount">12 分钟<br>768 字</div></div>
+    </div>
+    <div class="chart" id="chartView" aria-label="小时阅读柱状图">
+      <div style="height:80%" data-label="08时"></div><div style="height:42%" data-label="12时"></div><div style="height:56%" data-label="20时"></div>
+    </div>
+  </section>
+  <div class="footer">预览为静态界面示意，不是 KOReader / KPW4 实机截图</div>
+</main>
+<div class="overlay" id="weekDialog">
+  <section class="dialog">
+    <h3>选择周（2026年）</h3>
+    <div class="week-grid">
+      <div class="week">第39周　09.21–09.27</div><div class="week">第40周　09.28–10.04</div>
+      <div class="week">第41周　10.05–10.11</div><div class="week current">第42周　10.12–10.18　✓</div>
+      <div class="week">第43周　10.19–10.25</div><div class="week">第44周　10.26–11.01</div>
+    </div>
+    <button class="dismiss" data-close>关闭</button>
+  </section>
+</div>
+<div class="overlay" id="dateDialog">
+  <section class="dialog">
+    <h3>选择日期</h3>
+    <div class="calendar-head"><button class="arrow">‹</button><span>2026年10月</span><button class="arrow">›</button></div>
+    <div class="calendar">
+      <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+      <span></span><span></span><span></span><span>1</span><span>2</span><span>3</span><span>4</span>
+      <span class="day">5</span><span class="day">6</span><span class="day">7</span><span class="day">8</span><span class="day">9</span><span class="day">10</span><span class="day">11</span>
+      <span class="day today">12</span><span class="day">13</span><span class="day">14</span><span class="day">15</span><span class="day">16</span><span class="day">17</span><span class="day">18</span>
+      <span class="day">19</span><span class="day">20</span><span class="day">21</span><span class="day">22</span><span class="day">23</span><span class="day">24</span><span class="day">25</span>
+      <span class="day">26</span><span class="day">27</span><span class="day">28</span><span class="day">29</span><span class="day">30</span><span class="day">31</span><span></span>
+    </div>
+    <button class="dismiss" data-close>关闭</button>
+  </section>
+</div>
+<script>
+  const $ = id => document.getElementById(id);
+  $("openWeek").onclick = () => $("weekDialog").classList.add("open");
+  $("openDate").onclick = () => $("dateDialog").classList.add("open");
+  $("listToggle").onclick = () => {
+    $("hourList").style.display = "flex";
+    $("chartView").classList.remove("show");
+    $("listToggle").classList.add("selected");
+    $("chartToggle").classList.remove("selected");
+  };
+  $("chartToggle").onclick = () => {
+    $("hourList").style.display = "none";
+    $("chartView").classList.add("show");
+    $("chartToggle").classList.add("selected");
+    $("listToggle").classList.remove("selected");
+  };
+  document.querySelectorAll("[data-close]").forEach(button =>
+    button.onclick = () => button.closest(".overlay").classList.remove("open"));
+  document.querySelectorAll(".overlay").forEach(overlay =>
+    overlay.onclick = event => { if (event.target === overlay) overlay.classList.remove("open"); });
+</script>
+</body>
+</html>

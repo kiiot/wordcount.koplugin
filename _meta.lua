@@ -2631,11 +2631,1160 @@ return {
     --     （能直接看到那两条几乎重合的边框和小「腰」）。
     --   · `阅读统计-44-选择器.png` —— 月/周/日三个选择器 + 日网格备选。
     --
+    -- ★★★ 1.1 内修订（45：统计页 UI 去重、去框、收窄）
+    --
+    --   ⚠ **不升版号**。用户确认预览图后一次性改 5 处。
+    --
+    --   ① 【分段控件】`buildSegmentedRow` 外框 + 分隔线从 `COLOR_BLACK` 改
+    --      `COLOR_DARK_GRAY`（0x88）。视觉上更轻，不再像「两道黑粗线」。
+    --   ② 【日选择日历】`showDayPicker` 每个日期按钮加 `bordersize = 0`，
+    --      去掉默认黑框；当前日期用 `background = COLOR_BLACK` +
+    --      `color = COLOR_WHITE` 黑底白字反白，不再用「✓」后缀。
+    --   ③ 【周选择器】`showWeekPicker` 从每行 2 个按钮改成**单列 1 个**，
+    --      同样去框 + 当前项黑底白字。`shrink_unneeded_width` 让弹窗自动
+    --      收窄到内容宽度，不再撑满整屏。
+    --   ④ 【日视图小时列表】`buildHourlyActivityList` 去掉每小时卡片的
+    --      `FrameContainer` 圆角黑框，改成**纯行布局**；行间用 `HRule`
+    --      实线（`COLOR_BLACK`）分隔，比原来的 `VerticalSpan` 空行更明确。
+    --   ⑤ 【趋势图柱顶标签】确认已有 `chartValueLabels` + `buildChartWidget`
+    --      实现，本轮未动代码。
+    --
+    -- ★★★ 1.1 内修订（45b：上一轮 5 处里 3 处没做到位）
+    --
+    --   用户回执：「周选择器还是太长了，以及日期选择怎么还是有分割线，
+    --   小时统计格式还是乱的」。逐条查了**上游源码**，三处都找到了真因：
+    --
+    --   ② 【日选择日历 · 分割线没去掉 —— 找错地方了】
+    --      `bordersize = 0` 是**无效代码**：`ButtonTable:init()` 给每个
+    --      Button 硬编码了 `bordersize = 0`（buttontable.lua:89），
+    --      那条灰线跟按钮边框毫无关系，是 ButtonTable 自己画的：
+    --        · 行内 `vertical_sep = LineWidget{ background = COLOR_GRAY }`；
+    --        · 行间 `addVerticalSeparator()` 同样是 `COLOR_GRAY`。
+    --      修法：新增 `newFlatButtonDialog()` —— 临时把 ButtonTable 的
+    --      **类默认值** `sep_width` 置 0 → `ButtonDialog:new{}` → 立刻还原。
+    --      `new()` 内部同步跑完 `init()`（sep_width 就是在那里读的），
+    --      所以还原时构造已结束，不影响其它对话框。日/周两个选择器都改用它。
+    --
+    --   ③ 【周选择器 · 太长 —— 算错了量级】
+    --      按钮字号 20 ⇒ 设备上 40px；一行「第53周  12.28–01.03」≈390px 宽、
+    --      行高 ≈78px；53 行 = **4134px**，一屏只放得下 ~17 行 ⇒ 要滚 3 屏。
+    --      改两列能减半，但弹窗会从 ~410px 涨到 ~820px，直接违反用户上一轮
+    --      「选择器不需要那么宽」⇒ 不采用。改用本插件既定约定
+    --      （同 buildUnitsPage）：**图标翻页**，`WEEK_PAGE_SIZE = 15`，
+    --      顶部一行 `‹ N / M ›`，默认落在**当前正在看的那一周**所在页。
+    --      ⚠ 中间那格**不能**写「第 N / M 页」：一行三等分后每格只有
+    --        table_width/3 ≈ 137px，而「第 1 / 4 页」在 40px 字号下约 174px，
+    --        会被 Button 的 avoid_text_truncation 压成小字号。「1 / 4」约 74px。
+    --      顺带去掉了当前周后面那个尾随「 ✓」（黑底反白已经标出来了），
+    --      整行再窄约 20px。
+    --
+    --   ④ 【日视图小时列表 · 格式乱 —— 两处溢出叠加】
+    --      原来 `time_w = 92 / amount_w = 118 / row_h = 40` 全是写死的：
+    --        · `00:00–01:00` 在 x_smallinfofont(17⇒34px) 下本身就 ≈93px，
+    --          塞不进 92px 的 FixedBox；而本文件的 FixedBox **不裁剪**，
+    --          文字直接画到进度条上；
+    --        · 右侧「时长 / N 字」是**两行**（约 100px），
+    --          而 `row_h - 2*padding` 只剩 28px ⇒ 两行压到上下相邻的行上。
+    --      修法：列宽取「该列最宽的那一条」、行高取「两个字号里更高的那一行
+    --      + 上下留白」，全部由 `labelMetrics` 现量；数值并成**一行**
+    --      （`1小时20分 · 1,234 字`）。
+    --      ⚠ 连带修了一个 `labelMetrics` 的隐患：它的缓存键**只有字符串**，
+    --      同一串用两个字号量会串味（这次正好 f.axis / f.footer 都要量）
+    --      ⇒ 键改成 `tostring(face) .. "\1" .. s`。
+    --
+    -- ★★★ 1.1 内修订（45c：导航栏选中填充不完整 —— 又是 FrameContainer）
+    --
+    --   用户回执：「周选择选还是太长，以及导航栏选中的填充还是不完整」。
+    --   ① 这条查清了真因，② 还没定，见下。
+    --
+    --   ① 【导航栏 · 选中填充不完整 —— 两处 FrameContainer 误用】
+    --      上游 `FrameContainer:getSize()` **忽略**构造时传的 `width`/`height`，
+    --      只按「子控件尺寸 + 2×(margin + bordersize + padding) + padding_*」
+    --      反推。于是 `buildSegmentedRow` 里两处都塌了：
+    --        · 格与格之间那条 2px 分隔线写的是
+    --            `FrameContainer{ width = sep_w, height = inner_h,
+    --                             子控件 = 1×1 的 FixedBox }`
+    --          ⇒ getSize() 只认那个 1×1 ⇒ 设备上**根本没画出线**，只剩 1 个点。
+    --          改回**自造 SolidRect**（它只按给定 width/height 画实心矩形）。
+    --        · 选中格的填充用 `FrameContainer{ radius = radius - border }`，
+    --          而 `radius` 是**四角同一个值** ⇒ 选中落在中间格时，四角
+    --          各留一个白色缺口，看起来就是「填充不完整」。
+    --          新写 `SegFill` 控件：`radius_left` / `radius_right` **分开传**，
+    --          只有贴外框的那一侧才圆角（首格圆左、末格圆右、中间格两侧都不圆）。
+    --          SegFill 内部：中间段用 paintRect，两端各自「竖条 + 上下两个
+    --          paintCircle」拼出半圆角，半径再 clamp 到 min(w,h)/2。
+    --
+    --   ② 【周选择器 · 还是太长 —— 用户选了 B，每页 15 → 8】
+    --      45b 已经把 53 行拆成 `WEEK_PAGE_SIZE = 15` 的 4 页，但用户仍嫌长。
+    --      分不清他嫌的是「列表高」还是「弹窗宽」，所以先按真实尺寸画了
+    --      4 个候选（预览见 ui-shots/字数统计UI修改-45c-周选择器方案.png）：
+    --        A 现状  单列 15 行 → 弹窗 206×660（占屏 38% × 91%）· 4 页
+    --        B 单列 8 行        → 弹窗 206×382（38% × 53%）· 7 页   ← 用户选这个
+    --        C 两列 16 行       → 弹窗 412×382（**77%** × 53%）· 4 页（明显变宽）
+    --        D 周号网格         → 弹窗 186×343（35% × **47%**）· 一屏看全 53 周
+    --      用户选了 **B**：`WEEK_PAGE_SIZE = 15 → 8`。只动这一个常量就够了 ——
+    --      `page_count` / `first` / `last` / 「默认落在当前周所在页」全是按它算的，
+    --      翻页栏和黑底反白都不用改。代价：页数 4 → 7
+    --      （当前周 42 在倒序列表里是第 12 条 ⇒ 落在第 2 页）。
+    --
+    -- ★★★ 1.1 内修订（45e：去掉分段控件中间的竖线分隔）
+    --
+    --   用户回执（附真机截图）：「这个不要中间的竖线分隔」。
+    --   指的是 `buildSegmentedRow` 里格与格之间那条灰竖线 —— 也就是 45c
+    --   刚用 SolidRect 修出来的那条（在那之前它因 FrameContainer 的
+    --   getSize() 问题**从来没画出来过**）。
+    --   用户不要线 ⇒ 整段删掉，格子均分整个内宽：
+    --     · `cell_w = floor(inner_w / n)`，取整余数补给**最后一格**
+    --       （`(i == n) and (inner_w - cell_w * (n - 1)) or cell_w`），
+    --       否则整排右侧会留一条 1~4px 的白缝；
+    --     · 45c 的 `SegFill` 选中填充**保留不动** —— 去掉竖线后，
+    --       「未选中 = 白底黑框 / 选中 = 黑底白字」就是唯一的区分方式。
+    --   预览：ui-shots/字数统计UI修改-45e-去掉竖线.png
+    --
+    -- ★★★ 1.1 内修订（45f：选中项「全变黑」+ 日视图打开失败）
+    --
+    --   用户回执：「周的选择器选中的周直接全变黑了，日的统计页面打开失败：
+    --   plugins/wordcount.koplugin/statistics_page.lua:1251:
+    --   attempt to index global 'HRule' (a nil value)」。两条都查了上游源码。
+    --
+    --   ① 【周/日历 · 选中项黑底黑字 —— Button 的文字颜色是硬编码的】
+    --      `ButtonTable` **会**透传 `background`（buttontable.lua:98），所以黑底
+    --      画得出来；但 `Button` 的**文字颜色压根没有可配字段** ——
+    --      button.lua:114 写死 `fgcolor = self.enabled and COLOR_BLACK
+    --      or COLOR_DARK_GRAY`，随后原样喂给 TextWidget。既没有
+    --      `text_font_color`，也没有 `color`。
+    --      ⇒ 之前写的 `btn.color = COLOR_WHITE` 是**无效字段** ⇒ 黑底 + 黑字
+    --        = 一整块黑。日历的「今天」那一格同理。
+    --      （顺带：`btn.bold` 也是无效字段 —— ButtonTable 透传的是 `font_bold`，
+    --       见 buttontable.lua:97。这里干脆不加粗，免得长文本触发缩字号。）
+    --      修法：新增 `invertButtons(dlg, ids)` —— ButtonTable 会透传 `id`
+    --      （buttontable.lua:117 存进 `button_by_id`），构造完 dialog 后按 id
+    --      取回 Button 实例，把 `frame.invert` 置 true。
+    --      `FrameContainer:paintTo` 里有 `if self.invert then bb:invertRect(...)`
+    --      （framecontainer.lua:161，且排在**子控件绘制之后**），整个按钮区域
+    --      反色 ⇒ 白底黑字变黑底白字，文字自动跟着反，不用碰 TextWidget。
+    --      ⚠ 用了 invert 就**不要**再设 `background = COLOR_BLACK`，否则反成白底。
+    --      周选择器 id = "wc_current_week"，日历 id = "wc_today"。
+    --
+    --   ② 【日视图打开失败 —— `HRule` 缺前向声明】
+    --      报错行 1251 是 `buildHourlyActivityList` 里的 `HRule:new{}`
+    --      （45b 把行间分隔从 VerticalSpan 改成 HRule 时埋的）。
+    --      Lua 的 `local` 作用域**从声明那一行才开始**：`HRule` 当时只在
+    --      `local HRule = WidgetContainer:extend{...}`（1417 行）才声明，
+    --      于是 1251 行那句被解析成**全局** `HRule`（nil）—— 只在真正调用到
+    --      该函数时才炸，所以平时看不出来，一打开日视图就崩。
+    --      修法（照 `SolidRect` 已有的写法）：在 1136 行前向声明
+    --      `local HRule`，并把定义处的 `local` 去掉、改成纯赋值。
+    --      ⚠ 定义处**不能**再写 `local` —— 那会遮蔽前向声明，等于没修。
+    --      顺带全文件扫了一遍「定义在使用之后」的同类隐患，除 HRule 外没有第二处。
+    --
+    --   预览：ui-shots/字数统计UI修改-45f-选中项与日视图修复.png
+    --
+    -- ★★★ 1.1 内修订（46a：趋势图最高柱没数值 + 列表行间点线 + 日选择器年月分两行）
+    --
+    --   46 轮用户一次提了六项 UI。这一条记的是**已确认、已改完**的三项；
+    --   另外三项（导航栏重新设计、小时柱圆角、日历视图）还在预览阶段，见下。
+    --
+    --   ① 【趋势图 · 最高的那根柱子顶端没有数值 —— 是铺排顺序，不是空间不够】
+    --      用户原话：「我看月的有一个很长的柱子，顶端没有显示数值」。
+    --
+    --      ★ 先排除一个错误猜想：**不是图上方留白不够**。
+    --        `buildTrendSection` 给的 VerticalSpan = `label_h + 10px`，
+    --        而柱顶标签只需要 `label_h + gap(6px)` —— 还余 4px。
+    --        （`AbsoluteContainer:paintTo` 只按 `x+item.x, y+item.y` 画子控件，
+    --         **不裁剪**，所以标签 y 为负、画到图上方是设计而不是 bug。）
+    --
+    --      真因：`chartValueLabels` 原来是**只从「选中柱」出发**向左右贪心扫，
+    --        最高柱没有任何优先权。实测（月视图 31 桶、选中 27 号）：
+    --          向左扫到 20 号「700」时它先占住位置，
+    --          紧接着 18 号「5,800」算出来，两个标签的区间只差 **2px** 就撞上
+    --          ⇒ 判定重叠、直接跳过。于是最显眼的那根柱子反而没数字。
+    --        数据里一旦出现 `153.1万` 这种 6 字符宽标签（代码注释里点名的
+    --        情形），重叠幅度更大，必然丢。
+    --
+    --      修法：铺排改成**按优先级** ——
+    --        ① 选中柱（保住「刚点过的那根一定有数」）
+    --        ② 最高柱（本次新增）
+    --        ③ 其余按原来的方向贪心（左一遍、右一遍）
+    --      重叠判定从「只跟本方向的边沿比」换成「跟**所有已放置标签的区间**比」
+    --      （`overlaps()` + `placed` 区间表）—— 因为最高柱可能落在选中柱的
+    --      左边或右边，只比单侧边沿会漏判。
+    --      ⚠ 代价：最高柱和它邻居的标签**可能真的二选一**（上面那个例子里
+    --        700 会被挤掉）。这是几何硬约束。已用 fengari 实测：
+    --        宽标签场景 改前 [3,5,8,12,15,20,22,27] → 改后 [3,5,8,12,15,18,22,27]
+    --        （18 号拿到了，20 号让位，**标签总数不变**）；
+    --        窄标签场景两者完全一致。
+    --      ⚠ 别想着把 `gap` 调小来「两个都要」：gap 已经是 scaleBySize(3)=6px。
+    --
+    --   ② 【趋势图 · 整体往下一点】
+    --      同一处 `VerticalSpan` 从 `label_h + scaleBySize(3) + scaleBySize(2)`
+    --      （= label_h + 10px）放大到 **`label_h + scaleBySize(14)`**（+28px）。
+    --      原来只剩 4px 富余，最高柱顶到图顶时标签离标题「贴脸」；
+    --      改后富余 22px。**不动图高**（仍是 4*row_h），所以 X 轴刻度行、
+    --      周期导航、翻页栏的位置都不会被顶走，页面总高只多 18px。
+    --
+    --   ③ 【趋势列表 · 行间加水平点线分隔】
+    --      用户原话：「点线是分隔线不是导航线」。
+    --      这里有两种长得像、含义完全不同的「点线」，必须分清：
+    --        · **导航线（leader dots）**：像目录那样在**同一行内部**从左标签
+    --          点过去接到右数值 —— 用户**不要**这个；
+    --        · **分隔线（separator）**：横跨整行、**画在两行之间**的水平点线
+    --          —— 这个才是要的。
+    --      所以**没有**碰 `filler`（那根留白仍是纯空白），而是在每两行之间插
+    --      一条 `HRule{ width = width, dotted = true }`（与总览页「点线」卡片
+    --      样式同一种线，圆点半径见 SEP_DOT_R）。
+    --      ⚠ 最后一行后面**不加** —— 列表底下再挂一条线会跟翻页栏贴住，
+    --        看着像列表没结束。
+    --      ⚠ 连带把 `local SolidRect` / `local HRule` 这两句**前向声明又往上
+    --        挪了一格**（挪到 `buildTrendList` 之前）。因为 `buildTrendList`
+    --        比 `buildHourlyActivityList` 更靠前，声明留在原处的话，
+    --        45f 修过的那个 `attempt to index global 'HRule'` 会在
+    --        **列表模式**里原样复现一次。教训：这个文件里凡是「定义在文件
+    --        后半、被前半的函数体引用」的控件，前向声明必须放在**最早的那个
+    --        使用者之前**；再加新调用点时要回头确认顺序。
+    --
+    --   ④ 【日选择器 · 年月拆成两行】
+    --      用户原话：「日的选择器里，年和月放到两行」，随后确认选「候选 A」。
+    --      改前是一行三个按钮 `‹ | 2026年10月 | ›`，两个箭头**都只管月份**
+    --      （一次 1 个月，跨年自动进位）。想看「去年同月」最坏要点 24 下。
+    --      改后：年一行（`‹ | 2026 年 | ›`，箭头跨 1 年）、月一行
+    --      （`‹ | 10 月 | ›`，箭头跨 1 月），同一次跳转只要 3 下。
+    --      ⚠ 月份行的箭头**保持原来的跨年行为**（12 月的 › 走到次年 1 月）——
+    --        这是 `anchorAtMonth` 的既有语义（`os.time` 会自动规整越界的
+    --        `month`），没有改动。
+    --      ⚠ 年月文字改成 `%04d 年` / `%d 月`（中间带空格）：拆行后每格宽度
+    --        从约 110px 涨到 330px 的一半以上，不用再挤在一起了。
+    --      顺带把三个重复的 `callback` 收成 `gotoAnchor(target)` 一个闭包工厂。
+    --
+    --   验证：luaparser 语法通过；另用 fengari（`koreader-lua-plugin-verify`
+    --     技能的 runlua.js）**从 statistics_page.lua 真实提取** `chartValueLabels`
+    --     + `barPixelHeight` + `formatCount` 跑 17 项断言全过（含「最高柱必须
+    --     被标上」「标签两两不重叠」「全 0 / 空桶 / 单桶 / selected 越界不崩」）。
+    --     生成脚本 `_gen_chart_test.py`，测试 `test_chart_labels.lua`。
+    --
+    --   预览：ui-shots/字数统计UI修改-46-总览.png（第 47 轮的导航栏候选另出）
+    --
+    -- ★★★ 1.1 内修订（49：导航栏候选 D ⑦ + 小时柱圆角 + 卡片 4 列 / 删「记录笔记」）
+    --
+    --   46 轮剩下的三项，49 轮用户逐条拍板后一次落代码。中间出了三版预览
+    --   （47 导航栏四方案 / 48 灰色试色 / 49 边框与轨道高），用户最终选
+    --   「候选 D ⑦，轨道高度 46」。
+    --
+    --   ① 【导航栏 · 候选 D ⑦：白底圆角轨道 + 内缩圆角滑块】
+    --      用户原话：「导航到底怎么设计好看呢，这样也不是很好看」→ 看四方案后
+    --      「要这个，然后边框颜色重一点，轨道的高度高一些」「轨道边框」→
+    --      「d 能做成灰色的吗」→ 选深灰 →「46」。
+    --
+    --      45c 那版为什么不好看：外框是**圆角**的，而选中的黑块是**方角**、
+    --      且 `padding = 0` 直接顶到外框内缘 ⇒ 角落露出一小块白、中间那条
+    --      1px 分隔线又是**直**的，三者互不搭。
+    --
+    --      改法（四个常量 + 一处控件增强）：
+    --        · `ROW_TAB_H_PX` 26 → **46**（用户从 34/38/40/46 里选了最高的）
+    --        · `NAV_TRACK_RADIUS_PX = 11`  轨道圆角（设备 20px）
+    --        · `NAV_THUMB_RADIUS_PX = 9`   滑块圆角，四角同值（设备 17px）
+    --        · `NAV_TRACK_PAD_PX = 3`      轨道内边距（设备 6px）——
+    --          滑块从边框缩进去一圈，四角都圆，这才叫「圆角轨道 + 圆角滑块」
+    --        · 边框色与滑块色都用 `COLOR_DARK_GRAY(0x88)`（用户要「边框颜色
+    --          重一点」；0x88 在 KPW4 的 16 级灰阶上正好是 8/15 档，
+    --          是 17 的整数倍 ⇒ **不抖动**，见 ffi/blitbuffer.lua:2710-2725）
+    --
+    --      ⚠ `SegFill` 为此新增 `radius` 字段（四角同圆角，走
+    --        `bb:paintRoundedRect`）。原来的 `radius_left` / `radius_right`
+    --        只能分别管左右两侧，**拼不出四角同圆角**。
+    --        `radius == 0` 时**完全走老路径**（中间竖带 + 左右带 + 角圆），
+    --        行为一字未改 —— 有断言守着（见下）。
+    --      ⚠ `paintRoundedRect` 签名是 **(x, y, w, h, c, r)** —— 颜色在前、
+    --        半径在后（ffi/blitbuffer.lua:2169），别按直觉写反。
+    --      ⚠ `FrameContainer:getSize()` **忽略**构造时传的 width/height，
+    --        只按「子控件 + 2*(margin+bordersize+padding)」反推 ⇒ 新加的
+    --        `padding = pad` 必须真的传下去，否则尺寸会算少 12px。
+    --      ⚠ 高度涨了 ~72px（两排 47→83，中间还有 9px 空隙）——
+    --        `buildUnitsPage` 的 chrome 预算本来就引用 `ROW_TAB_H_PX`，
+    --        会自动跟着变（每页行数少 1）；总览页见下面第 ③ 条。
+    --
+    --   ② 【小时柱 · 加一点圆角】
+    --      用户原话：「4 边框怎么不是圆角的」。
+    --
+    --      ★ 先纠正我自己的一个错：真实 UI **根本没有那个外框**。代码只画一根
+    --        黑柱（`SolidRect`），`border = scaleBySize(1)` 只是把填充内缩 2px，
+    --        并没有画轨道轮廓 —— 47 轮预览里那个灰框是我自己加的示意框，
+    --        误导了用户。已在预览里说明并改成「只给柱子加圆角」。
+    --
+    --      `SolidRect` 新增 `radius`（`> 0` 走 `paintRoundedRect`，`== 0`
+    --      仍是原来的 `paintRect`，零回归）。调用点传
+    --      `radius = Screen:scaleBySize(3)` = **6px**，柱高
+    --      `scaleBySize(12)` = **22px** ⇒ 半径约占柱高 1/4，是「方中带圆」
+    --      而不是胶囊（胶囊要半径 = 柱高/2 = 11px，那在 e-ink 上像药丸）。
+    --      `fill_w` 的进度比例计算**一个字没动**。
+    --      ⚠⚠ 栽过一次：`local bar_r = ...` 一开始被插到了
+    --        `FixedBox:new{...}` 的**表构造器内部**（那是表达式位置，只允许
+    --        字段）⇒ luaparse 报 `[1300:12] '}' expected near 'local'`。
+    --        后来者改这里注意：`local` 必须提到表外面。
+    --
+    --   ③ 【卡片网格 · 一行 4 个 + 字号自适应 + 删「记录笔记」】
+    --      用户原话：「如果要是卡片放不下的话，缩小一点字体，变成一行 4 个
+    --      卡片，把最后的记录笔记卡片删掉」。
+    --
+    --      · `CARD_DEFAULT_COLS` 3 → **4**（`CARD_MAX_COLS` 也是 4）
+    --      · 删掉 `id = "notes"` 的「记录笔记」spec ⇒ 正好 **8 张 = 4 列 × 2 行**
+    --        ⚠ `summary.notes` 那个**数据本身没删**（还在 global_stats 里算着），
+    --          想加回来恢复这个 spec 就够。
+    --      · 新增 `CARD_LABEL_SIZE_LADDER {19..13}` / `CARD_DELTA_SIZE_LADDER
+    --        {18..13}` + `pickCardFace()`：照抄 `VALUE_SIZE_PAIRS` 那套
+    --        「从大到小试，第一个放得下就用」，量的是**所有卡片里最宽的那条**
+    --        （必须统一，不能一张卡一个字号）。
+    --        ⚠ 梯子**从原值起步**（19 / 18）：3 列模式下宽度够，会原样选回
+    --          19 / 18，**行为不变**；只有真放不下才降。
+    --        ⚠ 调用顺序不能反：必须**先**算 `spec.delta_text` 再挑字号 ——
+    --          pickCardFace 量的是 `spec.delta_text`，没算就是 nil、整条跳过、
+    --          直接返回最大档。（我在测试里踩过一次，`buildCardGrid` 的
+    --          ①→②→③ 三步就是为此排的。）
+    --
+    --      ★★ 顺手纠正一个**我先前写错的事实**：原来注释说「TextWidget 会
+    --        折行，卡片被动变高」。**不对。** TextWidget 给了 `max_width` 之后，
+    --        超宽走的是**截断 + 省略号**（frontend/ui/widget/textwidget.lua:154-176，
+    --        `truncate_with_ellipsis` 默认 true），高度**始终一行**。
+    --        所以放不下的真实症状是**标签被截成「日均阅读…」，用户读不到是
+    --        什么指标** —— 比变高更糟。字号梯子解决的正是这个。
+    --
+    --      实测（`_gen_card_test.py`，按真实 `Font:getFace` 的
+    --      `size = Screen:scaleBySize(size)` 换算）：
+    --        · 4 列：card_w 298→221，inner_w 280→203
+    --        · 标签可用宽 = 203 - scaleBySize(20)=36 ⇒ **167px**
+    --          「日均阅读时长」6 汉字：19→204 ✗ / 18→198 ✗ / 17→186 ✗
+    --                                 16→174 ✗ / **15→162 ✓** ⇒ 落到 15 号
+    --        · 环比可用宽 = inner_w ⇒ **203px**
+    --          最宽「↑ 3小时12分钟」：18→224 ✗ / 17→211 ✗ / **16→197 ✓**
+    --                                 ⇒ 落到 16 号
+    --        · 卡高 173 → 160；网格 3 行 537px → 2 行 329px
+    --
+    --   ④ 【页面总高 · 净变化是「变矮」，不是变高】
+    --      导航栏加高 **+72px**，卡片网格少一行 **-208px**
+    --      ⇒ 总览页净 **-136px**（反而多出空间）。阅读字数页的
+    --      `buildUnitsPage` 本来就是按 `ROW_TAB_H_PX` 现算 chrome、每页行数
+    --      自适应，导航栏变高只会让它每页少排 1 行，不会溢出。
+    --
+    --   验证：luaparser（换成 `luaparse`，行号更准）8 个 lua 文件全过；
+    --      fengari 三个套件共 **123 项断言全过**：
+    --        · `test_chart_labels.lua`  17 项（46a 的趋势图铺排，回归）
+    --        · `test_widgets_49.lua`    73 项（SolidRect/SegFill 的 radius
+    --          两条路、buildSegmentedRow 的几何与配色、余数补给、TapBox 包裹、
+    --          pickCardFace 的降级与兜底、ROW_TAB_H_PX/NAV_* 常量）
+    --        · `test_cards_49.lua`      33 项（列数、字号梯子、零回归、
+    --          不截断、卡高与网格总高、总高净变化）
+    --      生成脚本 `_gen_widget_test.py` / `_gen_card_test.py`，
+    --      语法校验脚本 `_lua_check.js`（luaparse）。
+    --      三者都是**从 statistics_page.lua 真实提取**函数体再跑，不是重抄一遍。
+    --
+    --   预览：ui-shots/字数统计UI修改-49-导航栏轨道边框与高度.png（及 47 / 48 两轮）
+    --
+    -- ★★★ 1.1 内修订（49b：卡片大数字统一字号 + 49c：年份去边框）
+    --
+    --   49 轮交付后用户连着两条回执，都是「同一屏里不统一」的问题。
+    --
+    --   ① 【49b · 卡片大数字统一字号】用户原话：「卡片字体一致一点啊」
+    --
+    --      病因：`buildCardContent` 原来在**每张卡内部**各自循环
+    --      `VALUE_SIZE_PAIRS`（试到放得下就 break）—— 于是同一屏出现三种
+    --      大数字字号。49 轮实测（4 列，inner_w = 203）：
+    --        阅读字数 / 阅读天数 / 累计读过 / 读完书籍 → cfont 32（设备 58px）
+    --        阅读速度 / 阅读时间 / 日均阅读时长     → cfont 28（设备 51px）
+    --        单日阅读最久                          → cfont 23（设备 42px）
+    --      一眼看过去就是「大数字忽大忽小」，四张卡不像一套。
+    --
+    --      改法：新增 `pickValuePair(specs, inner_width)` —— 和 `pickCardFace`
+    --      完全同一个思路：挑**第一个「所有卡片都放得下」的档位**，再传给每张卡。
+    --      `buildCardContent` 多一个可选参数 `value_pair`；**不传时行为与原来
+    --      一模一样**（每张卡各自试档），所以它仍可单独调用/测试。
+    --      `buildCardGrid` 里的三步走变成四步：① 算 delta_text → ② 挑
+    --      label/delta 字号 → ③ 挑 value 档位 → ④ 建内容量高。
+    --
+    --      实测（`_gen_card_test.py`）：
+    --        第 1 档 cfont 32/19（设备 58/34）：最宽「单日阅读最久」= 240 / 可用 203 ✗
+    --        第 2 档 cfont 28/17（设备 51/31）：最宽同上            = 218 / 可用 203 ✗
+    --        第 3 档 cfont 23/15（设备 42/27）：最宽同上            = 188 / 可用 203 ✓
+    --        ⇒ 统一落到 **cfont 23 / 15**。卡在 1、2 档的是「单日阅读最久」的
+    --          `5小时41分钟` —— 它有 **4 个片段**（数字/单位/数字/单位），是全屏最宽的。
+    --
+    --      ⚠ **代价说清楚**：统一之后，原本能单独用 32 号的那四张
+    --        （阅读字数 / 阅读天数 / 累计读过 / 读完书籍）会**跟着降到 23 号**。
+    --        这是「一致」的必然代价，不是 bug。大数字从 58px 变 42px。
+    --      ⚠ 想要「又一致又大」只有两条路，都**不是纯代码**能解决的，
+    --        所以**没有**擅自做：
+    --          ① 缩文案（`字/分钟` → `字/分`、`分钟` → `分`）—— 能让全屏回到 28 号；
+    --          ② 放宽卡片内边距（`Size.padding.default` 9 → `Size.padding.small` 4，
+    --             inner_w 203 → 213）—— 改变的是整块卡片的观感。
+    --      ⚠ 连带好处：卡高 173 → **141**、网格 537 → **291**（再省 246px）。
+    --        因为大数字小了，值行也矮了。总览页净变化变成 **−174px**。
+    --
+    --   ② 【49c · 年份去掉边框】用户原话：「年份不要有边框」→
+    --      「日周月里的年份都有边框，把边框去掉」（确认了就是那一处）
+    --
+    --      位置：`buildPeriodNav` 的第 1 行「年」。37t 给它套了一个胶囊：
+    --        `FrameContainer{ bordersize = scaleBySize(1),
+    --                         color = COLOR_GRAY_E, radius = scaleBySize(7) }`
+    --      左右还各塞了 `Size.padding.large` 的 HorizontalSpan 把胶囊撑宽，
+    --      理由是「用户一眼就知道这里能点」。
+    --      49c 用户明确不要这个框 ⇒ **整个 FrameContainer 撤掉**（边框、圆角、
+    --      左右 padding 一并没了），只剩一行加粗文字 —— 与下面「月日」那行
+    --      同一套文字语言。
+    --
+    --      ⚠ **代价**：「年份能点」的可视线索没了。点年份文字**仍然**会弹
+    --        年份列表（37r 那条路完整保留，有断言守着），只是看不出能点。
+    --        左右 ‹ › 年箭头不受影响，仍是唯一「看得出来能点」的东西。
+    --        如果哪天觉得「不知道这里能点」，**别把边框加回来** —— 换成更轻的
+    --        指示（文字下一条细下划线 / 尾部一个 chevron.down），那才跟
+    --        「无边框」是一套语言。
+    --      ⚠ 触摸热区**不变**：仍是外层 `FixedBox` 撑满 `width - 2*arrow_w`
+    --        的整条中间带（比文字宽得多，手指好按）。文字仍居中 ——
+    --        外层是 `FixedBox{align="center"}`，不靠那两个 span 定位。
+    --      ⚠ `Blitbuffer.COLOR_GRAY_E` 在本文件里**到此没有别的使用者**了。
+    --      ⚠ 「累计」粒度下本来就是纯文字（不套胶囊）—— 那段没动。
+    --
+    --   验证：luaparse 8 个 lua 文件全过；fengari **四个套件共 179 项断言全过**：
+    --     · `test_chart_labels.lua`   17 项（46a 趋势图铺排，回归）
+    --     · `test_widgets_49.lua`     73 项（SolidRect / SegFill / buildSegmentedRow
+    --                                      / pickCardFace / 导航栏常量）
+    --     · `test_cards_49.lua`       41 项（列数 / 字号梯子 / **统一档位** /
+    --                                      一致性 / 不截断 / 卡高与总高）
+    --     · `test_periodnav_49c.lua`  48 项（**构造过程中一个 FrameContainer
+    --                                      都没创建** / 热区不变 / 仍能弹年份列表 /
+    --                                      四个粒度 / 箭头没丢 / total 不可点）
+    --     `test_periodnav_49c.lua` 的核心断言是「`FrameContainer.new` 调用计数 == 0」
+    --     —— 比数像素硬：只要那个胶囊回来，这条立刻变红。
+    --     生成脚本 `_gen_card_test.py` / `_gen_nav_test.py`（连同之前的两个）。
+    --
     -- ★ 还没动 / 等拍板的（沿用前几轮，未变）：
     --   · 趋势图的柱子**不能点**（X 轴刻度是纯 text 控件，没有点击回调），
     --     而总览页的卡片是能点进去下钻的 —— 交互上不一致；
     --   · 「累计」和「年」视图的粒度仍是**月**（12 个桶）；
     --   · 「阅读字数」页第 1 / 41 页里后 40 页整页都是「0 字」（口径问题，
     --     两个候选修法见上一轮记录）。
+    --
+    -- ★★★ 1.1 内修订（49d：把 reload 的刷新模式从 "ui" 换成 "[partial]"，
+    --      治「导航栏选中黑色闪烁后才是灰色选中」）
+    --
+    --   用户原话：「为什么导航栏选中黑色闪烁后才是灰色选中」。
+    --   ⇒ 先只做只读排查、把「为什么」查实（**没动源码**），用户拍板选 B 后才落的代码。
+    --
+    --   ── 病因（两层，两层都对着源码验过）────────────────────────────
+    --   ① **插件侧是干净的**（已实测）：点一下导航栏标签，`reload()` 只排
+    --      **1 条**刷新 —— `mode = "ui"`、`region = popup_frame.dimen`；
+    --      **不含 "full"、不含 "flashui"**；`refresh_count` 也不动
+    --      （"ui" 不在提升名单里，uimanager.lua:1163 只认字符串 "partial"）。
+    --      ⇒ 43-no-flash 修掉的那个「partial → full 提升」**不是**这次的原因，
+    --        43 的修复是有效的，**没撤**。
+    --   ② 黑闪出在**驱动挑波形**这一步：
+    --      · PW4 = Rex 平台（device.lua:1076-1078 `isRex = yes`）；
+    --      · Rex/Zelda 的 `waveform_ui = WAVEFORM_MODE_AUTO`
+    --        （framebuffer_mxcfb.lua:874）—— **不是**老机型的 `GC16_FAST`；
+    --      · `"ui"` ⇒ `refreshUIImp` ⇒ `mech_refresh(false, AUTO)`（:789-792）
+    --        ⇒ `refresh_rex` 的 `hist_bw = DU`（:557）/ `hist_gray = GC16`（:558）
+    --        ⇒ **驱动按矩形内容挑波形：纯黑白 → DU（1bit 直写，快、不闪）；
+    --        含灰 → GC16（16 级全波形 = 闪黑）**；
+    --      · 49-nav-thumb 把选中块从 `COLOR_BLACK` 换成 `COLOR_DARK_GRAY(0x88)`，
+    --        而选中块是导航栏里**面积最大**的一块 ⇒ 这块矩形里出现大块实心灰
+    --        ⇒ 波形从 DU 跳到 GC16 ⇒ 就是那一下黑闪。
+    --      ⚠ 精确说法：轨道边框在 49 **之前**就已经是 `COLOR_DARK_GRAY` 了
+    --        （旧版可查 `E:/kindle越狱/自制字数/_tmp_pack/`，那边有 .git），
+    --        49 新增的是「**大块实心灰**」，不是「第一次出现灰」。
+    --
+    --   ── 改法 ────────────────────────────────────────────────────
+    --   `statistics_page.lua` 的 `StatisticsPage:reload()` 里：
+    --       UIManager:show(next_page, "ui", refresh_region)
+    --   →   UIManager:show(next_page, "[partial]", refresh_region)
+    --   区域和 `_skip_close_repaint` 那套**一个字没动**，只换模式字符串。
+    --
+    --   ── 为什么是 "[partial]" 而不是 "partial" ───────────────────────
+    --   · PW4 的 `waveform_partial = waveform_reagl = WAVEFORM_MODE_ZELDA_GLR16`
+    --     （:879-880）—— REAGL 就是**专为灰度局部刷新**设计的波形：能出 16 级灰，
+    --     但不像 GC16 那样走一整轮黑→白全波形 ⇒ **不闪、也不用抖动**。
+    --     （`is_flashing` 仍是 false、`update_mode` 仍是 `UPDATE_MODE_PARTIAL`，
+    --      见 :353。）
+    --   · ⚠ 但**不能**直接用 `"partial"`：uimanager.lua:1163 的提升名单是
+    --     「字符串精确等于 "partial"」，带 region 的 "partial" 每
+    --     `FULL_REFRESH_COUNT` 拍会被提升成 `"flashui"`（:1168）—— 又是一次黑闪，
+    --     等于把 43 的坑重新踩一遍。
+    --   · `"[partial]"` 走 `refreshNoMergePartial` ⇒ `refreshPartialImp`
+    --     ⇒ **同一个 REAGL 波形**，但字符串不匹配 ⇒ **永远不参与提升**。
+    --     ⇒ 一次拿到「灰度 + 不闪 + 不被提升」三样。
+    --
+    --   ── 代价说清楚 ──────────────────────────────────────────────
+    --   · `"[partial]"` 是「不合并」语义（`refreshNoMerge*`），不会和同帧其它
+    --     刷新合并。本页一次只排这一条，没有影响。
+    --   · 不参与提升 ⇒ 这块区域「攒够几拍清一次残影」也没了。但**整屏的周期全刷
+    --     由阅读器翻页那条 "partial" 负责**，计数器是全局的 ⇒ 残影照样会被清掉，
+    --     不会累积。
+    --   · 非 Rex/Zelda 机型上 `waveform_partial` 是 `GL16_FAST`（老 Kindle）或
+    --     `GL16`/`AUTO`（Kobo）—— 都仍是局部刷新、都不是 GC16，不会更差。
+    --   · `avoid_flashing_ui`（「避免 UI 黑闪」）只降级 flashui / flashpartial /
+    --     带 region 的 partial，**不会**把 `"[partial]"` 改成 "ui"
+    --     ⇒ 用户开不开这个开关，行为一致。
+    --
+    --   ⚠⚠ **别把这里改回 `"ui"`**：在 PW4 上 "ui" = AUTO，一旦这块矩形含灰就闪。
+    --      要再动这个模式，先跑下面两个测试。
+    --
+    --   ── 验证 ────────────────────────────────────────────────────
+    --   · luaparse：**8 个 lua 文件**（含 `_meta.lua`）全过。
+    --   · fengari 新套件 **`test_reload_49d.lua`**（生成脚本 `_gen_reload_test.py`）：
+    --     从 `statistics_page.lua` 里**原样抠出 `StatisticsPage:reload` 的函数体**
+    --     （131 行，不改一字），桩掉 `StatisticsPage.new` / `UIManager`，**31 项断言**：
+    --     先 `close`（**不带 refreshtype**）再 `show`；`show` 的第 2 个参数是
+    --     `"[partial]"`、第 3 个是 `popup_frame.dimen` 同一个对象；
+    --     整条路径**从不出现** "ui" / "full" / "flashui"；`_skip_close_repaint`
+    --     在 `close` 之前就已置 true；`popup_frame` 为 nil / dimen 为 nil 时
+    --     退回 `show(next_page)`（不带刷新参数）这条老路仍在；
+    --     参数透传（period / anchor / metric / view / plugin / unit_page）没被改坏；
+    --     构建失败时仍只弹 InfoMessage。
+    --   · fengari **`test_refresh_path.lua`**（生成脚本 `_gen_refresh_test.py`）：
+    --     把上游 `uimanager.lua` 的 `refresh_modes / refresh_methods / update_mode
+    --     / update_dither / show / close / setDirty / _refresh / _repaint`
+    --     **原样抠出来**（首尾行做内容校验，防上游漂移）跑真实刷新队列。
+    --     **36 项断言**，六个场景：
+    --       A) 49d 写法 → 1 条 `"[partial]"`，落到 `refreshNoMergePartial`；
+    --       A2) 连点 12 次 → 12 条全 `"[partial]"`，**0 次提升**；
+    --       A3) 对照：49c 的 `"ui"` 写法 → 1 条 `"ui"` → `refreshUI`（AUTO 那条路）；
+    --       B) 43 之前的老写法 → 12 次里**第 5、11 次被提升成整屏 `"full"`**
+    --          （这才是老黑闪的代码证据）；
+    --       C) `"[partial]"` 连排 30 次不被提升、不计数；`"ui"` 同样；
+    --       D) 带 region 的 `"partial"` 每 6 拍被提升成 `"flashui"`
+    --          （所以不能用 "partial"）。
+    --   · 只读核对脚本 `_check_pw4_refresh.py`：上游 **22 条事实全过**
+    --     （PW4=Rex / isREAGL 继承 / waveform_ui=AUTO / waveform_partial=ZELDA_GLR16
+    --      / 两个 refreshImp 的 is_flashing / refresh_rex 的 hist_* / update_mode
+    --      三元 / 波形常量数值 / 提升规则只认字符串 "partial"）。
+    --   · 累计 6 个套件 **246 项断言全绿**：
+    --     `test_chart_labels.lua` 17 + `test_widgets_49.lua` 73
+    --     + `test_cards_49.lua` 41 + `test_periodnav_49c.lua` 48
+    --     + `test_reload_49d.lua` 31 + `test_refresh_path.lua` 36。
+    --   · 本轮**没有出 HTML 预览图**：改的是刷新模式，静态截图看不出差别，
+    --     出了反而是误导。验证靠上面这些可执行的套件。
+    --
+    --   ★ 同源但**本轮没动**的两处（用户没要求，先记着）：
+    --     · `DrillDownPopup:onCloseWidget`（statistics_page.lua:1997）
+    --       —— `setDirty(self, "ui", region)`
+    --     · `StatisticsPage:onCloseWidget`（statistics_page.lua:2295）
+    --       —— `setDirty(self, "ui", region)`
+    --     两处都是「关浮窗时按矩形刷一块」，在 PW4 上同样有 AUTO→GC16 的风险。
+    --     ⇒ **50 轮已按 49d 的同源理由一起改成 `"[partial]"`**，见下。
+    --
+    -- =====================================================================
+    -- ★★★ 1.1 内修订（50：加宽日选择器 + 关窗刷新改 "[partial]" + 加构建标记）
+    -- =====================================================================
+    --
+    --   ── ① 日选择器太窄（用户原话：「日的选择器太窄了」）──────────────
+    --   `showDayPicker`（statistics_page.lua:4438）的 `newFlatButtonDialog`
+    --   一直带着 `shrink_unneeded_width = true`。上游 `buttontable.lua:143-169`
+    --   会据此把宽度收到「刚好放下最宽那行」—— 日历是**列数不等的混排行**
+    --   （年/月行 3 列、星期行/日期行 7 列），真正卡住宽度的是**年行**
+    --   （中间那格「2026 年」的 `min_needed` ≈ 73px）。
+    --   KPW4 实算（scaleBySize 系数 1.7867）：
+    --     ButtonDialog 默认宽 floor(1072*0.9) = 964
+    --     buttontable 宽 = 964 - 2*3 - 2*4 = 950
+    --     年行   default=floor(950/3)=316, min≈73 ⇒ row_min_width = 950-243*3 = 221
+    --     日期行 default=floor(950/7)=135, min≈28 ⇒ row_min_width = 950-107*7 = 201
+    --     ⇒ 取最大 **221px** ⇒ 7 列每格 floor(221/7) = **31px**
+    --       （网格 221px，外套 padding 4 + border 3 ⇒ 对话框 235px = 屏宽 22%）。
+    --   改法：去掉 shrink + `width_factor = 0.80`
+    --   ⇒ ButtonDialog 宽 floor(1072*0.80) = 857 → 网格 843 → **每格 120px**
+    --      （宽了近 4 倍），对话框 857px = 屏宽 80%。
+    --   ⚠ 年/月/周三个选择器**保持 shrink 不动**（竖排列表，收窄正是想要的）。
+    --   ⚠ 别把 `shrink_unneeded_width = true` 加回日选择器 —— 加回即退回 221px。
+    --
+    --   ── ② 关窗两处 `setDirty(..., "ui", region)` → `"[partial]"` ──────
+    --   `StatisticsPage:onCloseWidget`（原 :2295）与
+    --   `DrillDownPopup:onCloseWidget`（原 :1997）。
+    --   理由：上游 `uimanager.lua:508-518` 的官方建议说 `"ui"` onCloseWidget
+    --   「will ensure never seeing a flash because of that widget」——
+    --   ⚠ **在 PW4 上不成立**：Rex 平台
+    --     `waveform_ui = WAVEFORM_MODE_AUTO`（`framebuffer_mxcfb.lua:874`），
+    --     而 `refresh_rex` 在非 ZELDA_GLR16 波形下把
+    --     `hist_gray_waveform_mode` 设成 `GC16`（:557-558）
+    --     ⇒ 驱动按矩形内容挑波形：纯黑白 DU（不闪）/ 含灰 GC16（闪黑）。
+    --   这两处矩形里必然含灰（深灰填充 + 灰阶抗锯齿文字）⇒ 每次关窗闪一下。
+    --   `"[partial]"` = REAGL（ZELDA_GLR16），不闪；且字符串不等于 "partial"
+    --   ⇒ 不参与 `uimanager.lua:1163` 的 flashui 提升。与 49d 同源同理。
+    --
+    --   ── ③ 加**构建标记**（`build` 字段 + 菜单显示）────────────────────
+    --   起因：用户报「还是闪烁黑色」，但**版本号按约定不升（仍 1.1）**，
+    --   从菜单上根本分不清设备上装的是 49d 还是更早的包。
+    --   ⇒ `_meta.lua` 顶层新增 `build = "50"`；`main.lua` 菜单第一行
+    --   从「版本：1.1」改成「版本：1.1（内修订 50）」。
+    --   ⚠ 这**不是**版本号 —— `version` 一个字没动，仍是 "1.1"。
+    --   ⚠ 以后每轮改代码只动 `build` 这个字段，不要动 `version`。
+    --
+    --   ── ④ 关于「还是闪烁黑色」的排查结论（本轮**没有**再改刷新路径）──
+    --   把「点导航栏滑块」这条路径从头到尾读了一遍，插件侧是**干净的**：
+    --     TapBox:onTapSelect（statistics_page.lua:506）只调 on_tap，无 setDirty；
+    --     → buildViewTabs/buildTabs 的 on_tap → StatisticsPage:reload；
+    --     → reload 里 `_skip_close_repaint = true` + `UIManager:close(self)`
+    --       ⇒ onCloseWidget 直接 return，**不排任何刷新**；
+    --     → `UIManager:show(next_page, "[partial]", region)` 只排 1 条。
+    --   `test_refresh_path.lua` 的场景 A/A2 已用上游真源码断言过「只有 1 条
+    --   `[partial]`、连点 12 次 0 提升」。另外确认了
+    --   `WidgetContainer:handleEvent`（widgetcontainer.lua:100-107）会把
+    --   CloseWidget **往下传播**给所有子控件，但子控件里实现了
+    --   `onCloseWidget` 的（ScrollableContainer:395 / MovableContainer:233 /
+    --   TextBoxWidget:1280 / TextWidget:390）**只 free 资源、都不 setDirty**，
+    --   所以不会偷偷多排刷新。
+    --   ⇒ 若设备上仍闪，第一嫌疑是**装的不是 49d/50 这个包**（所以才有 ③ 的
+    --     构建标记）；第二嫌疑是 REAGL 局部刷新本身在大块深灰区域上的过渡
+    --     被感知成「闪」。这两条都要等设备上的构建标记回报才能定。
+    --
+    --   ── 验证 ───────────────────────────────────────────────────
+    --   · luaparse 语法：statistics_page.lua / main.lua / _meta.lua 全过。
+    --   · fengari 行为断言：新增 `test_daypicker_50.lua` —— 跑
+    --     `showDayPicker` 的**真源码**（桩掉 ButtonDialog / UIManager /
+    --     invertButtons）＋ 两个 `onCloseWidget` 的真源码，断言：
+    --       对话框 opts（无 shrink、`width_factor = 0.80`、`modal = true`、
+    --       title = 选择日期）；行列结构（2 个头行 3 列 + 1 个星期行 7 列 +
+    --       日期行 7 列 + 补足到 ≥8 行）；今天那格带 id `wc_today` 且被反色；
+    --       年月两行箭头跨 1 年 / 1 月；两处关窗刷新模式字符串是 `"[partial]"`。
+    --   · 预览：`wordcount-ui-preview-13.html`（按 KPW4 真实像素画的
+    --     改前 221px / 改后 857px 对照 + 每格 31px vs 120px）。
+    --
+    -- =====================================================================
+    -- ★★★ 1.1 内修订（50b：查出「点击就闪」的真凶 + 全插件消灭裸 show）
+    -- =====================================================================
+    --
+    --   ── 病因（这才是「每次点击都闪」的根）────────────────────────────
+    --   50 的 ④ 只证明了「点导航栏滑块」这条路是干净的，但用户回执
+    --   「点击的时候闪烁还是没解决」⇒ 说明**别的入口**在漏。把整条链读到底：
+    --
+    --     1) `UIManager:show(w)` **不带 refreshtype**（老写法遍地都是）
+    --        ⇒ `self:setDirty(widget, refreshtype, refreshregion, refreshdither)`
+    --          （uimanager.lua:184）里 refreshtype 就是 nil；
+    --     2) `_refresh(nil, …)` **直接 return**（uimanager.lua:1122-1127，
+    --        注释原文「which is the vast majority of them, in which case we
+    --        drop it to avoid enqueuing a useless full-screen refresh」）
+    --        ⇒ 刷新队列一直是空的；
+    --     3) `_repaint()` 的兜底补一条 `self:_refresh("partial")`
+    --        （uimanager.lua:1291-1294）—— ⚠ **没有 region**。
+    --        ⇒ ① region 为 nil ⇒ `_refresh` 填成**整屏**（:1178）；
+    --        ⇒ ② 提升规则（:1163-1175）：**不带 region** 的 `"partial"` 每
+    --           `FULL_REFRESH_COUNT`（默认 6）次被提升成 **`"full"`**
+    --           —— 那是带黑闪的整屏全刷。
+    --     ⇒ 于是「弹选择器 / 进下钻 / 打开统计页 / 关浮窗」这些操作，
+    --       每做 6 次就有 1 次整屏黑闪、其余 5 次是整屏局部刷 ——
+    --       用户感受到的正是「每次点击都闪」。
+    --   ⚠ 43-no-flash 当年只在 `StatisticsPage:reload` 那一条路上堵了这个洞，
+    --     其余入口（6 个选择器 + 下钻 + 打开统计页 + main.lua 的设置框/提示）
+    --     全漏着；49d / 50 又只治了「波形」那一层，没碰到这条。
+    --
+    --   ── 修法：`showNoFlash(w)`（statistics_page.lua:2143-2159；
+    --      main.lua:1194-1235 有一份同构的）──────────────────────────────
+    --     UIManager:show(widget, function()
+    --         return "[partial]", widgetRegion(widget)
+    --     end)
+    --
+    --     · **必须用 lambda**：要排「带 region 的刷新」得先知道矩形，但
+    --       `FrameContainer:paintTo`（framecontainer.lua:104-114）/
+    --       `MovableContainer:paintTo` 都是**画的时候**才写 `dimen` ——
+    --       `show()` 那一刻 `popup_frame.dimen` / `movable.dimen` 全是 nil。
+    --       上游 `setDirty` **支持 lambda**（uimanager.lua:651-659：函数塞进
+    --       `_refresh_func_stack`），由 `_repaint` 在**画完之后**求值
+    --       （:1279-1287）—— 那时 dimen 已经有值了。
+    --     · `widgetRegion(w)` 的优先级：`w.movable.dimen`（ButtonDialog 的外框）
+    --       → `w.popup_frame.dimen`（本插件自己的浮窗）→ nil（极端情形退回整屏，
+    --       但**模式仍是 `"[partial]"`** ⇒ 不闪、也不会被提升成 full）。
+    --     · 模式用 `"[partial]"` 而不是 `"ui"` / `"partial"`，三条理由：
+    --         提升：名单是**字符串精确等于** `"partial"` ⇒ `"[partial]"` 永不提升；
+    --         降级：`avoid_flashing_ui` 只改 flashui / flashpartial / 带 region 的
+    --               partial，**不碰** `"[partial]"` ⇒ 开关开不开，行为一致；
+    --         合并：`refresh_modes["[partial]"] = 6 > refresh_modes["ui"] = 3`
+    --               ⇒ 连 `ButtonDialog:onShow`（buttondialog.lua:327-331）/
+    --               `Notification:onShow`（notification.lua:216-218）/
+    --               `InfoMessage:onShow`（infomessage.lua:263-277）自己排的
+    --               那条 `"ui"` + 自身矩形，也会在 `_refresh` 的碰撞合并
+    --               （uimanager.lua:1188-1203 的 `update_mode`）里被我们顶掉。
+    --     · 落到 `refreshNoMergePartial`（uimanager.lua:1070）⇒
+    --       `refreshNoMergePartialImp`（framebuffer.lua:180-182）
+    --       ⇒ `refreshPartialImp` ⇒ `mech_refresh(false, waveform_partial)`
+    --       = `WAVEFORM_MODE_ZELDA_GLR16` ⇒ `refresh_rex` 走 ZELDA_GLR16 分支
+    --       （framebuffer_mxcfb.lua:516）⇒ `hist_bw = hist_gray = REAGL`
+    --       ⇒ **内容无关**，恒为灰度局部刷。
+    --       （对照 `"ui"`：`waveform_ui = AUTO`（:874）⇒ refresh_rex 把
+    --        `hist_bw = DU` / `hist_gray = GC16` ⇒ **驱动按矩形内容挑**：
+    --        纯黑白走 DU（不闪），含灰走 GC16（16 级全波形 = 闪黑）。
+    --        本插件浮窗到处是深灰填充 + 灰阶抗锯齿文字 ⇒ 必然含灰 ⇒ 必然闪。）
+    --
+    --   ── 替换清单（全插件已无裸 show）────────────────────────────────
+    --   statistics_page.lua（8 处）：
+    --     showDrillDown / showPeriodDialog / showYearPicker / showMonthPicker /
+    --     showDayPicker / showWeekPicker / M.show / reload 的**回退分支**
+    --     —— 全部改 `showNoFlash`；
+    --     另有 2 处 `InfoMessage`（构建失败提示）也一并改；
+    --     `reload` 主路径保持 49d 的 `show(next_page, "[partial]", region)` 不动。
+    --   main.lua（6 处）：
+    --     三处设置输入框 `dialog`、`notifyUser` 的 `Notification`、
+    --     两处兜底 `InfoMessage` / `Notification` —— 全部改 `showNoFlash`。
+    --   ⚠ `showNoFlash` 在 main.lua 里**必须定义在 `notifyUser` 之前** ——
+    --     这与 35-forward-local-fix 修掉的 `notifyUser` / `fmtCount` 是同一类坑
+    --     （Lua 的 `local function` 只从声明处往后可见，放晚了就是 nil 全局）。
+    --
+    -- =====================================================================
+    -- ★★★ 1.1 内修订（50c：日历视图 —— 落到「总览」那一行的轨道里）
+    -- =====================================================================
+    --
+    --   用户原话：「你做的月历放到哪了，我没看到」→「月历放到总览那一行的轨道里」。
+    --   （46 轮只在 `wordcount-ui-preview-7.html` 里画了预览，**从未落代码**。）
+    --
+    --   ── 形态 ──────────────────────────────────────────────────────
+    --   `VIEW_TABS` 新增**第 5 项** `{ value = "calendar", label = _("日历") }`
+    --   ⇒ 与「总览 / 阅读趋势 / 阅读字数 / 阅读速度」共用同一条分段轨道，
+    --     不另开入口。日历页自上而下：
+    --       视图轨道（5 格）
+    --       指标轨道：字数 / 速度 / 时间        ← `CAL_METRICS`
+    --       写法轨道：自动 / k / 万              ← `CAL_FORMATS`，
+    --                                            **只在 metric == "units" 时出现**
+    --                                            （「速度」「时间」没有 k/万 这回事）
+    --       ‹  2026 年 10 月  ›                  ← 前后各挪 1 个月，跨年自动进位
+    --       一 二 三 四 五 六 日（周一起始）
+    --       日期格子：日期数字 + 当天数值；今天那格黑底白字
+    --   每格点一下 ⇒ `reload{ period = "day", anchor = 那天 }`，
+    --   与日选择器 `showDayPicker` 的行为一致。
+    --
+    --   ⚠ 日历视图下**不显示**「日/周/月/年/总」那条周期轨道
+    --     （见 `build()` 里的 `if self.view == "calendar" then` 分支）：
+    --     日历自带月份导航，两条导航并存会让人不知道该点哪个；
+    --     而且「日历 + 周期 = 周」这种组合本身没有意义。
+    --
+    --   ── 数据来源 ──────────────────────────────────────────────────
+    --   直接复用 `GlobalStats.trend(store, "month", self.anchor, metric)`
+    --   —— `period == "month"` 时它返回的 buckets 就是「1 号 … 月末」逐日一条
+    --   （global_stats.lua:694-702，`label = "%02d"`），正好拿来填格子，
+    --   不用另写一套取数逻辑。指标名（units/speed/seconds）与它支持的
+    --   metric 完全对齐（global_stats.lua:726-736）。
+    --   取数结果走既有的 `statMemoKey` / `memoGet` / `memoSet` 缓存，
+    --   但 kind 里**带了 metric**（`"cal:"..anchor.."|"..metric`）⇒ 换指标会重取。
+    --
+    --   ── 新增常量 / 函数（statistics_page.lua:3027-3314）───────────────
+    --     CAL_CELL_H_PX = 30 / CAL_HEAD_H_PX = 22 /
+    --     CAL_FMT_ROW_H_PX = 34 / CAL_ARROW_W_PX = 30
+    --     calendarCellText(value, metric, fmt)
+    --       时间：>=1h 写「1.5h」，否则「23分」，不足 1 分钟留空（格子太窄）
+    --       速度：只写整数（单位「字/分钟」在指标轨道里已经说了）
+    --       字数：auto → `formatCount`（跟随设置的「单位切换」）；
+    --             k → 强制 `1.2k`（<1000 仍写完整数字，0.4k 没有意义）；
+    --             wan → 强制 `1.2万`（<10000 仍写完整数字）
+    --     calendarCell(w, h, day, value_text, is_today, on_tap)
+    --     StatisticsPage:buildCalendarGrid(width) / buildCalendarPage(width)
+    --
+    --   ⚠ 格子的底色**必须用 `SegFill`** 而**不能**用 `FrameContainer`：
+    --     `FrameContainer:getSize()`（framecontainer.lua:54-67）**忽略**构造时
+    --     传进来的 width/height，只按「子控件 + 2*(margin+bordersize+padding)」
+    --     反推 ⇒ 传 width 根本撑不出整格，今天那格的黑色底会只跟文字一样宽。
+    --     `SegFill` 是按给定 (宽,高) **实心绘制**的，正合用。
+    --   ⚠ `anchorAtMonth` 在 50c 里被 `buildCalendarPage` 用到，而它的定义在
+    --     **文件后半**的选择器一节 ⇒ 必须像 45f/46 那样在 `local SolidRect` /
+    --     `local HRule` 之后加**前向声明** `local anchorAtMonth`，并把定义写成
+    --     `anchorAtMonth = function(...)`（**不能**写 `local function`，
+    --     否则会另起一个新 local、前向声明失效）。
+    --
+    --   ── 验证（50b + 50c）───────────────────────────────────────────
+    --   · luaparse：8 个 lua 文件全过。
+    --   · fengari 行为断言：**9 个套件 506 项全绿** ——
+    --     chart 17 / widgets 73 / cards 41 / periodnav 48 / reload 31 /
+    --     refresh_path 36 / daypicker 89 / noflash 23（新）/ calendar 148（新）。
+    --       新增 `test_noflash_50b.lua`：跑 `widgetRegion` / `showNoFlash`
+    --         （statistics_page 与 main.lua 两份）的**真源码**，断言
+    --         movable 优先于 popup_frame、排的是 lambda 而非字符串、
+    --         lambda 求值得到 `"[partial]"` + 正确矩形、且是**延迟求值**
+    --         （先 nil、写完 dimen 再求值就拿到了）；另在生成器里**扫全文件**：
+    --         任何 `UIManager:show(` 调用点要么在 showNoFlash 函数体里、
+    --         要么显式带了模式字符串 —— 裸调用一律报错退出。
+    --       新增 `test_calendar_50c.lua`（148 项）：VIEW_TABS 5 项且第 5 项是
+    --         calendar；常量；`calendarCellText` 三指标 × 三写法；
+    --         `calendarCell` 今天那格 SegFill 黑底白字；
+    --         `buildCalendarGrid` 的 2026-10 布局（前导 3 空格 / 31 个日期格 /
+    --         5 行 / 末行补 1 空格 / trend 参数 / 缓存命中与换指标重取 /
+    --         点格子 reload{period="day"}）；
+    --         `buildCalendarPage` 的轨道条数（units 两条、speed/seconds 一条）、
+    --         active 状态、点指标/写法的 reload 参数、月份导航跨年进位。
+    --     ⚠ `test_daypicker_50.lua` 同步升级（86 → 89 项）：`showDayPicker`
+    --       的收尾从裸 `UIManager:show` 换成 `showNoFlash`，断言改为
+    --       「带了 1 个 lambda 参数，求值得到 `"[partial]"` + movable.dimen」。
+    --   · PW4 刷新事实核对 `_check_pw4_refresh.py`：**38 条全过** ——
+    --     把「裸 show → 丢弃 → 兜底 → 整屏 → 提升成 full」与
+    --     「[partial] → NoMergePartial → PartialImp → ZELDA_GLR16 → REAGL」
+    --     两条链逐行从上游源码里钉死（新增第 8~11 节）。
+    --   · 预览：`wordcount-ui-preview-14.html` + `ui-shots-51/`（8 张）。
+    --
+    -- ★★★ 1.1 内修订（52：导航栏选中改回纯黑 + 日历格子填充/文字修复 + 年月两行）
+    -- =====================================================================
+    --
+    -- 用户原话（三件事）：
+    --   「选中的导航栏还是深色吧，不要再闪烁了，另外日历页面的显示的内容不完全」
+    --   → 追问后确认：「格子填充不完全，以及日期和数据都被卡掉了一部分」
+    --   → 追加要求：「年份和月份放在两行」
+    --
+    --   ── ① 导航栏选中块：`COLOR_DARK_GRAY(0x88)` → `COLOR_BLACK` ───────
+    --   （`buildSegmentedRow`，statistics_page.lua 里那处 `SegFill`）
+    --
+    --   49-nav-thumb 当年把选中块从黑退成深灰，理由是「大块实心灰 + 抗锯齿
+    --   灰字 ⇒ 该矩形含灰 ⇒ 波形从 DU 跳到 GC16 ⇒ 黑闪」。**但那条链只在
+    --   排 `"ui"` 时成立**：PW4 的 `waveform_ui = WAVEFORM_MODE_AUTO`
+    --   （framebuffer_mxcfb.lua:874）⇒ `refresh_rex` 里 `hist_bw = DU` /
+    --   `hist_gray = GC16`（:557-558）⇒ 驱动按**矩形内容**挑波形。
+    --
+    --   50b 起本插件所有弹窗与切页统一排 `"[partial]"` ⇒
+    --   `refreshNoMergePartial` ⇒ `refreshPartialImp` ⇒
+    --   `waveform_partial = WAVEFORM_MODE_ZELDA_GLR16`（:879-880）⇒
+    --   `refresh_rex` 走 ZELDA_GLR16 分支（:516）⇒ `hist_bw = hist_gray = REAGL`
+    --   ⇒ **波形与矩形内容完全无关**。
+    --   ⇒ 滑块是纯黑还是深灰，对刷新行为**没有任何影响**，可以放心用纯黑。
+    --
+    --   ⚠ 记一笔：**决定「闪不闪」的是刷新模式（`"[partial]"`），不是这个颜色**。
+    --     以后别单独把这个颜色改来改去；动它之前先跑 `test_noflash_50b.lua`
+    --     （钉死「全插件无裸 UIManager:show」）与 `test_refresh_path.lua`。
+    --
+    --   ── ② 日历格子「填充不完全」+「日期和数据被卡掉一部分」──────────
+    --   （`calendarCell`，statistics_page.lua）
+    --
+    --   【病因 A：填充不满】老写法
+    --       SegFill{ width = w - Screen:scaleBySize(1),
+    --                height = h - Screen:scaleBySize(1) }
+    --     每格四周各留 1px 缝。「今天」那格是唯一有底色的格子，于是黑底比
+    --     格子小一圈 —— 用户说的「格子填充不完全」。
+    --     另外所有格子都是**白底压在白色卡片上**、彼此之间没有任何边界，
+    --     看上去像「格子根本没画出来」。
+    --     ⇒ 填充改成**铺满** (w, h)，并给 `SegFill` 新增可选描边
+    --       `border_size` / `border_color`（默认 0 ⇒ 行为与 49 版完全一致）：
+    --         今天那格：黑底 + 黑边 ⇒ 看着就是一整块实心黑，尺寸与别的格子一致；
+    --         其它格  ：白底 + 1px 深灰细边 ⇒ 格子清清楚楚。
+    --       ⚠ 描边只在 `radius == 0` 的矩形分支生效；圆角分支（分段轨道滑块）
+    --         直接 return，不受影响。
+    --
+    --   【病因 B：文字被卡】**真凶是 TextWidget 的 padding，不是格子太小**。
+    --     上游 `ui/widget/textwidget.lua:113`：
+    --         self._height = math.ceil(face.ftsize:getHeightAndAscender())
+    --                        + 2*self.padding
+    --     而 `padding` 的类默认值是 `Size.padding.small` = scaleBySize(2) = 4px
+    --     ⇒ **每行文字凭空多 8px 高**（固定的 8px，不是字号的 8px）。
+    --     `cfont`（Noto Sans CJK）行高 ≈ 1.48 em，KPW4 上：
+    --         日期(19px)：ceil(19×1.48) + 8 = 36
+    --         数值(13px)：ceil(13×1.48) + 8 = 27
+    --         两行合计 63px，而格子只有 scaleBySize(30) = 54px
+    --     ⇒ 上下各溢出 5px，相邻两行的字互相压 —— 用户看到的
+    --       「日期和数据都被卡掉了一部分」。
+    --     ⇒ 三处改动：
+    --         a) `text()` 工厂新增可选 `opts.padding`（默认 nil ⇒ 键不进表
+    --            ⇒ 用 TextWidget 类默认值 ⇒ **其它所有调用点行为不变**）；
+    --         b) 日历格子的日期行 / 数值行传 `padding = 0` ⇒ 两行 29 + 20 = 49px；
+    --         c) `CAL_CELL_H_PX` 30 → 34（scaleBySize(34) = 61px）
+    --            ⇒ 49 < 61，上下各余 6px。
+    --     ⚠ 同一个毛病在**导航行**上也有：`f.section` 是 24px，
+    --       `ceil(24×1.48) + 8 = 44 > 行高 40` ⇒ 箭头和标题本来也会被切 2px。
+    --       导航的箭头/标题、以及星期头，一并传 `padding = 0`。
+    --
+    --   ── ③ 月份导航：年份 / 月份分成两行 ─────────────────────────────
+    --   （`buildCalendarPage`）
+    --
+    --   老写法是一行 `‹ 2026 年 10 月 ›`，只有一套箭头，切年还是切月全靠猜。
+    --   现在拆成两行、**每行各带自己的左右箭头**：
+    --         ‹   2026 年   ›     ← 这一行只动**年**（月份保持不变）
+    --         ‹   10 月     ›     ← 这一行只动**月**（1 月往前退自动落到上年 12 月）
+    --   点哪个箭头 = 改哪个字段，不需要解释。两行都复用 `anchorAtMonth`，
+    --   跨年进位由它自己处理（已由测试覆盖：1 月 ‹ ⇒ 2025-12；12 月 › ⇒ 2027-01；
+    --   年份行 › ⇒ 年份 +1 且月份不变）。
+    --   ⇒ 整页高度：日历页内容 585px；加上标题栏(≈108) + 视图轨道(83) + 各段
+    --     span(4+9+9) ≈ 798px，仍远小于 `available_h = 1158px`
+    --     （本页是 FixedPane、禁止滚动，超出就会被裁，所以这个余量是必要的）。
+    --
+    --   ── 验证（52）──────────────────────────────────────────────────
+    --   · luaparse：8 个 lua 文件全过。
+    --   · fengari：**9 个套件 523 项全绿** ——
+    --     chart 17 / widgets 73 / cards 41 / periodnav 48 / reload 31 /
+    --     refresh_path 36 / daypicker 89 / noflash 23 / calendar **165**
+    --     （148 → 165：格子尺寸改「铺满」、新增描边断言、
+    --      新增两行文字 `padding = 0` 断言、导航从「一行 3 元素」改成
+    --      「两行各 3 元素」并补了「年份行只动年 / 月份行只动月」的断言）。
+    --   · 尺寸审计（`_gen_calendar_audit.py` → `_audit_calendar.lua`）：
+    --     用**真实的** statistics_page.lua 切片 + 按上游规则实现的尺寸桩
+    --     （TextWidget 高度照 `textwidget.lua:113` 算，行高比 1.48），
+    --     结论：格子 129×61、格内两行 36×49 ⇒ 放得下（余 12px）；
+    --     对照「padding 用默认 4px」= 65px > 61px ⇒ 溢出（复现用户现象）。
+    --   · 预览：`wordcount-ui-preview-15.html` + `ui-shots-52/`（6 张，
+    --     含「改前/改后」并排对照）。
+    --
+    --   ── 52b-no-grid-lines：日历不要分隔线 ───────────────────────────
+    --   用户原话：「日历不要分隔线」。
+    --
+    --   52 那版给每格加了 1px 深灰细边（为了让「白底压白卡片」的格子看得见），
+    --   但相邻两格的边叠在一起就是 2px 线 ⇒ 整张日历被切成一张网。
+    --   用户不要这个，去掉：`calendarCell` 不再传 `border_size` / `border_color`。
+    --
+    --   ⚠ 只去掉**描边**，「填充铺满 (w, h)」保留 —— 那才是「格子填充不完全」
+    --     的修复（今天那格的黑底必须铺满整格）。
+    --   ⚠ `SegFill` 的 `border_size` / `border_color` 能力**保留**（默认 0 ⇒
+    --     不画，行为与 49 版一致）。它是个通用控件，描边是合理能力，
+    --     将来别处要用随时能开；只是日历这里不再用。
+    --   ⚠ 去掉描边后格子之间没有边界，这是**刻意**的：今天那格靠实心黑底
+    --     自己立起来，其余格子的「边界」由日期数字和留白自然形成。
+    --   ⚠ 测试侧同步：
+    --     · `test_calendar_50c.lua` 的描边断言改成「`border_size == 0`」；
+    --     · 生成器 Python 侧新增**源码级扫描**：`calendarCell` 的**代码行**
+    --       （剥掉注释）里不许再出现 `border_size` / `border_color`；
+    --     · 顺手修了测试桩的一个缺陷：`make_class` 的 `extend` 原来**忽略**
+    --       传入的字段表（`return make_class(kind)`），导致类默认值全丢、
+    --       实例读 `border_size` 得到 nil —— 那样「没画描边」的断言会变成
+    --       **假阳性**（测的是桩的缺陷而不是代码）。现在 `extend` 真的复制
+    --       字段并把新类的 `__index` 指向父类，与上游语义一致。
+    --   ── 53-cal-fit：日历按**真实字高**自适应 + 日选择器收窄 ────────────
+    --   用户原话（两条一起提的）：
+    --     · 「日选择器的有点太宽了，但是也不要太窄」
+    --     · 「不行啊，日历的还是显示不完全，还是被截断一部分，上下都有被
+    --        阶段的（截断的），是因为高度不够吗」
+    --   （设备上的构建标记确认过是「内修订 53」，排除了「装的不是新包」；
+    --     被截断的界面确认是**日历视图页**，不是日选择器弹窗。）
+    --
+    --   ── ★★★ 真凶（52 轮修错的地方）──────────────────────────────────
+    --   `Font:getFace(name, size)` **会把 `size` 再乘一遍 `Screen:scaleBySize`**
+    --   （`frontend/ui/font.lua:276`：`size = Screen:scaleBySize(size)`）。
+    --   所以 `Font:getFace("cfont", 19)` 拿到的 `face.size` 是
+    --   `scaleBySize(19) = 34px`（KPW4），**不是 19px**。
+    --   52 轮把「设计字号」当「实际字号」算，于是所有高度估算都矮了 1.7867 倍。
+    --
+    --   真实账（KPW4，scaleBySize 系数 1.7867；NotoSans 实测 hhea
+    --   asc 1069 / desc −293 / gap 0 / upem 1000 ⇒ 行高/em = 1.362）：
+    --     日期  `cfont 19`            → 34px → 行高 ceil(34 × 1.362) = 47
+    --     数值  `x_smallinfofont 13`  → 24px → 行高 ceil(24 × 1.362) = 33
+    --           ⇒ 两行 **80px**（带 TextWidget 默认 padding 是 96px）
+    --     导航  `cfont 24`            → 43px → 行高 59
+    --     星期头 `x_smallinfofont 17` → 31px → 行高 43
+    --     轨道  `cfont 21`            → 38px → 行高 52
+    --   而 52 那版给的高度是：
+    --     格子 `scaleBySize(34)` = **61px**（装 80px 的内容 ⇒ 上下各溢 ~10px）
+    --     导航行/星期头 `scaleBySize(22)` = **40px**（装 59 / 43 ⇒ 上下各切十几像素）
+    --     写法轨道 `scaleBySize(34)` = 61px，内高只有 `61−2×2−2×6 = 45px`
+    --       （装 52px 的「自动 / k / 万」⇒ 上下各切 3~4px）
+    --   ⇒ 溢出的部分被**相邻格子的实心填充**盖掉，用户看到的就是
+    --     「上下都有被截断的」。52 轮把 `padding` 从 4 改成 0 只省了
+    --     2×2×4 = 16px（96 → 80），仍然 > 61，所以「还是被截断」。
+    --
+    --   ── 改法（statistics_page.lua，8 处）────────────────────────────
+    --    ① 新增 `faceLineH(face)`：**直接问字体本身** ——
+    --       `face.ftsize:getHeightAndAscender()`（就是上游
+    --       `TextWidget:updateSize()` 用的那个值，textwidget.lua:113），
+    --       拿不到 freetype 度量时才兜底 `ceil((face.size or 16) × 1.6)`
+    --       —— 兜底宁可估高（估高只会让格子更高，估低才会切字）。
+    --    ② `buildSegmentedRow`：**行高自动长到放得下最高的那个标签**
+    --       （`need = faceLineH(it.face) + 2×(边框 + 内边距)`），只长不缩。
+    --       ⇒ 视图/周期/指标轨道（83）**一点没变**；只有写法轨道 61 → **68**。
+    --       同时给每个 `label` 传 `padding = 0`（同日历格子，去掉 TextWidget
+    --       白送的 2×4px；`FixedBox{vertical_align="center"}` 仍然居中，
+    --       视觉位置不变）。
+    --    ③ 日历常量重写：`CAL_CELL_H_PX / CAL_HEAD_H_PX / CAL_FMT_ROW_H_PX`
+    --       全部降级为**设计下限**，新增 `CAL_CELL_PAD_PX = 2` /
+    --       `CAL_NAV_PAD_PX = 2`（scaleBySize(2) = 4px）。
+    --    ④ `calendarCell` 注释更正（把 52 那句错的「19px + 13px = 65/49」
+    --       换成 53 的真实账）。
+    --    ⑤ `buildCalendarGrid(width, avail_rows_h)`：
+    --       `head_h = max(scaleBySize(22), faceLineH(f.axis) + 2×nav_pad)` = **51**
+    --       `need_cell_h = 47 + 33 + 2×cell_pad` = **88**
+    --       `cell_h = max(scaleBySize(34), need_cell_h)` = **88**
+    --       有预算时压到预算内，但**绝不小于 `need_cell_h`**
+    --       （宁可不填满整页，也不能再切字）。
+    --    ⑥ `buildCalendarPage(width, avail_h)`：新增 `add()` 逐控件累计
+    --       **实测** `getSize().h`（`used`），把 `avail_h − used` 当预算传给网格；
+    --       导航行高 `max(scaleBySize(22), faceLineH(f.section) + 2×nav_pad)` = **67**。
+    --    ⑦ `build()` 的日历分支：按实测 `body[i]:getSize().h` 累加出 `above_h`，
+    --       传 `cal_avail = available_h − above_h − Size.span.vertical_large`。
+    --    ⑧ `showDayPicker`：`width_factor` **0.80 → 0.74**。
+    --       `floor(1072 × 0.74) = 793` ⇒ buttontable 779 ⇒ 7 列每格 **111px**
+    --       （原 120px）。对话框 793px = 屏宽 74%，比统计浮窗（943px / 88%）
+    --       明显窄一层。⚠ 别再收到 0.7 以下：7 列每格会掉到 100px 以内。
+    --
+    --   ── 实测结果（`_gen_calendar_audit.py` → `_audit_calendar.lua`）────
+    --     格子 129 × **88**（原 61）；格内两行 66 × **80**（47 + 33）
+    --       ⇒ 88 > 80，上下各余 4px ⇒ **不再截断**
+    --     星期头 129 × **51**（原 40，字 43）
+    --     导航行 **67**（原 40，字 59）
+    --     写法轨道 **68**（原 61，字 52）
+    --     日历整页 **785px**（= 网格以上 290 + 网格 495）
+    --       ⇒ 加标题栏 108 + 视图轨道 83 + 各段 span ≈ **998px**
+    --         < `available_h = 1158px` ⇒ 放得下，余 160px
+    --         （本页是 FixedPane、禁止滚动，超出就会被裁，所以这个余量是必要的）
+    --
+    --   ── 验证（53）──────────────────────────────────────────────────
+    --   · luaparse：8 个 lua 文件全过。
+    --   · fengari：**9 个套件 591 项全绿** ——
+    --     chart 17 / widgets **84** / cards 41 / periodnav 48 / reload **37** /
+    --     refresh_path 36 / daypicker **94** / noflash 23 / calendar **211**
+    --     （widgets 73 → 84、daypicker 89 → 94、calendar 165 → 211、reload 31 → 37）
+    --   · `_check_pw4_refresh.py`：38 项通过。
+    --   · pinyin-fix `test_sanitize.lua`：20 项通过。
+    --
+    --   ── 测试侧同步（本轮暴露并修掉的**测试漂移**）───────────────────
+    --   · `_gen_calendar_test.py`：`Font.getFace` 桩**如实复刻**上游那一乘
+    --     （`size = ceil(px × 1.78667)` + `ftsize:getHeightAndAscender()`），
+    --     容器桩补 `getSize`（`buildCalendarPage` 新增的 `add()` 要用），
+    --     新增第 0b 节（真实字号/行高真值表）与第 17 节（预算压缩有下限、
+    --     填不满也不撑高、avail_h = 0 / 负数 / 不传都当没给）。
+    --   · `_gen_widget_test.py`：抠出 `faceLineH`、Font 桩给真实度量，
+    --     新增第 11 节（写法轨道 61 → 68、主轨道 83 不变、
+    --     `need > height` 用严格大于、取最高标签、空 items / 无 ftsize 兜底）。
+    --     顺手修掉一条**从 49 就漂着的断言**：选中滑块在 51 已从
+    --     `COLOR_DARK_GRAY` 改成 `COLOR_BLACK`，测试没同步。
+    --   · `_gen_daypicker_test.py`：0.80 → 0.74，并补上「793px / 779px /
+    --     每格 111px / 年-月行每格 259px / 每格不得 < 100px」的实算断言。
+    --   · `_gen_reload_test.py`：**50b 就漂了**（`reload` 的两条回退路换成了
+    --     `showNoFlash`，测试没桩它 ⇒ 一重新生成就 `nil value 'showNoFlash'`）。
+    --     现在按 `showNoFlash` / `widgetRegion` 的真实行为桩出来，并把
+    --     「回退路也排 `"[partial]"`」钉死。
+    --   · `_gen_calendar_audit.py`：修掉**两个把结论带偏的桩**——
+    --     Font 桩没复刻 `scaleBySize`（拿到的是设计字号 19/13）、
+    --     行高比错用 CJK 的 1.48（本设备 `cfont` 解析到 NotoSans，是 1.362）。
+    --     两处一起错正好把 27px 的缺口抹平，这就是 52 轮得出
+    --     「格子 61、内容 49，放得下」这种自相矛盾结论的原因。
+    --   · `_gen_calendar_test.py` / `_gen_calendar_audit.py` 的 `Size` 桩：
+    --     `span.vertical_default` 8 → **4**、`vertical_large` 16 → **9**
+    --     （对齐上游 `ui/size.lua:75-80` 的 `scaleBySize(2)` / `scaleBySize(5)`）。
+    --   · 预览：`wordcount-ui-preview-16.html` + `ui-shots-54/`。
+    -- ★★★ 1.1 内修订（54：日历导航行箭头改 KOReader 原生 chevron + 年月可点击弹选择器）：
+    --   1. `buildCalendarPage` 导航行箭头从 Unicode "‹" / "›" 改成
+    --      `icon("chevron.left", ...)` / `icon("chevron.right", ...)`
+    --      —— 与 `buildPeriodNav` / `buildUnitsPage` 的箭头统一。
+    --   2. 年份/月份文字（"2026 年" / "10 月"）外包 `TapBox`，
+    --      点击时弹出 `showYearPicker()` / `showMonthPicker("month")`。
+    --      `reload` 的 `view = opts.view or self.view` 会自动保留 `"calendar"`，
+    --      所以不需要改选择器本身。
+    --   3. 预览：`wordcount-ui-preview-17.html` + `ui-shots-55/`。
+    -- ★★★ 1.1 内修订（56-cal-time-heat：日历默认显示时间 + 9h/7h18m/13m + 热力图
+    --   + 速度单位可切）：
+    --   用户原话（两条）：
+    --     「阅读统计日历以时间显示到日历中，时间的格式为 9h，7h18m，13m 这种形式
+    --       显示，并显示相应的热力图」
+    --     「日历中阅读速度分为每分钟多少字和每小时多少字，可以点击进行切换」
+    --
+    --   1. **默认指标改成「时间」**：`StatisticsPage.cal_metric` 的默认值
+    --      `"units"` → `"seconds"`。指标轨道（字数/速度/时间）**保留**，
+    --      只是打开日历第一眼看到的是阅读时长。
+    --   2. **时间文案改写法**（`calendarCellText`）：旧的
+    --      `>= 3600 → "1.5h"` / 否则 `"23分"` 整段换掉，改成
+    --      「时、分各一段、有分才写分」：
+    --        32400 → `9h`；26280 → `7h18m`；780 → `13m`；< 60 秒 → 空串。
+    --      ⚠ 旧写法里的 `分` 是汉字，24px 字号下比 `m` 宽得多，5 个字就顶满格子。
+    --   3. **热力图**（新增 `CAL_HEAT_FILL` / `CAL_HEAT_TEXT` / `heatLevel`）：
+    --      格子**底色**按「当天值 ÷ 当月最大值」分 4 档 ——
+    --      0xEE / 0xCC / 0xAA / 0x88（无数据 = 白）。最深那档**文字反白**
+    --      （0x88 底 + 黑字在 e-ink 上会糊）。只用灰阶，不用彩色。
+    --      ⚠ 分母是「当月最大的一天」而不是固定阈值 —— 指标可在
+    --        字数/速度/时间 之间切，三者量纲差三个数量级，固定阈值没法通用。
+    --        代价：某月若有一天特别突出，其余天会全落进第 1 档。
+    --   4. **「今天」不再整格反白**（那样会把热力图深浅吃掉），改成
+    --      **日期加粗 + 一圈 1px 黑描边**（`CAL_TODAY_BORDER_PX`，用户选的方案）。
+    --      只框今天这一格，不会变回 52b 被否掉的「整张日历切成一张网」。
+    --   5. **速度单位轨道**（新增 `CAL_SPEED_UNITS` + `cal_speed_unit` 字段）：
+    --      「字/分钟」↔「字/小时」。`GlobalStats.trend` 的 speed 口径是
+    --      **字/分钟**，选 hour 就是 ×60（`calendarCellValue`）。
+    --      热力图用同一个换算后的值 ⇒ 切单位不改变深浅分布。
+    --   6. 装配重构：`buildCalendarPage` 里「自动/k/万」与「字/分钟/字/小时」
+    --      抽成同一个 `unitRow()`，**按指标二选一出现**（互斥，不同时占两行）。
+    --
+    --   ── 高度账（KPW4：scaleBySize 系数 1.7867、available_h = 1158）──────
+    --     标题栏 **95**（按上游 titlebar.lua 实算：69 + 14 + 3 + 9），
+    --     网格以上 = 95 + span 4 + 视图轨道 83 + span 9 = 191
+    --     cal_avail = 1158 − 191 − 9 = 958
+    --     日历页「网格以上」：时间 **225** / 字数 **297** / 速度 **297**
+    --       （指标轨道 83 + span 4 + 导航 2×67=134 + span 4；单位轨道再 +68+4）
+    --     网格 5 行 × 88 + 星期头 51 + span 4 = 495
+    --     网格预算：时间 958−225 = 733 ⇒ 每行 146；速度 958−297 = 661 ⇒ 每行 132
+    --       ⇒ 两者都 > 88 ⇒ **格子不会被压扁**
+    --     整页：时间 920px / 速度 992px，都 < 1158px ⇒ 放得下
+    --
+    --   ── 验证（56）──────────────────────────────────────────────────
+    --   · `check_plugin.py`：语法 0 错、未声明变量 0。
+    --   · fengari `test_calendar_56.lua`：**157 项全绿** ——
+    --     时间文案（含 9h/7h18m/13m/1h/1h30m/空串边界）、速度文案、
+    --     字数 k/万/auto、速度单位换算、heatLevel 四档边界、配色表单调性、
+    --     `calendarCell` 真源码跑出底色/文字色/今天描边/加粗/夹取，
+    --     以及 4 组**反向验证**（改坏阈值/删分支/去换算/改配色 ⇒ 断言变红）。
+    --   · fengari `test_calendar_page_56.lua`：**43 项全绿** ——
+    --     单位轨道的出现与互斥（时间 0 条 / 字数 1 条 / 速度 1 条）、
+    --     选中态、点击 reload 的字段（只带 cal_speed_unit，不误改别的）、
+    --     点已选中项不 reload、以及 225/297 的高度账。
+    --   · 预览：`预览-日历-时间热力图.png` + `预览-日历-速度单位切换.png`。
+    -- ★★★ 1.1 内修订（57-kpw4-perf：三指标热力图复核 + KPW4 按需计算）：
+    --   用户原话（两条）：
+    --     「日历页面，字数和速度也有热力图吗，检查是否有bug」
+    --     「考虑设备性能，我的设备是kpw4，已经很老了」
+    --
+    --   1. **复核结论：字数和速度本来就有热力图** —— 热力图是**指标无关**的。
+    --      `buildCalendarGrid` 里逐日循环是
+    --          local value      = calendarCellValue(buckets[day], metric, speed_unit)
+    --          local value_text = calendarCellText(value, metric, fmt)
+    --          local level      = heatLevel(value, max_value)
+    --      **没有**任何 `if metric == ...` 分支 —— 三种指标共用同一条
+    --      「取值 → 分档」路径，分档分母是各自指标口径下的当月最大值。
+    --      这一点由 `test_calendar_heat_all_metrics_57.lua` 端到端钉死：
+    --      真实 `GlobalStats.trend` → 真实 `calendarCellValue`/`heatLevel`，
+    --      三种指标各自分出 **4 档**（0/1/2/3/4 里的 4 个）。
+    --      ⚠ 复核时顺手确认了一处**不是 bug 但要知道**的事：
+    --        速度口径 `units × 60 / seconds`（global_stats.lua:730）对
+    --        「某天只读了几十秒却翻了不少字」会给出很大的字/分钟，
+    --        一旦它成为当月最大值，其余天会全落进第 1 档 —— 这是相对分档的
+    --        固有取舍（与 56 里写的同一条），已在测试里**锁死行为**而不是假装没有。
+    --
+    --   2. **修掉一处真实的 KPW4 性能浪费**（`StatisticsPage:build`）：
+    --      57 之前这里**无条件**算齐四样：
+    --          summary / previous   ← 只有「总览」视图用
+    --          buckets / selected   ← 只有「趋势」「速度」视图用
+    --      而 `GlobalStats.summarize` 是 `for date, row in pairs(store.days)`
+    --      —— **O(全部历史天数)**，还算两遍（本期 + 上期）；
+    --      `trend` 在 year/total 口径下是 O(12 × 天数)。
+    --      memo 的键里带了 `view`（`statMemoKey(..., self.view)`），
+    --      所以**从「总览」点进「日历」必定 cache miss** ⇒ 开一次日历
+    --      就白算两遍 summarize + 一遍 trend，结果一个字节都没用上
+    --      （日历的月份数据走它自己的 `cal:` 缓存槽）。
+    --      读得越久 `store.days` 越大，白算得越久 —— 正好坑在老设备上。
+    --      现在改成按视图按需算：
+    --          overview        → summary + previous
+    --          trend / speed   → buckets + selected
+    --          units / calendar→ 两样都不算
+    --      ⚠ 行为零变化（这四样在对应视图之外**从来没有被读过**），
+    --        纯属省掉无用功。
+    --
+    --   3. **热力图自身的开销 ≈ 0**（这才是回答「KPW4 扛不扛得住」的正题）：
+    --      · 分档**不引入任何 store 访问** —— 分母扫描是纯数组遍历
+    --        （月末最多 31 个元素），循环体里连 `store` 这个词都不出现；
+    --      · 每格**只算一次 value**，文案与档位共用同一个数（不是各算一遍）；
+    --      · 不额外调 `Font:getFace`（`faces()` 是记忆化的），
+    --        不额外建 TextWidget；
+    --      · 每次构建只调一次 `GlobalStats.trend`（memo 住，不是每格一次）。
+    --      以上四条都不是口头保证 —— `test_calendar_heat_all_metrics_57.lua`
+    --      的 §E 节直接从**源码文本**上断言（针里带 `(store` 后缀，
+    --      避免命中注释），并且 §E5 附了**反空转验证**：把 57 之前的
+    --      无条件写法喂给同一套判据，必须判 false。
+    --      ⚠ 唯一"变慢"的地方是分母扫描多跑 31 次 `calendarCellValue`
+    --        （一次 tonumber + 一次比较），在 KPW4 上是亚毫秒量级；
+    --        换来的是整张日历有深浅对比。这个交换是值得的。
+    --
+    --   ── 验证（57）──────────────────────────────────────────────────
+    --   · `check_plugin.py`：语法 0 错、未声明变量 0（8 条量词告警是既有的，
+    --     来自注释里的 `**` 与 `%`）。
+    --   · fengari `test_calendar_heat_all_metrics_57.lua`：**246 项全绿** ——
+    --     §A 三指标端到端热力图（真实 trend → 真实 heatLevel，各 ≥3 档、
+    --        最深档必现、有数据的天必非 0 档、没数据的天必为 0 档、
+    --        三指标的分布数组互不相同）
+    --     §B 速度单位（切单位后**逐日深浅完全不变** + 最大值 ×60 + 文案数值）
+    --     §C 文案 × 档位同源（31 天逐日断言 text≠"" ⇔ level>0）
+    --     §D 极端数据（单日独苗 / 全零不产生 nan / 离群月锁死 3 档）
+    --     §E KPW4 性能结构性护栏 6 条 + 反空转
+    --     §F 6 组反向验证（分母写死 / 分母放大 / 删短路 / 换算反着来 /
+    --        文案丢小时段 / 分母恒 0 ⇒ 断言必须变红）
+    --   · 既有三个套件全部复跑通过：load-56 **7** / calendar-56 **157** /
+    --     calendar-page-56 **43**（`test_load_56.lua` 的 `dofile` 路径
+    --     问题一并修掉 —— chunkname 要带真实目录，见该文件注释）。
+    --   · 预览：`预览-日历-字数热力图.png`（新增）+
+    --     `预览-日历-速度单位切换.png` + `预览-日历-时间热力图.png`，
+    --     渲染器新增**格子文字溢出检查**（三张图均无溢出，
+    --     最长文案 3h12m = 79px < max_width 121px，余 42px）。
     version = "1.1",
+    -- ★★★ 54：**构建标记**（不是版本号！`version` 一个字没动）。
+    --   用于在设备菜单第一行区分「装的是哪一轮的包」——版本号按约定不升，
+    --   没有这个字段就分不清 49d / 50 / 50b+50c / 52 / 53 / 54 / 55 / 更早的包。
+    --   本轮（三指标热力图复核 + KPW4 按需计算）：56 → **57**。
+    build = "57",
 }

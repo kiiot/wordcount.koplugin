@@ -1191,6 +1191,49 @@ local function removeCachedCount(path, prefer_settings)
 end
 
 
+--- ★★★ 50b-no-fallback-flash：`UIManager:show` 的安全版本（main.lua 侧）。
+---
+--- 与 statistics_page.lua 里的同名 helper 是同一个理由：
+---   裸的 `UIManager:show(w)` **不带刷新参数** ⇒ 上游 `show()`（uimanager.lua:184）
+---   把它转成 `setDirty(w, nil, nil)` ⇒ `_refresh(nil, …)` 直接 return
+---   （uimanager.lua:1122-1127「we drop it」）⇒ 刷新队列为空
+---   ⇒ `_repaint()` 的兜底补一次 **无 region 的 `"partial"`**（:1291-1294）⇒
+---   ① region 填成整屏；② 每 `FULL_REFRESH_COUNT`（默认 6）次被提升成 `"full"`
+---   —— 那就是整屏黑闪。
+---   （详见 statistics_page.lua 里 showNoFlash 上方那段长注释。）
+---
+--- 而且本插件还有第二重理由：PW4 上 `"ui"` 波形 = `WAVEFORM_MODE_AUTO`
+---   （framebuffer_mxcfb.lua:874）⇒ `refresh_rex` 里 hist_bw=DU / hist_gray=GC16
+---   ⇒ **驱动按矩形内容挑波形**：含灰（灰底填充 + 灰阶抗锯齿文字）⇒ GC16 ⇒ 闪黑。
+---   `Notification:onShow` / `InfoMessage:onShow` 自己排的正是 `"ui"` + 自身矩形，
+---   所以光把 `show()` 修好还不够 —— 得让**我们这条**优先级更高、把它顶掉。
+---   `refresh_modes["[partial]"] = 6 > refresh_modes["ui"] = 3`
+---   ⇒ `_refresh` 的碰撞合并（uimanager.lua:1188-1203）会取我们这条。
+---
+--- 这里用 lambda 形式：矩形在**画完之后**才取得到
+--- （`FrameContainer:paintTo` / `MovableContainer:paintTo` 都是画的时候才写 dimen），
+--- 而 `setDirty` 支持把函数塞进 `_refresh_func_stack`（uimanager.lua:651-659），
+--- 由 `_repaint` 在画完之后求值（:1279-1287）。
+--- 模式固定 `"[partial]"`（PW4 上 = REAGL，不闪、不提升、也不被 avoid_flashing_ui 降级）。
+---
+--- ⚠ **必须定义在所有调用点之前**（`notifyUser` 就要用它）——
+---   这与 35-forward-local-fix 修掉的 `notifyUser` / `fmtCount` 是同一类坑：
+---   Lua 的 `local function` 只从声明处往后可见，放晚了就会解析成 nil 全局。
+local function showNoFlash(widget)
+    UIManager:show(widget, function()
+        local region
+        if widget then
+            if widget.movable and widget.movable.dimen then
+                region = widget.movable.dimen
+            elseif widget.popup_frame and widget.popup_frame.dimen then
+                region = widget.popup_frame.dimen
+            end
+        end
+        return "[partial]", region
+    end)
+    return widget
+end
+
 --- 统一提示入口：显式构造 Notification 实例并 show。
 --- （原因见下方 notify_source 的说明：模块级 `Notification:notify` 会被静默吞。）
 ---
@@ -1210,7 +1253,7 @@ local function notifyUser(arg, timeout)
         text = arg
     end
     pcall(function()
-        UIManager:show(Notification:new{
+        showNoFlash(Notification:new{
             text = tostring(text or ""),
             timeout = timeout or 2,
         })
@@ -1689,7 +1732,9 @@ local function runEntrySafely(fn)
     local ok, err = xpcall(fn, debug.traceback)
     if not ok then
         logger.err("WordCount: operation entry failed", err)
-        UIManager:show(InfoMessage:new{
+        -- ★★★ 50b：走 showNoFlash（否则 InfoMessage:onShow 自己排的 "ui" 在 PW4 上
+        --   = AUTO ⇒ 含灰 ⇒ GC16 ⇒ 闪黑；我们的 "[partial]" 优先级更高会把它顶掉）。
+        showNoFlash(InfoMessage:new{
             text = T(_("字数统计启动失败：%1"), tostring(err)),
         })
     end
@@ -2008,13 +2053,27 @@ function WordCount:addToMainMenu(menu_items)
     -- ★★★ 37i2：把**版本号**顶到菜单最上面一行：点它弹通知显示当前装的是哪一版。
     --   用户抱怨「为什么不重构版本号」——根因是插件从来不把版本显示出来，
     --   他装完新包也没法确认自己装的是新版还是旧版（zip 名又一直没变）。
+    --
+    -- ★★★ 50-build-marker：再加一个**构建标记**。
+    --   起因：用户报「还是闪烁黑色」，但版本号按约定**不升**（仍 1.1）
+    --   ⇒ 菜单上「版本：1.1」四个字，49d 的包和更早的包长得一模一样，
+    --   根本没法判断设备上到底装没装上修复。于是 `_meta.lua` 顶层新增
+    --   `build` 字段，这里显示成「版本：1.1（内修订 50）」。
+    --   ⚠ `build` **不是**版本号，只是「1.1 内部的第几轮修订」——
+    --     与变更日志标题「1.1 内修订（50：…）」是同一个编号。
     local version_text = "unknown"
+    local build_text = nil
     do
         local ok, meta = pcall(dofile, plugin_dir .. "_meta.lua")
         if ok and type(meta) == "table" and meta.version then
             version_text = tostring(meta.version)
+            if meta.build then build_text = tostring(meta.build) end
         end
     end
+    -- 菜单/通知里统一用这个「带构建标记」的显示串；`build` 缺失时退回纯版本号。
+    local version_display = build_text
+        and (version_text .. "（内修订 " .. build_text .. "）")
+        or version_text
     -- ★★★ 38a-bugA：**sorting_hint 必须按上下文选，不能写死**。
     --
     --   ☠ 真 bug（用户 crash.log 坐实，2026-10-11）：
@@ -2064,12 +2123,13 @@ function WordCount:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 -- ★ 版本号：点一下弹通知，方便核对装的是哪一版。
+                --   50 起带上构建标记（见上面的 version_display）。
                 text_func = function()
-                    return T(_("版本：%1"), tostring(version_text))
+                    return T(_("版本：%1"), tostring(version_display))
                 end,
                 callback = function()
                     notifyUser(T(_("字数与阅读速度\n当前版本：%1\n（点此可确认装的是最新包）"),
-                        tostring(version_text)), 5)
+                        tostring(version_display)), 5)
                 end,
                 keep_menu_open = true,
             },
@@ -2312,7 +2372,8 @@ function WordCount:editDowngradePages()
             },
         },
     }
-    UIManager:show(dialog)
+    -- ★★★ 50b：走 showNoFlash，别退回裸的 `UIManager:show(dialog)`（见它的注释）。
+    showNoFlash(dialog)
     dialog:onShowKeyboard()
 end
 
@@ -2396,7 +2457,8 @@ function WordCount:editDowngradeMb()
             },
         },
     }
-    UIManager:show(dialog)
+    -- ★★★ 50b：走 showNoFlash，别退回裸的 `UIManager:show(dialog)`（见它的注释）。
+    showNoFlash(dialog)
     dialog:onShowKeyboard()
 end
 
@@ -2496,7 +2558,8 @@ function WordCount:editBatchThreshold()
             },
         },
     }
-    UIManager:show(dialog)
+    -- ★★★ 50b：走 showNoFlash，别退回裸的 `UIManager:show(dialog)`（见它的注释）。
+    showNoFlash(dialog)
     dialog:onShowKeyboard()
 end
 
@@ -3621,15 +3684,16 @@ function WordCount:startCountFromMenu(force_rescan)
     logger.err("WordCount: synchronous startCount failure", err)
     local message = T(_("无法启动字数统计：%1"), tostring(err))
     local shown = pcall(function()
-        UIManager:show(InfoMessage:new{ text = message })
+        showNoFlash(InfoMessage:new{ text = message })
     end)
     if not shown then
         -- ★ 这里以前写的是 `pcall(Notification.notify, Notification, message)` ——
         --   在**类表**上点调用，`notify_source` 为 nil ⇒ 静默返回 false，什么也不显示。
         --   这正是 notify_source 那个坑（见 notifyUser 的注释）。虽然它在兜底路径里，
         --   但兜底路径才最需要「真的显示出来」，所以改成构造实例。
+        -- ★★★ 50b：同样走 showNoFlash（理由见上）。
         pcall(function()
-            UIManager:show(Notification:new{ text = message, timeout = 4 })
+            showNoFlash(Notification:new{ text = message, timeout = 4 })
         end)
     end
     return false

@@ -400,8 +400,8 @@ end
 --- 列出某一年的所有周（含「第几周 + 日期区间」），从新到旧。
 --
 --   用户原话：「周的点击可以选择第几周（第几周后面跟着时间）」——
---   所以每一项都带 `range`（如 "10月05日–10月11日"），选择器里
---   拼成「第41周  10月05日–10月11日」。
+--   所以每一项都带 `range`（如 "10.05–10.11"），选择器里
+--   拼成「第41周  10.05–10.11」。
 --
 --   ★ 只列 anchor 所在年（year_override 可指定别的年）：
 --     一年最多 53 周，弹窗可控；要是把「有数据的周」全列出来，
@@ -409,7 +409,7 @@ end
 --     想看别的年，先在「年」标签里选年，再点「周」。
 --
 --   返回：{ { monday = ts, year = 2026, week_no = 41,
---            label = "第41周", range = "10月05日–10月11日", has_data = true }, … }
+--            label = "第41周", range = "10.05–10.11", has_data = true }, … }
 function M.availableWeeks(store, anchor, year_override)
     anchor = tonumber(anchor) or os.time()
     local anchor_year = parts(anchor)

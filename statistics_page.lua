@@ -59,7 +59,6 @@ local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
-local IconButton = require("ui/widget/iconbutton")
 local IconWidget = require("ui/widget/iconwidget")
 local ImageWidget = require("ui/widget/imagewidget")
 local InfoMessage = require("ui/widget/infomessage")
@@ -333,12 +332,12 @@ local function faces()
     if FACES then return FACES end
     FACES = {
         -- ★★★ 32：用户要求「字体放大一点」。整体上调 2~4 px。
-        value_big = Font:getFace("cfont", 29),
-        value_small = Font:getFace("cfont", 18),
-        label = Font:getFace("smallinfofont", 17),
-        delta = Font:getFace("smallinfofont", 16),
-        tab = Font:getFace("cfont", 18),
-        period = Font:getFace("cfont", 20),
+        value_big = Font:getFace("cfont", 32),
+        value_small = Font:getFace("cfont", 19),
+        label = Font:getFace("smallinfofont", 19),
+        delta = Font:getFace("smallinfofont", 18),
+        tab = Font:getFace("cfont", 21),
+        period = Font:getFace("cfont", 23),
         section = Font:getFace("cfont", 24),
         axis = Font:getFace("x_smallinfofont", 17),
         footer = Font:getFace("smallinfofont", 19),
@@ -526,7 +525,63 @@ local function text(str, face, opts)
         fgcolor = opts.color or Blitbuffer.COLOR_BLACK,
         max_width = opts.max_width,
         truncate_with_ellipsis = opts.truncate ~= false,
+        -- ★★★ 52-cell-fit：可选的**垂直内边距覆盖**。
+        --
+        --   上游 `TextWidget:updateSize()`（ui/widget/textwidget.lua:113）算的是
+        --       self._height = ceil(face.ftsize:getHeightAndAscender()) + 2*self.padding
+        --   而 `padding` 的类默认值是 `Size.padding.small` = scaleBySize(2) = 4px
+        --   ⇒ **每行文字凭空多 8px 高**（不是字号的 8px，是固定的 8px）。
+        --
+        --   ⚠ 52 轮这里写的是「cfont 行高 ≈ 1.46 em，日期(19px) → 36、数值(13px)
+        --     → 27，两行 63px」—— 那个 19px / 13px 是**设计字号**，不是真实字号。
+        --     `Font:getFace` 会把字号乘一遍 `Screen:scaleBySize`（ui/font.lua:276），
+        --     所以 KPW4 上的真实账是（NotoSans 实测行高/em = 1362/1000）：
+        --       日期 `cfont 19`            → 34px → 行高 ceil(34×1.362) = 47
+        --       数值 `x_smallinfofont 13`  → 24px → 行高 ceil(24×1.362) = 33
+        --     两行合计 **80px**（带默认 padding 是 80+2×2×4 = 96px），
+        --     而 52 那版的日历格只有 scaleBySize(34) = 61px。
+        --   传 `padding = 0` 只省掉 2×2×4 = 16px（96 → 80），**仍然放不下** ——
+        --   真正解决「上下都被截断」的是 53 轮把格子按 `faceLineH()` 撑到 88px
+        --   （见 faceLineH / buildCalendarGrid 的注释）。
+        --
+        --   ⚠ 默认不传时 `opts.padding` 是 nil ⇒ 键不进表 ⇒ TextWidget 用类默认
+        --     值 ⇒ 其它所有调用点（卡片、图表、轨道…）行为**一点没变**。
+        padding = opts.padding,
     }
+end
+
+--- 一个 face 在 `padding = 0` 时**单行占的像素高** —— 就是上游
+--- `TextWidget:updateSize()`（ui/widget/textwidget.lua:113）算出来的 `_height`：
+---     `_height = math.ceil(face.ftsize:getHeightAndAscender()) + 2*self.padding`
+--- 这里要的是 `padding = 0` 的那部分，所以直接取 `ceil(ftsize:getHeightAndAscender())`。
+---
+--- ★★★ 53-cal-fit：**高度必须问字体本身，不能按「设计字号 × 经验行高比」估。**
+---
+---   52 轮我把「格子放不放得下」算错了，根因就在这儿：
+---   `Font:getFace(name, size)` 会把 `size` **再乘一遍 `Screen:scaleBySize`**
+---   （ui/font.lua:276：`size = Screen:scaleBySize(size)`）——
+---   所以 `Font:getFace("cfont", 19)` 拿到的 `face.size` 是
+---   `scaleBySize(19) = 34px`（KPW4），**不是 19px**。
+---   于是真实账是：
+---       日期行 `ceil(34 × 1.362) = 47`（NotoSans 的 hhea 高/em = 1362/1000）
+---       数值行 `ceil(24 × 1.362) = 33`   （`Font:getFace("x_smallinfofont", 13)`）
+---       两行合计 **80px**，而格子只有 61px ⇒ 上下各溢出 ~10px，
+---       被相邻格子的实心填充盖掉 ⇒ 用户看到的「上下都有被截断的」。
+---   （52 轮那版把 `padding` 从 4 改成 0，只省了 2×2×4 = 16px，
+---     80+16 = 96 → 80，仍然比 61 高，所以「还是被截断」。）
+---
+---   ⚠ 兜底：拿不到 freetype 度量时按 `1.6 em` 估（宁可算高一点，也不要切字）。
+---     估高只会让格子/行更高，不会溢出；估低才会切字。
+local function faceLineH(face)
+    if not face then return 0 end
+    local ftsize = face.ftsize
+    if ftsize then
+        local ok, h = pcall(function() return ftsize:getHeightAndAscender() end)
+        if ok and type(h) == "number" and h > 0 then
+            return math.ceil(h)
+        end
+    end
+    return math.ceil((face.size or 16) * 1.6)
 end
 
 --- 图标统一开 alpha：卡片/条带底色不是纯白时，IconWidget 默认会把图标压平到白色底上，
@@ -727,7 +782,15 @@ local LABEL_METRICS = {}
 local LABEL_METRICS_LIMIT = 512
 
 local function labelMetrics(s, face)
-    local m = LABEL_METRICS[s]
+    -- ★★★ 45-face-key：缓存键**带上 face**。
+    --   原来键只有字符串，把「face 当成固定的」—— 但 45 轮给
+    --   「按小时阅读记录」量列宽时，同一个串可能既要用 f.axis 又要用
+    --   f.footer 量（两个字号不同），只按字符串缓存就会**串味**：
+    --   先量的那个字号把宽度写进缓存，后量的直接拿到错的宽度 ⇒ 列宽算错。
+    --   `tostring(face)` 在单次运行内是稳定的（face 是 Font 缓存里的表对象），
+    --   够当键用；同一次运行里字号不变，所以缓存仍然有效。
+    local key = (face and (tostring(face) .. "\1") or "") .. s
+    local m = LABEL_METRICS[key]
     if m then return m end
     -- 防御性上限：正常用不到（标签文案的取值集合很有限），
     -- 但万一某天有人把日期/书名拼进标签，这里兜住内存。
@@ -738,7 +801,7 @@ local function labelMetrics(s, face)
     local size = probe:getSize()
     m = { w = size.w, h = size.h }
     pcall(probe.free, probe)
-    LABEL_METRICS[s] = m
+    LABEL_METRICS[key] = m
     return m
 end
 
@@ -872,33 +935,69 @@ local function chartValueLabels(buckets, unit, selected_index, width, height, sc
     local anchor = tonumber(selected_index) or 1
     anchor = math.max(1, math.min(count, anchor))
 
-    -- ★ 锚点的左右边沿**无论标不标都要先算出来** —— 左右两遍扫描
-    --   都是以「选中柱的位置」为起点向外走的，跳过 0 桶不能改变这个起点。
-    local anchor_x, anchor_w = label_x(anchor)
-    local left_edge, right_edge = anchor_x, anchor_x + anchor_w
-    if has_value(anchor) then place(anchor) end
-
-    -- 向左：只要不压到已放置标签的左边沿就放
-    --   ⚠ 跳过 0 桶时**不要动 left_edge** —— left_edge 记的是「最左那个
-    --     已放置标签的左沿」，被跳过的桶什么都没放，不能拿它的位置去
-    --     收紧后面（更靠左）的判定，否则会把本来放得下的标签误判为重叠。
-    for i = anchor - 1, 1, -1 do
-        if has_value(i) then
-            local x, w = label_x(i)
-            if x + w + gap <= left_edge then
-                left_edge = place(i)
-            end
+    -- ★★★ 46-tallest-label：**最高柱必须标上数值**。
+    --
+    --   46 轮用户原话：「我看月的有一个很长的柱子，顶端没有显示数值」。
+    --
+    --   真因**不是空间不够**（图上方那块 VerticalSpan 是够的，见
+    --   buildTrendSection 的注释），而是**贪心铺排的顺序**：
+    --   原来只从「选中柱」出发向左右扫，最高柱没有任何优先权。
+    --   实测这一屏（月视图 31 桶、选中 27 号）：
+    --     向左扫到 20 号「700」时它先占住位置（x=[c20-21, c20+21]），
+    --     紧接着 18 号「5,800」算出来 x=[c18-33, c18+33]，
+    --     两个区间只差 **2px** 就撞上 ⇒ 判定重叠、直接跳过。
+    --   于是最显眼的那根柱子反而没数字。
+    --
+    --   修法：把铺排改成**按优先级**：
+    --     ① 选中柱（保证「刚点过的那根一定有数」）
+    --     ② 最高柱（本次新增 —— 它是最显眼的一根）
+    --     ③ 其余按原来的方向贪心（左一遍、右一遍）
+    --   重叠判定也从「只跟本方向的边沿比」换成「跟**所有已放置标签的区间**比」
+    --   —— 因为最高柱可能落在选中柱的左边或右边，只比单侧边沿会漏判。
+    --
+    --   ⚠ 代价说清楚：最高柱和它邻居的标签**可能真的二选一**（上面那个例子
+    --     里 700 就会被挤掉）。这是几何上的硬约束 —— 31 个桶、标签比 slot
+    --     还宽时怎么摆都会叠。用户的诉求是「最长的柱子要有数」，所以优先级
+    --     排在 700 前面。**宁可少标一根矮的，也不能让最高那根空着。**
+    --   ⚠ 别把 gap 调小来「两个都要」：gap 是 scaleBySize(3)=6px，已经很紧，
+    --     再小两个数字的白底就贴上了（见函数头对 gap 的说明）。
+    local placed = {}   -- { {x1, x2}, ... } 已放置标签的区间
+    local function overlaps(x, w)
+        local x1, x2 = x, x + w
+        for _i, p in ipairs(placed) do
+            if x1 < p[2] + gap and p[1] < x2 + gap then return true end
         end
+        return false
     end
-    -- 向右：同理
+    local function try_place(i)
+        if not has_value(i) then return false end
+        local x, w = label_x(i)
+        if overlaps(x, w) then return false end
+        placed[#placed + 1] = { x, x + w }
+        place(i)
+        return true
+    end
+
+    -- ① 选中柱
+    try_place(anchor)
+
+    -- ② 最高柱（跳过 0 桶；与选中柱重合时 try_place 会被 overlaps 自动挡掉）
+    local max_index, max_value = 0, 0
+    for i, bucket in ipairs(buckets) do
+        local v = tonumber(bucket.value) or 0
+        if v > max_value then max_index, max_value = i, v end
+    end
+    if max_index > 0 and max_index ~= anchor then
+        try_place(max_index)
+    end
+
+    -- ③ 其余：从选中柱向左右各扫一遍。
+    --   ⚠ 跳过 0 桶时什么都不做 —— 被跳过的桶没有占位，不该影响别的判定。
+    for i = anchor - 1, 1, -1 do
+        try_place(i)
+    end
     for i = anchor + 1, count do
-        if has_value(i) then
-            local x = label_x(i)
-            if x >= right_edge + gap then
-                local _unused, nr = place(i)
-                right_edge = nr
-            end
-        end
+        try_place(i)
     end
     return items
 end
@@ -1086,39 +1185,225 @@ local function buildTickRow(buckets, chart_width, tick_height, color)
     return row
 end
 
+-- ★★★ 前向声明：这两个控件在文件后半部分才定义，但**前面的函数体里已经用到**。
+--   Lua 的 `local` 作用域**从声明那一行才开始**，所以如果只在后面写
+--   `local HRule = ...`，前面函数里的 `HRule` 会被解析成**全局变量**（nil），
+--   只有在真正调用到那个函数时才炸。
+--
+--   ⚠ 45f 修的真 bug：`buildHourlyActivityList` 行间用 `HRule`，而 `HRule` 的
+--   local 定义在后面 ⇒ 打开**日视图**直接崩：
+--     `plugins/wordcount.koplugin/statistics_page.lua:1251:
+--      attempt to index global 'HRule' (a nil value)`
+--   修法：在任何使用者之前前向声明，把定义处改成纯赋值（定义处再写 `local`
+--   会遮蔽掉这里的声明，等于没修）。
+--
+--   ⚠ 46-list-dotted-sep：**这段声明又往上挪了一格**。因为 46 轮给
+--     `buildTrendList` 也加了 `HRule`（行间点线分隔），而 `buildTrendList`
+--     比 `buildHourlyActivityList` 更靠前 —— 声明留在原处的话，45f 那个
+--     bug 会在**列表模式**里原样复现一次。教训：这个文件里凡是「定义在文件
+--     后半、被前半的函数体引用」的控件，前向声明必须放在**最早的那个使用者
+--     之前**；再加新调用点时要回头确认一下顺序。
+local SolidRect
+local HRule
+-- ★★★ 50c-calendar：`anchorAtMonth` 定义在**文件后半**的选择器一节里
+--   （原 :4329），而 `buildCalendarPage`（:3000 一带）比它早。
+--   不在这里前向声明的话，`buildCalendarPage` 里引用到的会是一个
+--   **全局 nil** —— 点月份箭头立刻 `attempt to call a nil value`。
+--   （这就是 45f / 46 轮踩过的同一个坑，见上面的教训。）
+local anchorAtMonth
+
 --- 趋势列表视图（图表视图的替代），每行「标签 …… 数值」。
+---
+--- ★★★ 46-list-dotted-sep：**行与行之间加一条水平点线分隔**。
+---
+---   46 轮用户原话：「点线是分隔线不是导航线」。
+---   ⚠ 这里必须说清楚是哪一种「点线」——两种长得像、含义完全不同：
+---     · **导航线（leader dots）**：像目录那样，在**同一行内部**从左边标签
+---       一路点过去接到右边数值（`01 ......... 1,200`）。用户明确**不要**这个。
+---     · **分隔线（separator）**：横跨整行宽、**画在两行之间**的水平点线。
+---       这个才是用户要的 —— 行多了以后数字容易串行，靠它把行切开。
+---   所以下面**没有**碰 `filler`（那根留白仍然是纯空白），而是在每两行之间
+---   插一条 `HRule{dotted = true}`（与总览页「点线」卡片样式同一种线，
+---   圆点半径见 SEP_DOT_R）。
+---   ⚠ 最后一行后面**不加** —— 列表底下再挂一条线会跟下面的翻页栏/页脚贴住，
+---     看着像列表没结束。
 local function buildTrendList(buckets, metric, selected_index, width)
     local f = faces()
     local group = VerticalGroup:new{}
     local row_h = Screen:scaleBySize(34)
     for i, bucket in ipairs(buckets) do
         local is_selected = (i == selected_index)
-        local color = is_selected and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+        local color = Blitbuffer.COLOR_BLACK
         local left = text(tostring(bucket.label), f.axis, { color = color, bold = is_selected })
         local right = text(metricValueText(bucket.value, metric), f.footer, { color = color, bold = is_selected })
         local left_w = left:getSize().w
         local right_w = right:getSize().w
         local filler = math.max(0, width - left_w - right_w - Screen:scaleBySize(8))
-        local row = FixedBox:new{
-            width = width, height = row_h,
-            align = "left", vertical_align = "center",
+        group[#group + 1] = FixedBox:new{
+            width = width,
+            height = row_h,
+            align = "left",
+            vertical_align = "center",
             HorizontalGroup:new{
-                align = "center", left,
+                align = "center",
+                left,
                 HorizontalSpan:new{ width = filler },
                 right,
             },
         }
-        if is_selected then
-            row = FrameContainer:new{
-                width = width, height = row_h,
-                bordersize = 0, padding = 0, margin = 0,
-                background = Blitbuffer.COLOR_BLACK,
-                row,
-            }
+        -- ★★★ 46-list-dotted-sep：行间水平点线（最后一行不加，见函数头注释）。
+        if i < #buckets then
+            group[#group + 1] = HRule:new{ width = width, dotted = true }
         end
-        group[#group + 1] = row
     end
     return group
+end
+
+--- 日视图按小时展示实际发生过的阅读记录。
+local function buildHourlyActivityList(buckets, width)
+    local f = faces()
+    local rows = {}
+    local max_value = 0
+    local total_seconds, total_units = 0, 0
+    for i, bucket in ipairs(buckets) do
+        local seconds = math.max(0, tonumber(bucket.seconds) or 0)
+        local units = math.max(0, tonumber(bucket.units) or 0)
+        total_seconds = total_seconds + seconds
+        total_units = total_units + units
+        if seconds > 0 or units > 0 then
+            local value = seconds > 0 and seconds or units
+            max_value = math.max(max_value, value)
+            rows[#rows + 1] = {
+                hour = i - 1,
+                seconds = seconds,
+                units = units,
+                value = value,
+            }
+        end
+    end
+
+    local group = VerticalGroup:new{ align = "left" }
+    if #rows == 0 then
+        group[#group + 1] = FixedBox:new{
+            width = width,
+            height = Screen:scaleBySize(42),
+            align = "center",
+            vertical_align = "center",
+            text(_("当天暂无阅读记录"), f.footer, { color = Blitbuffer.COLOR_BLACK }),
+        }
+        return group, total_seconds, total_units
+    end
+
+    -- ★★★ 45-hour-fit：**列宽与行高一律量出来**，不再写死像素。
+    --
+    -- 45 轮之前这里是 `time_w = 92px` / `amount_w = 118px` / `row_h = 40px`，
+    -- 全是拍脑袋的常数。在设备上（`x_smallinfofont` 17 ⇒ 实际 34px、
+    -- `smallinfofont` 19 ⇒ 38px）两处**同时**溢出：
+    --
+    --   ① 时间列：`00:00–01:00` 本身就有 ~93px ⇒ 塞不进 92px 的 FixedBox。
+    --      而本文件的 `FixedBox` **不裁剪**（见 FixedBox:paintTo —— 它只按
+    --      align 把子控件画出去）⇒ 文字直接**压到进度条上**。
+    --   ② 数值列：原来是「时长 / N 字」**两行**（两行约 100px），
+    --      而 `row_h - 2*padding` 只剩 28px ⇒ 两行上下都溢出，
+    --      **压到相邻两行**的文字上。
+    --
+    -- 两条叠在一起，就是用户说的「小时统计格式还是乱的」。
+    --
+    -- 现在：时间列取「该列最宽的那条时间标签」、数值列取「最宽的那条数值」，
+    --   行高取「两个字号里更高的那一行 + 上下留白」，全部由 labelMetrics 现量。
+    --   ⚠ 只有 `seconds > 0 or units > 0` 的小时才会进 rows（见上面的过滤），
+    --     所以实际行数通常是几个到十几个，不会真的排满 24 行。
+    local time_texts, amount_texts = {}, {}
+    local time_w, amount_w = 0, 0
+    for i, row in ipairs(rows) do
+        local next_hour = (row.hour + 1) % 24
+        time_texts[i] = string.format("%02d:00–%02d:00", row.hour, next_hour)
+        -- ★ 数值并成**一行**（两行根本放不下，见上）：
+        --   `1小时20分 · 1,234 字`
+        amount_texts[i] = formatDuration(row.seconds) .. " · "
+            .. formatCount(row.units) .. " " .. _("字")
+        time_w = math.max(time_w, labelMetrics(time_texts[i], f.axis).w)
+        amount_w = math.max(amount_w, labelMetrics(amount_texts[i], f.footer).w)
+    end
+
+    local gap = Screen:scaleBySize(8)
+    local padding = Screen:scaleBySize(4)
+    local bar_h = Screen:scaleBySize(12)
+    local border = Screen:scaleBySize(1)
+    -- 行高 = 两个字号里更高的那一行 + 上下留白（量出来的，不是拍脑袋的 40px）
+    local row_h = math.max(
+        labelMetrics("0", f.axis).h,
+        labelMetrics("0", f.footer).h) + 2 * padding
+    -- 两列各留 2px 气口：正好等于文字宽时，像素取整会把最后一个字符挤掉。
+    local time_col = time_w + Screen:scaleBySize(2)
+    local amount_col = amount_w + Screen:scaleBySize(2)
+    local bar_w = math.max(Screen:scaleBySize(20),
+        width - 2 * padding - time_col - amount_col - 2 * gap - 2 * border)
+
+    for i, row in ipairs(rows) do
+        local time_widget = text(time_texts[i], f.axis, { bold = true })
+        local ratio = max_value > 0 and row.value / max_value or 0
+        local fill_w = math.max(border, math.floor((bar_w - 2 * border) * ratio))
+        -- ★★★ 49-hour-round：柱子加圆角（用户：「日的按小时记录列形式里的
+        --   柱子加一点圆角效果」）。
+        --   · 半径取 `scaleBySize(3)` = 6px，柱高是 `scaleBySize(12)` = 22px
+        --     ⇒ 圆角约占柱高的 1/4，是「方中带圆」而不是胶囊
+        --     （胶囊要半径 = 柱高/2 = 11px，那在 e-ink 上看着像药丸，
+        --      跟旁边的读数文字不搭）。
+        --   · **只改观感**：`fill_w` 的进度比例计算完全没动。
+        --   ⚠ 半径必须 ≤ 填充高的一半，否则 `paintRoundedRect` 会自己夹到
+        --     h/2（它内部有夹取），但那样就成了胶囊 —— 所以这里给的值
+        --     要留余量。
+        --   ⚠⚠ `local` 不能写在 `FixedBox:new{...}` 的表构造器里（那是表达式
+        --     位置，只允许字段），必须提到外面 —— 之前就栽在这上面。
+        local bar_r = Screen:scaleBySize(3)
+        local bar = FixedBox:new{
+            width = bar_w,
+            height = bar_h,
+            align = "left",
+            vertical_align = "center",
+            SolidRect:new{
+                width = fill_w,
+                height = math.max(1, bar_h - 2 * border),
+                color = Blitbuffer.COLOR_BLACK,
+                radius = bar_r,
+            },
+        }
+        local content = HorizontalGroup:new{
+            align = "center",
+            FixedBox:new{
+                width = time_col,
+                height = row_h,
+                align = "left",
+                vertical_align = "center",
+                time_widget,
+            },
+            HorizontalSpan:new{ width = gap },
+            bar,
+            HorizontalSpan:new{ width = gap },
+            FixedBox:new{
+                width = amount_col,
+                height = row_h,
+                align = "right",
+                vertical_align = "center",
+                text(amount_texts[i], f.footer, { bold = true }),
+            },
+        }
+        group[#group + 1] = FixedBox:new{
+            width = width,
+            height = row_h,
+            align = "left",
+            vertical_align = "center",
+            content,
+        }
+        if i < #rows then
+            group[#group + 1] = HRule:new{
+                width = width, height = border,
+                color = Blitbuffer.COLOR_BLACK,
+            }
+        end
+    end
+    return group, total_seconds, total_units
 end
 
 --==========================================================================
@@ -1127,7 +1412,7 @@ end
 
 --- 卡片大数字的候选字号。宽度不够就整档降级，避免多列卡片互相压字。
 --- ★ 32：整体上调（用户要求字体更大）；同时因为改成多列，降级档位也保留。
-local VALUE_SIZE_PAIRS = { { 29, 18 }, { 26, 16 }, { 22, 14 }, { 18, 12 }, { 15, 10 } }
+local VALUE_SIZE_PAIRS = { { 32, 19 }, { 28, 17 }, { 23, 15 }, { 19, 13 }, { 16, 11 } }
 local VALUE_FACES
 
 local function valueFaces()
@@ -1137,6 +1422,60 @@ local function valueFaces()
         VALUE_FACES[i] = { Font:getFace("cfont", pair[1]), Font:getFace("cfont", pair[2]) }
     end
     return VALUE_FACES
+end
+
+-- ★★★ 49-cards：卡片**标签行 / 环比行**的字号梯子。
+--
+--   背景：用户要求「如果要是卡片放不下的话，缩小一点字体，变成一行 4 个卡片」
+--   ⇒ 卡片宽度从 298px 掉到 221px（inner_w 280 → 203）。
+--
+--   ⚠⚠ **纠正一个我先前写错的说法**：这里原来写的是「TextWidget 会折行，
+--     卡片被动变高」。**不对。** TextWidget 一旦给了 `max_width`，超宽走的是
+--     **截断 + 省略号**（`frontend/ui/widget/textwidget.lua:154-176`，
+--     `truncate_with_ellipsis` 默认 true），高度**始终是一行**。
+--     所以放不下的真实症状不是「卡片变高」，而是
+--     **标签被截成「日均阅读…」，用户根本读不到是什么指标** —— 更糟。
+--     （顺带：也正因为高度不会变，卡片网格的高度跟字号无关，
+--       字号梯子只解决「读不到」，不解决「放不下」。）
+--
+--   实测（`_gen_card_test.py` 按真实 Font:getFace 换算量出来的）：
+--     标签可用宽 = 203 - scaleBySize(20)=36 ⇒ **167px**
+--       「日均阅读时长」6 汉字：19 号→204px ✗ / 18→198 ✗ / 17→186 ✗
+--                              16→174 ✗ / **15→162 ✓**  ⇒ 落到 15 号
+--     环比可用宽 = inner_w ⇒ **203px**
+--       最宽「↑ 3小时12分钟」：18 号→224px ✗ / 17→211 ✗ / **16→197 ✓**
+--                              ⇒ 落到 16 号
+--
+--   做法：照抄 `VALUE_SIZE_PAIRS` 那套「从大到小试，第一个放得下就用」
+--   （`buildValueRow` 已经是这个思路），只是这次量的是**所有卡片里最宽的那条**
+--   —— 必须统一，不能一张卡一个字号。
+--   ⚠ 梯子**从 19 / 18 起步**（= 原来的值）：3 列模式下宽度够，会原样选回
+--     19 / 18，行为不变；只有真的放不下才逐级降到 13。这样「自适应」不会
+--     平白改变本来就正常的布局。
+--   ⚠ 调用顺序不能反：必须**先**把 `spec.delta_text` 算出来，再调 pickCardFace
+--     —— 它量的是 `spec.delta_text`，没算就是 nil、整条被跳过 ⇒ 直接返回最大档。
+--     （buildCardGrid 里的 ①→②→③ 就是为此排的。）
+local CARD_LABEL_SIZE_LADDER = { 19, 18, 17, 16, 15, 14, 13 }
+local CARD_DELTA_SIZE_LADDER = { 18, 17, 16, 15, 14, 13 }
+
+--- 在字号梯子里挑第一个「所有卡片都放得下」的字号。
+--- @param field  spec 上要量的字段名（"label" / "delta_text"）
+--- @param avail  可用宽度（设备像素）
+local function pickCardFace(specs, field, avail, ladder, face_name)
+    for _i, px in ipairs(ladder) do
+        local face = Font:getFace(face_name, px)
+        local ok = true
+        for _j, spec in ipairs(specs) do
+            local s = spec[field]
+            if s and labelMetrics(s, face).w > avail then
+                ok = false
+                break
+            end
+        end
+        if ok then return face end
+    end
+    -- 全都放不下：用最小那档，让 TextWidget 自己去折行（至少不崩）。
+    return Font:getFace(face_name, ladder[#ladder])
 end
 
 local function buildValueRow(parts, inner_width, big_face, small_face)
@@ -1155,16 +1494,73 @@ local function buildValueRow(parts, inner_width, big_face, small_face)
     return row
 end
 
-local function buildCardContent(spec, inner_width)
+--- ★★★ 49b-value-unify：给「大数字」也挑一个**所有卡片共用**的档位。
+---
+---   用户原话：「卡片字体一致一点啊」。
+---
+---   病因：`buildCardContent` 原来在**每张卡内部**各自循环 `VALUE_SIZE_PAIRS`，
+---   「试到放得下就 break」—— 于是同一屏里会出现三种大数字字号。49 轮实测
+---   （4 列，inner_w = 203）：
+---     阅读字数 / 阅读天数 / 累计读过 / 读完书籍 → cfont 32（设备 58px）
+---     阅读速度 / 阅读时间 / 日均阅读时长     → cfont 28（设备 51px）
+---     单日阅读最久                          → cfont 23（设备 42px）
+---   一眼看过去就是「大数字忽大忽小」，卡片不像一套。
+---
+---   做法：和 `pickCardFace` 完全同一个思路 —— 挑**第一个「所有卡片都放得下」
+---   的档位**，再把这个档位传给每张卡。量的是**最宽的那张卡**（这里是
+---   「单日阅读最久」的 `5小时41分钟`，4 个片段）。
+---   ⚠ 代价要说清楚：统一之后，原本能单独用 32 号的那几张（阅读字数 / 阅读天数
+---     / 累计读过 / 读完书籍）会**跟着降**到共同档位。这是「一致」的必然代价，
+---     不是 bug。49 轮实测 4 列下共同档位是 `{23, 15}`（设备 42/27）。
+---   ⚠ 想要「又一致又大」只有两条路，都不是纯代码能解决的：
+---     ① 缩文案（`字/分钟` → `字/分`、`分钟` → `分`），能回到 28 号；
+---     ② 放宽卡片内边距（`Size.padding.default` 9 → `Size.padding.small` 4，
+---        inner_w 203 → 213），能多挤出一点，但改变的是整块卡片的观感。
+---     这两条都要用户拍板，所以**没有**在这里擅自做。
+---   @return pair, rank  pair = { big_face, small_face }；rank = 在梯子里的序号（1 起）
+local function pickValuePair(specs, inner_width)
+    local sizes = valueFaces()
+    for i = 1, #sizes do
+        local pair = sizes[i]
+        local ok = true
+        for _j, spec in ipairs(specs) do
+            local row = buildValueRow(spec.parts, inner_width, pair[1], pair[2])
+            if row:getSize().w > inner_width then
+                ok = false
+                break
+            end
+        end
+        if ok then return pair, i end
+    end
+    -- 连最小档都放不下：仍然用最小档（各片段自己有 max_width，会截断加省略号，
+    -- 至少不会横向压出卡片外），保证「一致」这个前提不被打破。
+    return sizes[#sizes], #sizes
+end
+
+--- ★★★ 49-cards：多三个可选参数 `label_face` / `delta_face` / `value_pair`
+---   （由 buildCardGrid 按「所有卡片里最宽的那条」统一选出来，
+---    见 pickCardFace / pickValuePair）。
+---   不传则退回**原来的行为**（label/delta 用 `faces()` 里的原字号，
+---   大数字在卡片内部逐档试）—— 保持本函数可单独调用/测试。
+local function buildCardContent(spec, inner_width, label_face, delta_face, value_pair)
     local f = faces()
+    label_face = label_face or f.label
+    delta_face = delta_face or f.delta
     local group = VerticalGroup:new{}
 
     -- 第一行：大数字 + 小单位
-    local sizes = valueFaces()
+    --
+    -- ★★★ 49b-value-unify：`value_pair` 给了就用**统一的**那一档（所有卡片
+    --   同一个大数字字号，用户要求「一致」）；没给才退回原来的「一张卡一个档」。
     local value_row
-    for i = 1, #sizes do
-        value_row = buildValueRow(spec.parts, inner_width, sizes[i][1], sizes[i][2])
-        if value_row:getSize().w <= inner_width then break end
+    if value_pair then
+        value_row = buildValueRow(spec.parts, inner_width, value_pair[1], value_pair[2])
+    else
+        local sizes = valueFaces()
+        for i = 1, #sizes do
+            value_row = buildValueRow(spec.parts, inner_width, sizes[i][1], sizes[i][2])
+            if value_row:getSize().w <= inner_width then break end
+        end
     end
     group[#group + 1] = value_row
     group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
@@ -1174,8 +1570,8 @@ local function buildCardContent(spec, inner_width)
     -- ★★★ 41-no-card-icon：**卡片左侧的小图标删掉了**（用户：「总览页的卡片
     --   不要图标」）。
     --   · 删的是行首那个 `icon(spec.icon, ...)`。行尾那个 `chevron.right`
-    --     **保留** —— 它明确提示「这张卡能点进去下钻」；浅灰描边只划分卡片边界，
-    --     不表达点击动作。它和行首那个纯装饰性图标不是一回事。
+    --     **保留** —— 它是「这张卡能点进去下钻」的**唯一**线索（卡片没有
+    --     边框、没有按钮外观），和行首那个纯装饰性图标不是一回事。
     --   · 顺带把 `icon_size` 和它参与的 max_width 算术一起收掉：标签文字
     --     现在直接从卡片内边距起排，可用宽度多了 icon_size + 5px
     --     （KPW4 上 15+5 经 scaleBySize 后约 33px）——
@@ -1186,8 +1582,8 @@ local function buildCardContent(spec, inner_width)
     --   ⚠ 不要再给 label_row 加 `HorizontalSpan` 去「补」左边那块空位 ——
     --     那等于把图标换成了空白，用户要的是**标签整体靠左**。
     local label_row = HorizontalGroup:new{ align = "center" }
-    label_row[#label_row + 1] = text(spec.label, f.label, {
-        color = Blitbuffer.COLOR_DARK_GRAY,
+    label_row[#label_row + 1] = text(spec.label, label_face, {
+        color = Blitbuffer.COLOR_BLACK,
         max_width = inner_width - Screen:scaleBySize(20),
     })
     if spec.drill then
@@ -1202,13 +1598,13 @@ local function buildCardContent(spec, inner_width)
     if spec.delta_text then
         delta_row = HorizontalGroup:new{
             align = "center",
-            text(spec.delta_text, f.delta, {
-                color = Blitbuffer.COLOR_DARK_GRAY,
+            text(spec.delta_text, delta_face, {
+                color = Blitbuffer.COLOR_BLACK,
                 max_width = inner_width,
             }),
         }
     else
-        delta_row = HorizontalGroup:new{ align = "center", text(" ", f.delta) }
+        delta_row = HorizontalGroup:new{ align = "center", text(" ", delta_face) }
     end
     group[#group + 1] = delta_row
 
@@ -1265,7 +1661,9 @@ end
 local SEP_DOT_R   = 2                       -- 圆点半径(px)：2 ⇒ 直径 5px
 local SEP_DOT_GAP = Screen:scaleBySize(2)   -- 点间隔(px)：KPW4 上 = 4px
 
-local HRule = WidgetContainer:extend{
+-- ★★★ 注意：这里**不能**再写 `local`（会遮蔽掉 1126 行的前向声明，
+--   前面函数里拿到的就还是全局 nil）。同 SolidRect 的写法。
+HRule = WidgetContainer:extend{
     width = nil,
     height = nil,
     color = Blitbuffer.COLOR_BLACK,
@@ -1363,10 +1761,19 @@ end
 
 --- 实心矩形（自带尺寸，不依赖子控件）。
 -- 用于「标签」卡片左侧的粗竖条 —— 不能用无子控件的 FrameContainer（会崩）。
-local SolidRect = WidgetContainer:extend{
+--
+-- ★★★ 49-hour-round：新增 `radius`（四角同圆角，0 = 直角，行为不变）。
+--   49 轮用户原话：「日的按小时记录列形式里的柱子加一点圆角效果」。
+--   柱子就是 `SolidRect`，所以圆角能力加在这里，调用点传一个 radius 即可。
+--   ⚠ `paintRoundedRect` 的签名是 **(x, y, w, h, c, r)** —— 颜色在前、
+--     半径在后（ffi/blitbuffer.lua:2169），别按直觉写反。
+--   ⚠ 半径由调用方按「柱高的比例」给（见 buildHourlyActivityList），
+--     不要在这里写死 —— 柱子高度是量出来的，写死会在大字号下变形。
+SolidRect = WidgetContainer:extend{
     width = nil,
     height = nil,
     color = Blitbuffer.COLOR_BLACK,
+    radius = 0,
 }
 
 function SolidRect:getSize()
@@ -1376,7 +1783,12 @@ end
 function SolidRect:paintTo(bb, x, y)
     local size = self:getSize()
     self.dimen = Geom:new{ x = x, y = y, w = size.w, h = size.h }
-    bb:paintRect(x, y, size.w, size.h, self.color)
+    local r = math.floor(self.radius or 0)
+    if r > 0 and size.w > 0 and size.h > 0 then
+        bb:paintRoundedRect(x, y, size.w, size.h, self.color, r)
+    else
+        bb:paintRect(x, y, size.w, size.h, self.color)
+    end
 end
 
 --==========================================================================
@@ -1411,7 +1823,7 @@ end
 
 local function wrapCard(content, card_width, card_height, style, on_tap)
     local border = Screen:scaleBySize(1)
-    local pad = Size.padding.small
+    local pad = Size.padding.default
     local card
 
     if style == "grid" then
@@ -1449,7 +1861,7 @@ local function wrapCard(content, card_width, card_height, style, on_tap)
                     content,
                 },
                 HRule:new{ width = card_width, height = border,
-                    color = Blitbuffer.COLOR_GRAY_E, dotted = true },
+                    color = Blitbuffer.COLOR_BLACK, dotted = true },
             },
         }
     elseif style == "plate" then
@@ -1507,7 +1919,7 @@ local function wrapCard(content, card_width, card_height, style, on_tap)
                 --   用户要求「不选中有边框，不要填充颜色」，这里统一给卡片描边，
                 --   底色一律纯白（不再用任何灰底）。
                 bordersize = border,
-                color = Blitbuffer.COLOR_GRAY_E,
+                color = Blitbuffer.COLOR_BLACK,
                 padding = pad,
                 margin = 0,
                 content,
@@ -1533,15 +1945,15 @@ end
 --   · 竖屏/横屏都用 min/max 取，不写死。
 local POPUP_MARGIN = Size.padding.large           -- 窗口与屏幕边缘的缝隙
 local POPUP_SIDE_PADDING = Size.padding.large     -- 窗口内部左右内边距
--- ★★★ 44-shrink：用户原话「整体的阅读统计能不能缩小一点」⇒ 88%/80% → 84%/76%。
+-- ★★★ 44-shrink：用户原话「整体的阅读统计能不能缩小一点」⇒ 92%/90% → 88%/80%。
 --   KPW4（1072×1448）上的实际结果：
---     卡片宽 = floor(1072 * 0.84) = 900（原 943）
---     内容宽 = 900 - 2*18 = 864（原 907）
---     趋势图宽 = 864 - 2*18 = 828（原 871）
---     可用高 = floor(1448 * 0.76) = 1100（原 1158）
---   ⇒ 窗口四周留白增加，内容区仍保留适合阅读的尺寸。
-local POPUP_MAX_WIDTH_RATIO = 0.84                -- 宽度不超过屏宽的 84%
-local POPUP_MAX_HEIGHT_RATIO = 0.76               -- 高度不超过屏高的 76%
+--     卡片宽 = floor(1072 * 0.88) = 943（原 986）
+--     内容宽 = 943 - 2*18 = 907（原 950）
+--     趋势图宽 = 907 - 2*18 = 871（原 914）
+--     可用高 = floor(1448 * 0.80) = 1158（原 1303）
+--   ⇒ 高度少了 145px、宽度少了 43px，正文露出的部分明显变多。
+local POPUP_MAX_WIDTH_RATIO = 0.88                -- 宽度不超过屏宽的 88%
+local POPUP_MAX_HEIGHT_RATIO = 0.80               -- 高度不超过屏高的 80%
 
 -- ★★★ 36：下钻浮窗的尺寸比例 —— 必须**明显小于**主浮窗（0.88 / 0.80），
 --   这样点卡片进去时，能看到下钻框四周还露出主浮窗，一眼就是「叠在上面一层」。
@@ -1553,8 +1965,27 @@ local DRILL_MAX_HEIGHT_RATIO = 0.66
 --   `scaleBySize(36)`，而 `buildUnitsPage` 的高度预算里又各抄了一份
 --   （VIEWTAB_H / TABS_H）—— 改一处就会算错可用高、把内容挤出去。
 --   现在统一成一个常量，三处都引用它。
---   KPW4：scaleBySize(23) = 42（原 47 / 65）。
-local ROW_TAB_H_PX = 23
+--   KPW4：scaleBySize(26) = 47（原 68 / 65）。
+--
+-- ★★★ 49-nav-thumb：26 → **46**。用户从预览的四个档位（34 / 38 / 40 / 46）里
+--   选了最高的一档。
+--   ⚠ 先把 KPW4 的换算写清楚，免得后面对不上：
+--       `fb:scaleBySize(px)`（ffi/framebuffer.lua:414）=
+--         `ceil(px * (min(屏宽,屏高)/600 + dpi_scale) / 2)`；
+--       KPW4 没有 dpi_override ⇒ 两个 scale 都是 1072/600 = 1.7867
+--       ⇒ **实际是 ×1.7867，不是 ×2**。
+--       所以 `scaleBySize(46) = 83`（不是 92）。两行合计 166px + 中间 9px 空隙
+--       = 175px，而改之前是 47×2 + 9 = 103px。
+--   ⚠ 页面总高会因此多 ~72px，正文可用的高度相应变少 ——
+--     `buildUnitsPage` 的每页行数、总览卡片网格都要跟着看（见 49-cards）。
+local ROW_TAB_H_PX = 46
+
+-- ★★★ 49-nav-thumb：候选 D ⑦ 的三个几何常量（都是「设计像素」，走 scaleBySize）。
+--   预览里量出来的比例：轨道圆角 ≈ 轨道高的 1/4、滑块圆角略小一点、
+--   内边距 ≈ 轨道高的 1/15。换算成设备像素是 20 / 17 / 6（KPW4）。
+local NAV_TRACK_RADIUS_PX = 11   -- 轨道（外框）圆角
+local NAV_THUMB_RADIUS_PX = 9    -- 选中滑块圆角（四角同值）
+local NAV_TRACK_PAD_PX    = 3    -- 轨道内边距（滑块四周留白）
 
 --==========================================================================
 -- 下钻浮窗（★★★ 34：从全屏 KeyValuePage 改成**悬浮在上层的浮窗**）
@@ -1623,16 +2054,27 @@ function DrillDownPopup:onAnyKeyPressed()
 end
 
 function DrillDownPopup:onCloseWidget()
+    -- ★★★ 50-close-partial：`"ui"` → `"[partial]"`（与 49d 同源）。
+    --
+    --   PW4 是 Rex 平台，`waveform_ui = WAVEFORM_MODE_AUTO`
+    --   （`ffi/framebuffer_mxcfb.lua:874`），而 `refresh_rex` 在非
+    --   ZELDA_GLR16 波形下把 `hist_gray_waveform_mode` 设成 `GC16`（:557-558）
+    --   ⇒ 驱动按矩形内容挑波形：纯黑白 DU（不闪）/ 含灰 GC16（闪黑）。
+    --   下钻浮窗里全是灰阶文字 ⇒ 用 `"ui"` 关窗必然闪。
+    --   `"[partial]"` ⇒ REAGL（`WAVEFORM_MODE_ZELDA_GLR16`），不闪；
+    --   且不等于字符串 `"partial"` ⇒ 不会被提升成 flashui。
+    --   完整推导见 `StatisticsPage:reload` 上方的 49d 长注释。
+    --   ⚠ 别改回 `"ui"`。
     local region = (self.popup_frame and self.popup_frame.dimen) or self.dimen
     if region then
-        pcall(UIManager.setDirty, UIManager, self, "ui", region)
+        pcall(UIManager.setDirty, UIManager, self, "[partial]", region)
     end
 end
 
 function DrillDownPopup:build()
     -- ★★★ 36：下钻浮窗要**明显小于**阅读统计主浮窗（用户要求
     --   「卡片点击进去的显示框比阅读统计要小一点」）。
-    --   主浮窗宽/高分别由 POPUP_MAX_WIDTH_RATIO / POPUP_MAX_HEIGHT_RATIO 限制。
+    --   主浮窗宽 = 屏宽 * POPUP_MAX_WIDTH_RATIO(0.92)，高 = 屏高 * 0.90；
     --   下钻取 0.80 / 0.72 —— 一眼就能看出「这是叠在上面的一层」。
     local frame_w = Screen:getWidth() * DRILL_MAX_WIDTH_RATIO
     frame_w = math.max(Screen:scaleBySize(200),
@@ -1675,13 +2117,13 @@ function DrillDownPopup:build()
                 FixedBox:new{ width = right_w, height = row_h,
                     align = "right", vertical_align = "center",
                     text(right, faces().footer, { color = Blitbuffer.COLOR_BLACK,
-                        max_width = right_w, bold = true }) },
+                        max_width = right_w }) },
             },
         }
         -- 行间点线（最后一行不画）
         if _i < #self.rows then
             body[#body + 1] = HRule:new{ width = content_w, height = line_w,
-                color = Blitbuffer.COLOR_GRAY_E, dotted = true }
+                color = Blitbuffer.COLOR_BLACK, dotted = true }
         end
     end
 
@@ -1710,8 +2152,70 @@ function DrillDownPopup:build()
     return self
 end
 
+--==========================================================================
+-- ★★★ 50b-no-fallback-flash：「不带刷新参数的 UIManager:show」一律不许用
+--==========================================================================
+--
+--   ── 病因（这一条才是「点击就闪」的真凶）────────────────────────────
+--   老写法 `UIManager:show(w)` **不带 refreshtype**。上游 `show()`
+--   （uimanager.lua:184）把它转成 `setDirty(w, nil, nil)`，而 `_refresh(nil,…)`
+--   是**直接 return** 的（uimanager.lua:1122-1127：「show/close 没带刷新细节时
+--   丢弃，免得排一次没用的全屏刷新」）。
+--   ⇒ 刷新队列一直是空的 ⇒ 最终靠 `_repaint()` 的兜底
+--   （uimanager.lua:1291-1294）补一次 **`_refresh("partial")`** ——
+--   ⚠ **没有 region**。两个后果：
+--     1) region 为 nil ⇒ `_refresh` 把区域填成**整屏**（:1178）
+--        ⇒ 整屏局部刷，在 e-ink 上就是「整块屏幕闪一下」；
+--     2) 更要命的是 :1163-1175 的**提升规则**：没有 region 的 `"partial"`
+--        每 `FULL_REFRESH_COUNT`（默认 6）次会被提升成 **`"full"`**
+--        —— 那是**带黑闪的整屏全刷**。
+--   ⇒ 于是「点周期标签弹选择器 / 点卡片进下钻 / 打开统计页」这些操作，
+--     每做 6 次就有 1 次整屏黑闪、其余 5 次是整屏局部刷 ——
+--     用户感受到的正是「每次点击都闪」。
+--   （43-no-flash 当年只在 `StatisticsPage:reload` 那一条路上堵了这个洞，
+--     其余入口全漏着；49d / 50 又只治了「波形」那一层。）
+--
+--   ── 为什么必须用 lambda 形式 ────────────────────────────────────
+--   要排「带 region 的刷新」就得先知道矩形，但
+--   `FrameContainer:paintTo`（framecontainer.lua:104-114）**只在画过之后**
+--   才写 `self.dimen`（`FrameContainer:getSize()` 是另算一个 Geom、
+--   **不碰** `self.dimen`）
+--   ⇒ `show()` 那一刻 `popup_frame.dimen` / `movable.dimen` 全都还是 nil。
+--   而上游 `setDirty` **支持 lambda**（uimanager.lua:651-659）：
+--   把函数塞进 `_refresh_func_stack`，由 `_repaint` 在**画完之后**求值
+--   （:1279-1287）—— 那时 `dimen` 已经有值了。
+--   ⇒ 这就是「排一条精确到浮窗矩形的刷新」的正确姿势。
+--
+--   ⚠ 模式用 `"[partial]"`（REAGL，不闪）而不是 `"ui"`：PW4 上 `"ui"` = AUTO，
+--     含灰矩形会被驱动挑成 GC16 闪黑（理由与 49d / 50 完全一致）。
+--   ⚠ 顺带解决另一个坑：`ButtonDialog:onShow`（buttondialog.lua:327-331）
+--     自己会排一条 `"ui"` + `movable.dimen`。`_refresh` 的碰撞合并
+--     （uimanager.lua:1188-1203）用 `update_mode` 取**优先级高的**，
+--     `refresh_modes["[partial]"]=6 > refresh_modes["ui"]=3`
+--     ⇒ 我们这条 `"[partial]"` 会把那条 `"ui"` **顶掉**，
+--     所以选择器弹窗也不会再因为 `"ui"` 而闪。
+--   ⚠ 矩形拿不到时（极端情形）返回 nil ⇒ `_refresh` 退回整屏，
+--     但**模式仍是 `"[partial]"`** ⇒ 不会闪、也不会被提升成 full。
+local function widgetRegion(w)
+    if not w then return nil end
+    -- ButtonDialog 的外框是 movable
+    if w.movable and w.movable.dimen then return w.movable.dimen end
+    -- 本插件自己的浮窗（StatisticsPage / DrillDownPopup）
+    if w.popup_frame and w.popup_frame.dimen then return w.popup_frame.dimen end
+    return nil
+end
+
+--- `UIManager:show` 的安全版本：**一定**带一条 `"[partial]"` + 自身矩形。
+--- 返回值就是传进来的 widget，方便 `local p = showNoFlash(X:new{...})`。
+local function showNoFlash(widget)
+    UIManager:show(widget, function()
+        return "[partial]", widgetRegion(widget)
+    end)
+    return widget
+end
+
 local function showDrillDown(parent, plugin, title, rows)
-    UIManager:show(DrillDownPopup:new{
+    showNoFlash(DrillDownPopup:new{
         title = title,
         rows = rows,
     })
@@ -1729,11 +2233,17 @@ local TABS = {
     { value = "total", label = _("总") },
 }
 
+-- ★★★ 50c-calendar：新增「日历」视图 —— 用户原话：
+--   「你做的月历放到哪了，我没看到」→「月历放到总览那一行的轨道里」。
+--   ⇒ 它和「总览 / 阅读趋势 / 阅读字数 / 阅读速度」**同一行**（同一个分段轨道），
+--     不是另开一个入口。46 轮只在 wordcount-ui-preview-7.html 里画过预览，
+--     代码一直没落 —— 这一轮补上。
 local VIEW_TABS = {
     { value = "overview", label = _("总览") },
-    { value = "trend", label = _("阅读趋势") },
-    { value = "units", label = _("阅读字数") },
-    { value = "speed", label = _("阅读速度") },
+    { value = "trend", label = _("趋势") },
+    { value = "units", label = _("字数") },
+    { value = "speed", label = _("速度") },
+    { value = "calendar", label = _("日历") },
 }
 
 local METRICS = {
@@ -1783,6 +2293,22 @@ local StatisticsPage = FocusManager:extend{
     card_style = "box",
     -- ★★★ 34：阅读字数页的**分页**（用户要求左右键翻页，不再上下滑动）
     unit_page = 1,
+    -- ★★★ 50c-calendar：日历视图自己的选择（与别的视图互不干扰）。
+    --   · cal_metric：格子里显示什么 —— units(字数) / speed(速度) / seconds(时间)
+    --   · cal_format：字数怎么写 —— auto(跟随全局「单位切换」设置) / k / wan
+    --     用户原话：「万和k以及速度可以自己选择显示到日历」。
+    --   · cal_speed_unit：速度按什么单位 —— min(字/分钟) / hour(字/小时)
+    --     用户原话：「日历中阅读速度分为每分钟多少字和每小时多少字，可以点击进行切换」。
+    --
+    -- ★★★ 56-cal-time-heat：`cal_metric` 的默认值从 `"units"` 改成 `"seconds"`。
+    --   用户原话：「阅读统计日历以时间显示到日历中」—— 打开日历默认就该看到
+    --   阅读时长，而不是字数。轨道保留（用户确认「保留，默认改成时间」），
+    --   所以字数/速度仍然点得到，只是**初始值**变了。
+    --   ⚠ 这里的默认值就是「打开日历看到什么」，`reload()` 传的是
+    --     `opts.cal_metric or self.cal_metric` ⇒ 从别的视图切进日历也吃这个默认值。
+    cal_metric = "seconds",
+    cal_format = "auto",
+    cal_speed_unit = "min",
     -- ★ 这两个现在表示**浮窗内容区**的尺寸，不再等于整屏
     width = nil,
     height = nil,
@@ -1921,9 +2447,33 @@ function StatisticsPage:onCloseWidget()
     --   正确做法是刷**浮窗自己的矩形**：`self.popup_frame.dimen`。
     --   这样底下书页只有被浮窗遮住的那块需要重画，观感干净、也省电。
     --   `popup_frame` 拿不到时（构建失败等极端情形）才退回整屏。
+    --
+    -- ★★★ 50-close-partial：刷新模式从 `"ui"` 换成 `"[partial]"`（与 49d 同源）。
+    --
+    --   上游 `uimanager.lua:508-518` 的官方建议是「onShow/onUpdate 用 ui、
+    --   onCloseWidget 用 partial」，而且明说 `"ui"` onCloseWidget
+    --   「will ensure never seeing a flash because of that widget」——
+    --   ⚠ **这句话在 PW4 上不成立**：Rex 平台的
+    --     `waveform_ui = WAVEFORM_MODE_AUTO`（`framebuffer_mxcfb.lua:874`），
+    --     而 `refresh_rex` 在非 ZELDA_GLR16 波形下把
+    --     `hist_gray_waveform_mode` 设成 `GC16`（:557-558）
+    --     ⇒ 驱动**按矩形内容挑波形**：纯黑白走 DU（不闪）、含灰走 GC16（整块闪黑）。
+    --   本页浮窗里到处是 `COLOR_DARK_GRAY` 和灰阶抗锯齿文字 ⇒ 这块矩形必然含灰
+    --   ⇒ **每次正常关窗都会闪一下**。
+    --
+    --   `"[partial]"` ⇒ `refreshNoMergePartial` ⇒ `waveform_partial`
+    --   = `WAVEFORM_MODE_ZELDA_GLR16`（REAGL，专为灰度局部刷新设计，不闪），
+    --   且字符串**不等于** `"partial"` ⇒ 不参与 `uimanager.lua:1163` 的
+    --   flashui 提升（带 region 的 "partial" 每 `FULL_REFRESH_COUNT` 拍
+    --   会被提升成 `"flashui"` = 又闪）。理由与 49d 完全一致，
+    --   完整推导见本文件 `StatisticsPage:reload` 上方 49d 的长注释。
+    --
+    --   ⚠ 代价：这块区域不再有「攒够几拍清一次残影」；整屏残影仍由
+    --     阅读器翻页那条 `"partial"` 负责清（计数器是全局的）。
+    --   ⚠ 别改回 `"ui"`（见上）。
     local region = (self.popup_frame and self.popup_frame.dimen) or self.dimen
     if region then
-        pcall(UIManager.setDirty, UIManager, self, "ui", region)
+        pcall(UIManager.setDirty, UIManager, self, "[partial]", region)
     end
 end
 
@@ -1931,22 +2481,38 @@ end
 --- 重建比原地 update 简单可靠得多，代价是一次重绘。
 function StatisticsPage:reload(opts)
     opts = opts or {}
+    local next_period = opts.period or self.period
+    local next_trend_view = opts.trend_view
+    if next_trend_view == nil then
+        if next_period ~= self.period and next_period == "day" then
+            next_trend_view = "list"
+        else
+            next_trend_view = self.trend_view
+        end
+    end
     local ok, next_page = pcall(StatisticsPage.new, StatisticsPage, {
         plugin = self.plugin,
-        period = opts.period or self.period,
+        period = next_period,
         anchor = opts.anchor or self.anchor,
         metric = opts.metric or self.metric,
-        trend_view = opts.trend_view or self.trend_view,
+        trend_view = next_trend_view,
         view = opts.view or self.view,
         unit_sort = opts.unit_sort or self.unit_sort,
         card_style = opts.card_style or self.card_style,
         -- 翻页：显式传了就按传的，没传就回到第 1 页
         -- （只有在「同一个 units 视图内翻页」时才显式传 unit_page）
         unit_page = opts.unit_page or 1,
+        -- ★★★ 50c：日历视图的两个选择，同样「显式传了按传的，没传沿用自己」。
+        cal_metric = opts.cal_metric or self.cal_metric,
+        cal_format = opts.cal_format or self.cal_format,
+        -- ★★★ 56：速度单位（字/分钟 ↔ 字/小时）同理。
+        cal_speed_unit = opts.cal_speed_unit or self.cal_speed_unit,
     })
     if not ok then
         logger.err("WordCount: statistics page build failed", next_page)
-        UIManager:show(InfoMessage:new{ text = T(_("统计页面打开失败：%1"), tostring(next_page)) })
+        -- ★★★ 50b：错误提示也要走 showNoFlash —— 裸的 `UIManager:show` 会触发
+        --   `_repaint` 兜底排一条**整屏**无 region 的 "partial"（见 showNoFlash 注释）。
+        showNoFlash(InfoMessage:new{ text = T(_("统计页面打开失败：%1"), tostring(next_page)) })
         return self
     end
     -- ★ 26-popup：重建时不要先 close 再 show —— 那会在 e-ink 上闪一下
@@ -1982,19 +2548,76 @@ function StatisticsPage:reload(opts)
     --          而 `ScrollableContainer` 有 `dimen`（= frame_w × available_h），
     --          `WidgetContainer:getSize()` 见 dimen 就直接返回它 ——
     --          所以浮窗尺寸与内容高矮无关，`CenterContainer` 的居中位置也不变。
-    --     · 模式 = `"ui"`（不是 "partial"）。
-    --       ✅ "ui" **不在**提升名单里（名单里只有 "partial"），永远不会被
-    --          提升成带黑闪的 "full"；同时它仍是 e-ink 上的灰阶局部刷新，
-    --          不是 "flashui" 那种闪。
+    --     · 模式 = `"[partial]"`（**不是** "ui"，也**不是** "partial"）。
     --     · 排了刷新 ⇒ `_repaint()` 的兜底不再触发，也就不会再有整屏刷新。
     --
     --   ⚠ `popup_frame` 拿不到时（构建失败等极端情形）退回老写法，
     --     宁可多刷一次也不能不刷。
+    --
+    -- ★★★ 49d-refresh-partial：模式从 `"ui"` 改成 `"[partial]"`。
+    --
+    --   用户原话：「为什么导航栏选中黑色闪烁后才是灰色选中」。
+    --
+    --   ── 病因（分两层，两层都查过源码）──────────────────────────────
+    --   ① 插件侧是干净的（已实测）：点一下标签，`reload()` 只排 **1 条**
+    --      刷新 —— `mode = "ui"`、`region = 浮窗矩形`；不含 "full"、
+    --      不含 "flashui"；`refresh_count` 也不动（"ui" 不在提升名单里）。
+    --      ⇒ 43-no-flash 修掉的那个「partial → full 提升」**不是**这次的原因。
+    --   ② 黑闪出在**驱动挑波形**这一步。PW4 是 Rex 平台
+    --      （`frontend/device/kindle/device.lua:1076-1078` 的 `isRex = yes`），
+    --      而 Rex/Zelda 的 `waveform_ui = WAVEFORM_MODE_AUTO`
+    --      （`ffi/framebuffer_mxcfb.lua:874`）—— **不是**老机型的 `GC16_FAST`。
+    --      `"ui"` ⇒ `refreshUIImp` ⇒ `mech_refresh(false, AUTO)`（:789-792）
+    --      ⇒ `refresh_rex` 里 `hist_bw_waveform_mode = DU`（:557）、
+    --      `hist_gray_waveform_mode = GC16`（:558）
+    --      ⇒ **驱动按这个矩形的内容挑波形：纯黑白走 DU（1bit 直写，快、不闪），
+    --      含灰就走 GC16（16 级全波形 = 闪黑）。**
+    --      49-nav-thumb 把选中块从 `COLOR_BLACK` 换成 `COLOR_DARK_GRAY(0x88)`，
+    --      而选中块是导航栏里**面积最大**的一块 ⇒ 这块矩形里出现大块实心灰
+    --      ⇒ 波形从 DU 跳到 GC16 ⇒ 就是用户看到的那一下黑闪。
+    --      （轨道边框在 49 **之前**就已经是 `COLOR_DARK_GRAY` 了，新增的是
+    --        「大块实心灰」，不是「第一次出现灰」。）
+    --
+    --   ── 为什么是 `"[partial]"` 而不是 `"partial"` ────────────────────
+    --   PW4 的 `waveform_partial = self.waveform_reagl = WAVEFORM_MODE_ZELDA_GLR16`
+    --   （`framebuffer_mxcfb.lua:879-880`）—— REAGL 就是**专为灰度局部刷新**
+    --   设计的波形：能出 16 级灰，但不像 GC16 那样走一整轮黑→白全波形，
+    --   所以**不闪**、也不需要抖动。（`is_flashing` 同样是 false，
+    --   `update_mode` 仍是 `UPDATE_MODE_PARTIAL`，见 :353。）
+    --
+    --   ⚠ 但不能直接用 `"partial"`：`uimanager.lua:1163` 的提升名单是
+    --     **字符串精确等于 "partial"**，带 region 的 "partial" 每
+    --     `FULL_REFRESH_COUNT` 拍会被提升成 `"flashui"`（:1168）
+    --     —— 那又是一次黑闪，等于把 43 的坑重新踩一遍。
+    --     而 `"[partial]"` 走 `refreshNoMergePartial` ⇒ `refreshPartialImp`
+    --     ⇒ 同一个 REAGL 波形，**但字符串不匹配** ⇒ 永远不参与提升。
+    --     ⇒ 一次拿到「灰度 + 不闪 + 不被提升」三样。
+    --
+    --   ⚠ 代价说清楚：
+    --     · `"[partial]"` 是「不合并」语义（`refreshNoMerge*`），不会和同帧
+    --       其它刷新合并。本页一次只排这一条，没有影响。
+    --     · 不参与提升 ⇒ 这块区域的「攒够几拍清一次残影」也没了。但整屏的
+    --       周期全刷由**阅读器翻页**那条 "partial" 负责，计数器是全局的，
+    --       所以残影照样会被清掉，不会累积。
+    --     · 非 Rex/Zelda 的机型上 `waveform_partial` 是 `GL16_FAST`（老 Kindle）
+    --       或 `GL16`/`AUTO`（Kobo）—— 都仍是局部刷新、都不是 GC16，不会更差。
+    --     · `avoid_flashing_ui`（「避免 UI 黑闪」）只降级 flashui/flashpartial/
+    --       带 region 的 partial，**不会**把 `"[partial]"` 改成 "ui"
+    --       ⇒ 用户开不开这个开关，行为一致。
+    --
+    --   ⚠ 别把这里改回 `"ui"`：在 PW4 上 "ui" = AUTO，一旦这块矩形含灰就闪。
+    --     要再动这个模式，先看 `test_refresh_path.lua`（把上游 uimanager 的
+    --     `show/close/setDirty/_refresh/_repaint` 原样抠出来跑）和
+    --     `test_reload_49d.lua`（跑本函数的真源码）。
     local refresh_region = self.popup_frame and self.popup_frame.dimen or nil
     if refresh_region then
-        UIManager:show(next_page, "ui", refresh_region)
+        UIManager:show(next_page, "[partial]", refresh_region)
     else
-        UIManager:show(next_page)
+        -- ★★★ 50b：矩形拿不到时**也不能**退回裸 show（那会走 `_repaint` 兜底排
+        --   整屏无 region 的 "partial"，每 6 次提升成 full = 整屏黑闪）。
+        --   `showNoFlash` 的 lambda 会在新页画完之后再取一次它自己的矩形，
+        --   既安全又精确。
+        showNoFlash(next_page)
     end
     return next_page
 end
@@ -2111,27 +2734,52 @@ function StatisticsPage:build()
     local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
     local memo_key = statMemoKey(self.plugin, self.period, self.anchor, self.view)
 
-    local summary = memoGet(self.plugin, "summary:" .. tostring(self.period)
-        .. "|" .. tostring(self.anchor), memo_key)
-        or memoSet(self.plugin, "summary:" .. tostring(self.period)
-            .. "|" .. tostring(self.anchor), memo_key,
-            GlobalStats.summarize(store, self.period, self.anchor))
-    local previous
-    if self.period ~= "total" then
-        local prev_anchor = GlobalStats.shiftAnchor(self.period, self.anchor, -1)
-        local pkey = "prev:" .. tostring(self.period) .. "|" .. tostring(self.anchor)
-        previous = memoGet(self.plugin, pkey, memo_key)
-            or memoSet(self.plugin, pkey, memo_key,
-                GlobalStats.summarize(store, self.period, prev_anchor))
+    -- ── ★★★ 57-kpw4-perf：这四样**按视图按需算**，不要无条件算 ──
+    --
+    --   57 之前这里是「不管当前是哪个视图，先算齐再说」：
+    --       summary / previous  ← 只有「总览」用
+    --       buckets / selected  ← 只有「趋势」「速度」用
+    --     而 `GlobalStats.summarize` 是
+    --       `for date, row in pairs(store.days)`  ← **O(全部历史天数)**
+    --     两遍（本期 + 上期）；`trend` 在 year/total 口径下还要
+    --     `for i = 0, 11` 里再套一遍 `pairs(store.days)` ⇒ O(12 × 天数)。
+    --
+    --   代价在 KPW4 上是要看得见的：memo 的键里带了 `view`
+    --   （`statMemoKey(..., self.view)`），所以**从「总览」点进「日历」时
+    --   一定是 cache miss** ⇒ 日历页开一次就白算两遍 summarize + 一遍 trend，
+    --   结果一个字节都没用上（日历的月份数据走它自己的 `cal:` 缓存槽）。
+    --   读得越久 store.days 越大，白算得越久 —— 正好坑在老设备上。
+    --
+    --   现在改成只在真用得着的视图里算：
+    --     overview → summary + previous
+    --     trend / speed → buckets + selected
+    --     units / calendar → 两样都不算（它们各有自己的数据源）
+    local summary, previous
+    if self.view == "overview" then
+        summary = memoGet(self.plugin, "summary:" .. tostring(self.period)
+            .. "|" .. tostring(self.anchor), memo_key)
+            or memoSet(self.plugin, "summary:" .. tostring(self.period)
+                .. "|" .. tostring(self.anchor), memo_key,
+                GlobalStats.summarize(store, self.period, self.anchor))
+        if self.period ~= "total" then
+            local prev_anchor = GlobalStats.shiftAnchor(self.period, self.anchor, -1)
+            local pkey = "prev:" .. tostring(self.period) .. "|" .. tostring(self.anchor)
+            previous = memoGet(self.plugin, pkey, memo_key)
+                or memoSet(self.plugin, pkey, memo_key,
+                    GlobalStats.summarize(store, self.period, prev_anchor))
+        end
     end
     local _first, _last, range_label = GlobalStats.bounds(self.period, self.anchor)
-    local page_metric = self.view == "speed" and "speed" or self.metric
-    local trend_key = "trend:" .. tostring(self.period) .. "|" .. tostring(self.anchor)
-        .. "|" .. tostring(page_metric)
-    local buckets = memoGet(self.plugin, trend_key, memo_key)
-        or memoSet(self.plugin, trend_key, memo_key,
-            GlobalStats.trend(store, self.period, self.anchor, page_metric))
-    local selected = self:selectedIndex(buckets)
+    local buckets, selected
+    if self.view == "trend" or self.view == "speed" then
+        local page_metric = self.view == "speed" and "speed" or self.metric
+        local trend_key = "trend:" .. tostring(self.period) .. "|" .. tostring(self.anchor)
+            .. "|" .. tostring(page_metric)
+        buckets = memoGet(self.plugin, trend_key, memo_key)
+            or memoSet(self.plugin, trend_key, memo_key,
+                GlobalStats.trend(store, self.period, self.anchor, page_metric))
+        selected = self:selectedIndex(buckets)
+    end
 
     -- ★★★ 26-scroll-header（用户要求）：
     --   「顶部那一条能不能也随着下滑一起消失？就保留中间那个滚动的区域」
@@ -2181,21 +2829,39 @@ function StatisticsPage:build()
     --   specs 的顺序（把这两张卡挪到数组头部）—— 它们是「卡片网格」里
     --   的同级卡片，位置就该在网格内部体现，而不是在网格外面另起一块。
     body[#body + 1] = self:buildViewTabs(content_w)
-    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-    body[#body + 1] = self:buildTabs(content_w)
-    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-    body[#body + 1] = self:buildPeriodNav(content_w, range_label)
-    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-    if self.view == "overview" then
-        -- ★★★ 34：卡片样式切换行（只在总览视图出现，换来换去才有意义）
-        body[#body + 1] = self:buildCardStyleRow(content_w)
-        body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-        body[#body + 1] = self:buildCardGrid(content_w, summary, previous)
-    elseif self.view == "units" then
-        body[#body + 1] = self:buildUnitsPage(content_w)
+    body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
+    if self.view == "calendar" then
+        -- ★★★ 50c-calendar：日历视图**不显示**「日/周/月/年/总」那条周期轨道 ——
+        --   日历自带月份导航（‹ 2026 年 10 月 ›），两条导航并存会让人不知道
+        --   该点哪个；而且「日历 + 周期 = 周」这种组合本身没有意义。
+        -- ★★★ 53-cal-fit：把「这一页真正能用的高度」传给日历页。
+        --   = available_h − 本页以上已占的高度（标题栏 + 间距 + 视图轨道 + 页尾间距）。
+        --   ⚠ 这里必须用**实测**的 body 高度，不能估 ——
+        --     上游 `TitleBar:getSize()` 返回的是它自己 init 里算的
+        --     `self.dimen`（titlebar.lua:349），和图标大小 / 标题行数有关。
+        local above_h = 0
+        for _i = 1, #body do
+            local sz = body[_i]:getSize()
+            above_h = above_h + ((sz and sz.h) or 0)
+        end
+        local cal_avail = available_h - above_h - Size.span.vertical_large
+        body[#body + 1] = self:buildCalendarPage(content_w, cal_avail)
     else
-        body[#body + 1] = self:buildTrendSection(content_w, buckets, selected,
-            self.view == "speed" and "speed" or nil)
+        body[#body + 1] = self:buildTabs(content_w)
+        body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
+        body[#body + 1] = self:buildPeriodNav(content_w, range_label)
+        body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
+        if self.view == "overview" then
+            -- ★★★ 34：卡片样式切换行（只在总览视图出现，换来换去才有意义）
+            body[#body + 1] = self:buildCardStyleRow(content_w)
+            body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
+            body[#body + 1] = self:buildCardGrid(content_w, summary, previous)
+        elseif self.view == "units" then
+            body[#body + 1] = self:buildUnitsPage(content_w)
+        else
+            body[#body + 1] = self:buildTrendSection(content_w, buckets, selected,
+                self.view == "speed" and "speed" or nil)
+        end
     end
     body[#body + 1] = VerticalSpan:new{ width = Size.span.vertical_large }
     -- ★★★ 32：**删掉「退出」按钮**。
@@ -2241,7 +2907,7 @@ function StatisticsPage:build()
     self.popup_frame = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE,
         bordersize = Screen:scaleBySize(2),
-        color = Blitbuffer.COLOR_GRAY_E,
+        bordercolor = Blitbuffer.COLOR_BLACK,
         radius = Screen:scaleBySize(12),
         padding = 0,
         margin = 0,
@@ -2282,87 +2948,849 @@ end
 ---   反而没有这个问题（所以只有周期排看起来脏）—— 但两排观感不一致。
 ---
 ---   现在两排统一走标准分段控件：
----     · 外框**只画一圈**（浅灰描边 + `radius` 圆角 + 白底）；
----     · 格子内部**不画边框**，格与格之间插一条浅灰竖线；
+---     · 外框**只画一圈**（2px 黑边 + `radius` 圆角 + 白底）；
+---     · 格子内部**不画边框**，格与格之间插一条 2px 黑竖线（单线，不叠）；
 ---     · 选中格填黑，圆角取 `radius - 边宽` ⇒ 贴到两端时正好与外框内缘吻合，
 ---       不会在角上露出白缝。
+--- ★★★ 45c-segfill：分段控件的「选中填充」—— **完整覆盖自己的格子**，
+---   而且只在需要的那一侧做圆角。
+---
+--- 45 轮用户两次反馈「导航栏选中的填充还是不完整」，真因有两处，
+--- 都出在 `FrameContainer` 身上（上游 `ui/widget/container/framecontainer.lua`）：
+---
+---   ① `FrameContainer:getSize()` **忽略** 构造时传进来的 `width` / `height`
+---      —— 它只按 `子控件尺寸 + 2*(margin+bordersize+padding)` 反推。
+---      所以本文件里凡是「用一个 1×1 占位子控件 + width/height 想撑出
+---      `sep_w × inner_h`」的写法，**实际只画了 1×1 像素**。
+---      分段控件那条「2px 分隔线」在设备上根本不存在，只剩一个点
+---      ⇒ 未选中的格子之间没有分界，整排看着就是一块白，选中格孤零零的。
+---   ② `radius` 是**四角同一个值**（`bb:paintRoundedRect` 只收一个 radius）。
+---      选中格一旦落在中间（「月」「阅读字数」），四个角各留一个白缺口
+---      ⇒ 这正是「填充不完整」。
+---
+--- 这个控件只做一件事：按给定 (宽, 高) 画一个实心矩形（四角可选圆角），
+--- 再把自己的子控件（文字）居中画上去。
+---   两侧半径都取 0 时**退化成完整矩形**（45c 的用法，填充严丝合缝）。
+--- 45c 的圆角用 `bb:paintCircle`（省略 w ⇒ 实心圆）拼出来：
+---   中间竖带 + 左带 + 右带 + 最多 4 个角圆，并集就是圆角矩形。
+---
+--- ★★★ 49-nav-thumb：新增 `radius`（**四角同一个值**）。
+---
+---   49 轮用户选了「候选 D ⑦」：导航栏改成「白底圆角轨道 + 一块内缩的圆角滑块」。
+---   滑块四角都要圆，而 `radius_left` / `radius_right` 只能分别管左右两侧 ——
+---   拼不出「四角同圆角」。所以加一个 `radius`：
+---     · `radius > 0` ⇒ 直接走 `bb:paintRoundedRect(x, y, w, h, c, r)`
+---       （上游 blitbuffer.lua:2169，签名是 **(x, y, w, h, c, r)** —— 颜色在前、
+---        半径在后，别按直觉写反）；
+---     · `radius == 0`（缺省）⇒ 走下面原来那套 left/right 拼接，行为**完全不变**。
+---   ⚠ 两条路互斥：`radius` 一旦给了就忽略 `radius_left` / `radius_right`。
+---     本控件目前只有 `buildSegmentedRow` 一个调用点，所以不存在兼容问题。
+local SegFill = WidgetContainer:extend{
+    width = nil,
+    height = nil,
+    radius = 0,          -- ★ 49：四角同圆角（>0 时优先于下面两个）
+    radius_left = 0,
+    radius_right = 0,
+    color = Blitbuffer.COLOR_BLACK,
+    -- ★★★ 52-cell-fit：可选**描边**（默认 0 ⇒ 完全不画，行为与 49 版一致）。
+    --   日历格子靠它把「格子的边界」画出来 —— 之前所有格子都是白底，
+    --   白底压在白色卡片上 ⇒ 用户看到的是「格子填充不完全 / 看不出格子」。
+    --   ⚠ 只在 `radius == 0` 的矩形分支生效；圆角分支（分段轨道滑块）
+    --     不画边框，因为圆角矩形的描边要另一套画法，而那里本来就不需要。
+    border_size = 0,
+    border_color = nil,
+}
+
+function SegFill:getSize()
+    return Geom:new{ x = 0, y = 0, w = self.width or 0, h = self.height or 0 }
+end
+
+function SegFill:paintTo(bb, x, y)
+    local w, h = self.width or 0, self.height or 0
+    self.dimen = Geom:new{ x = x, y = y, w = w, h = h }
+
+    -- ★★★ 49-nav-thumb：四角同圆角这条路（见控件头的注释）。
+    local four_r = math.floor(self.radius or 0)
+    if four_r > 0 then
+        -- `paintRoundedRect` 内部自己会把 r 夹到 h/2 / w/2，这里不用再夹。
+        bb:paintRoundedRect(x, y, w, h, self.color, four_r)
+        local child = self[1]
+        if child then
+            local cs = child:getSize()
+            child:paintTo(bb, x + math.floor((w - cs.w) / 2),
+                y + math.floor((h - cs.h) / 2))
+        end
+        return
+    end
+    local max_r = math.floor(math.min(w, h) / 2)
+    local rl = math.max(0, math.min(self.radius_left or 0, max_r))
+    local rr = math.max(0, math.min(self.radius_right or 0, max_r))
+    local c = self.color
+
+    -- 中间竖带：从左圆角区右缘到右圆角区左缘，通高
+    local mid_w = w - rl - rr
+    if mid_w > 0 then
+        bb:paintRect(x + rl, y, mid_w, h, c)
+    end
+    if rl > 0 then
+        local band_h = h - 2 * rl
+        if band_h > 0 then
+            bb:paintRect(x, y + rl, rl, band_h, c)
+        end
+        bb:paintCircle(x + rl, y + rl, rl, c)
+        bb:paintCircle(x + rl, y + h - 1 - rl, rl, c)
+    end
+    if rr > 0 then
+        local band_h = h - 2 * rr
+        if band_h > 0 then
+            bb:paintRect(x + w - rr, y + rr, rr, band_h, c)
+        end
+        bb:paintCircle(x + w - 1 - rr, y + rr, rr, c)
+        bb:paintCircle(x + w - 1 - rr, y + h - 1 - rr, rr, c)
+    end
+
+    -- ★★★ 52-cell-fit：可选描边（日历格子用它把边界画出来）。
+    --   ⚠ 画在**填充之后、文字之前** —— 这样边框压在底色上，文字仍然清晰。
+    --   ⚠ 只在 `radius == 0` 的矩形分支生效（圆角分支上面已经 return 了）。
+    local bsz = math.floor(self.border_size or 0)
+    if bsz > 0 and self.border_color then
+        local bc = self.border_color
+        local t = math.min(bsz, math.floor(h / 2))
+        local v = math.min(bsz, math.floor(w / 2))
+        if t > 0 then
+            bb:paintRect(x, y, w, t, bc)                        -- 上边
+            bb:paintRect(x, y + h - t, w, t, bc)                -- 下边
+        end
+        if v > 0 then
+            bb:paintRect(x, y, v, h, bc)                        -- 左边
+            bb:paintRect(x + w - v, y, v, h, bc)                -- 右边
+        end
+    end
+
+    -- 子控件（文字）居中
+    local child = self[1]
+    if child then
+        local cs = child:getSize()
+        child:paintTo(bb, x + math.floor((w - cs.w) / 2), y + math.floor((h - cs.h) / 2))
+    end
+end
+
 local function buildSegmentedRow(opts)
     local width = opts.width
     local height = opts.height
-    local radius = opts.radius or Size.radius.button
+    local radius = opts.radius or Screen:scaleBySize(NAV_TRACK_RADIUS_PX)
     local items = opts.items or {}
     local border = Screen:scaleBySize(1)              -- 2px
-    local inner_w = math.max(1, width - 2 * border)
-    local inner_h = math.max(1, height - 2 * border)
+    -- ★★★ 49-nav-thumb：新增**轨道内边距**（用户选的候选 D ⑦）。
+    --   原来 padding = 0 ⇒ 选中格紧贴外框内缘，只能靠「只圆贴边那一侧」来
+    --   将就外框的圆角（45c 的 SegFill radius_left/right）。
+    --   现在滑块要**四角都圆**并且**从边框缩进去一圈**，所以给轨道加 6px
+    --   内边距（预览 3px），格子只占内边距围出来的那块。
+    local pad = Screen:scaleBySize(NAV_TRACK_PAD_PX)
+    -- ★★★ 53-cal-fit：**行高自动长到放得下最高的那个标签**。
+    --   设计常量（ROW_TAB_H_PX / CAL_FMT_ROW_H_PX）是按「设计字号」定的，
+    --   而 `Font:getFace` 会把字号乘一遍 `scaleBySize`（见 faceLineH 的注释），
+    --   所以真实字高比设计值大得多：`f.tab` 实际是 `scaleBySize(21) = 38px`、
+    --   行高 52px，而「写法轨道」内高只有 `61 - 2*2 - 2*6 = 45px`
+    --   ⇒ 自动 / k / 万 三个字上下各被切 3~4px。
+    --   这里只**长不缩**：视图轨道(83)、周期轨道(83)、指标轨道(83) 内高 67
+    --   都还装得下 52，所以它们一点不变；只有写法轨道会被撑到 68。
+    for _i, it in ipairs(items) do
+        local need = faceLineH(it.face) + 2 * (border + pad)
+        if need > height then height = need end
+    end
+    local inner_w = math.max(1, width - 2 * border - 2 * pad)
+    local inner_h = math.max(1, height - 2 * border - 2 * pad)
     local n = math.max(1, #items)
-    local sep_w = border
-    local cell_w = math.floor((inner_w - sep_w * (n - 1)) / n)
+    -- ★★★ 45e：**去掉格与格之间的竖线分隔**（用户回执：「这个不要中间的
+    --   竖线分隔」）。改回「纯留白 + 选中填黑」—— 格子均分整个内宽，
+    --   不再为分隔线预留位置。45c 那条竖线（SolidRect）整段删掉。
+    local cell_w = math.floor(inner_w / n)
 
     local row = HorizontalGroup:new{ align = "center" }
     for i, it in ipairs(items) do
-        if i > 1 then
-            -- 分隔线：浅灰窄条，避免和黑底选中项争抢注意力。
-            -- ⚠ `FrameContainer` 必须有子控件（`getSize()` 会取 `self[1]`），
-            --   所以塞一个 1×1 的 `FixedBox` 占位；实际尺寸由 `width/height` 决定。
-            row[#row + 1] = FixedBox:new{
-                width = sep_w, height = inner_h,
-                FrameContainer:new{
-                    width = sep_w, height = inner_h,
-                    bordersize = 0, margin = 0, padding = 0,
-                    background = Blitbuffer.COLOR_GRAY_E,
-                    FixedBox:new{ width = 1, height = 1 },
-                },
-            }
-        end
-        local label
-        if it.icon then
-            label = icon(it.icon, Screen:scaleBySize(16), { white = it.active })
-        else
-            label = text(it.label, it.face, {
-                color = it.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-                bold = it.active,
-                max_width = math.max(1, cell_w - Screen:scaleBySize(6)),
-            })
-        end
+        -- 取整的余数补给最后一格，保证整排严丝合缝贴住内边距的内缘
+        -- （否则右边会留一条 1~4px 的白缝）。
+        local cw = (i == n) and (inner_w - cell_w * (n - 1)) or cell_w
+        local label = text(it.label, it.face, {
+            color = it.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+            bold = it.active,
+            max_width = math.max(1, cw - Screen:scaleBySize(6)),
+            -- ★★★ 53-cal-fit：同日历格子，去掉 TextWidget 白送的 2×4px。
+            --   `FixedBox{vertical_align = "center"}` 仍然把字居中，
+            --   视觉位置和以前**一模一样**，只是不再多占 8px 高度。
+            padding = 0,
+        })
         local inner = FixedBox:new{
-            width = cell_w, height = inner_h,
+            width = cw, height = inner_h,
             align = "center", vertical_align = "center", label,
         }
         if it.active then
-            inner = FixedBox:new{
-                width = cell_w, height = inner_h,
-                align = "center", vertical_align = "center",
-                FrameContainer:new{
-                    width = cell_w, height = inner_h,
-                    bordersize = 0, margin = 0, padding = 0,
-                    background = Blitbuffer.COLOR_BLACK,
-                    radius = math.max(0, radius - border),
-                    FixedBox:new{
-                        width = cell_w, height = inner_h,
-                        align = "center", vertical_align = "center", label,
-                    },
-                },
+            -- ★★★ 51-nav-thumb-black：选中块 = **四角同圆角**的滑块，颜色
+            --   `COLOR_BLACK`（用户：「选中的导航栏还是深色吧」）。
+            --
+            --   ── 为什么现在敢用纯黑（49 那轮不敢）────────────────────────
+            --   49 把滑块从 `COLOR_BLACK` 退成 `COLOR_DARK_GRAY(0x88)`，
+            --   理由是「大块实心灰/黑 + 抗锯齿灰字 ⇒ 该矩形含灰 ⇒ 波形从 DU
+            --   跳到 GC16 ⇒ 黑闪」。但那条链只在**排 `"ui"`** 时成立：
+            --   PW4 的 `waveform_ui = WAVEFORM_MODE_AUTO`
+            --   （`ffi/framebuffer_mxcfb.lua:874`）⇒ `refresh_rex` 里
+            --   `hist_bw = DU` / `hist_gray = GC16`（:557-558）⇒ **驱动按矩形
+            --   内容挑波形**。
+            --   50/51 起，本插件所有弹窗与页面切换统一排 `"[partial]"`
+            --   ⇒ `refreshNoMergePartial` ⇒ `refreshPartialImp`
+            --   ⇒ `waveform_partial = WAVEFORM_MODE_ZELDA_GLR16`（:879-880）
+            --   ⇒ `refresh_rex` 走 ZELDA_GLR16 分支（:516）⇒
+            --   `hist_bw = hist_gray = REAGL` ⇒ **波形与矩形内容无关**。
+            --   ⇒ 滑块是纯黑还是深灰，对刷新行为**没有任何影响**。
+            --
+            --   ⚠ 所以：**别在没确认刷新模式的情况下单独把这个颜色改来改去**。
+            --     真正决定「闪不闪」的是刷新模式（`"[partial]"`），不是这个
+            --     颜色。改动前后请跑 `test_noflash_50b.lua`（钉死全插件无裸
+            --     `UIManager:show`）与 `test_refresh_path.lua`。
+            --
+            --   和 45c 那版的区别（形状，与颜色无关）：
+            --     · 45c：`radius_left`/`radius_right` **只圆贴外框的那一侧**，
+            --       padding = 0，滑块**顶到边框内缘**（方角那一侧就靠边框挡着）；
+            --     · 现在：轨道有 6px 内边距，滑块**四角都圆**，四周都留白 ——
+            --       这才是「圆角轨道 + 圆角滑块」该有的样子。
+            --   ⚠ 半径取 `NAV_THUMB_RADIUS_PX`（预览 9px = 设备 17px），
+            --     比轨道半径小 2px，视觉上滑块是「嵌在轨道里」的。
+            inner = SegFill:new{
+                width = cw, height = inner_h,
+                radius = Screen:scaleBySize(NAV_THUMB_RADIUS_PX),
+                color = Blitbuffer.COLOR_BLACK,
+                label,
             }
         end
         if it.on_tap then
             inner = TapBox:new{ inner, on_tap = it.on_tap }
         end
-        row[#row + 1] = FixedBox:new{ width = cell_w, height = inner_h, inner }
+        row[#row + 1] = FixedBox:new{ width = cw, height = inner_h, inner }
     end
 
+    -- ★★★ 49-nav-thumb：外框 = 白底 + `COLOR_DARK_GRAY` 边框 + 圆角 + 内边距。
+    --   ⚠ `FrameContainer:getSize()` **忽略**构造时传的 width/height，
+    --     只按「子控件 + 2*(margin + bordersize + padding)」反推 ——
+    --     所以 `padding` 必须在这里真的传下去，否则尺寸会算少 12px。
+    --     （45c 的「填充不完整」就是这个 getSize 坑的另一面，见上面的注释。）
     return FixedBox:new{
         width = width, height = height,
         align = "center", vertical_align = "center",
         FrameContainer:new{
             width = width, height = height,
             bordersize = border,
-            color = Blitbuffer.COLOR_GRAY_E,
+            color = Blitbuffer.COLOR_DARK_GRAY,
             radius = radius,
-            margin = 0, padding = 0,
+            margin = 0, padding = pad,
             background = Blitbuffer.COLOR_WHITE,
             row,
         },
     }
+end
+
+--==========================================================================
+-- ★★★ 50c-calendar：日历视图
+--==========================================================================
+--
+-- 用户要求（原话）：
+--   「你做的月历放到哪了，我没看到」→「月历放到总览那一行的轨道里」。
+-- ⇒ 「日历」是 VIEW_TABS 的第 5 项，和「总览 / 阅读趋势 / …」同一个分段轨道。
+--
+-- 形态（对齐 46 轮 wordcount-ui-preview-7.html 里拍板过的设计）：
+--     视图轨道（总览 / 阅读趋势 / 阅读字数 / 阅读速度 / 日历）
+--     指标轨道：字数 / 速度 / 时间
+--     单位轨道：自动 / k / 万（**只在「字数」下出现**）
+--              字/分钟 / 字/小时（**只在「速度」下出现**，★ 56 新增）
+--     ‹  2026 年  ›     ← 这一行切**年**
+--     ‹  10 月    ›     ← 这一行切**月**
+--     一 二 三 四 五 六 日
+--     日期格子（日期数字 + 当天数值；底色按当天数值深浅 = 热力图）
+--
+-- 每格点一下 ⇒ 跳到那天的**日视图**（和日选择器 `showDayPicker` 行为一致）。
+--
+-- 数据来源：`GlobalStats.trend(store, "month", anchor, cal_metric)`
+--   —— 它返回的 buckets 就是「1 号 … 月末」逐日一条（`label` 是 "%02d"，
+--   见 global_stats.lua:694-702），正好拿来填格子，不用另写一套取数逻辑。
+--
+-- ⚠ 日历视图下**不显示**「日/周/月/年/总」那条周期轨道（见 build() 里
+--   `if self.view == "calendar" then` 那一段）：日历自带月份导航，
+--   而且「日历 + 周期=周」这种组合本身没有意义。
+--
+-- ★★★ 56-cal-time-heat（用户原话）：
+--   「阅读统计日历以时间显示到日历中，时间的格式为 9h，7h18m，13m 这种形式显示，
+--     并显示相应的热力图」
+--   「日历中阅读速度分为每分钟多少字和每小时多少字，可以点击进行切换」
+--
+--   ① **默认指标改成「时间」**（见 StatisticsPage 的 `cal_metric` 默认值）。
+--   ② **时间文案改成 `9h` / `7h18m` / `13m`** —— 旧的写法是
+--      `>= 1 小时 → "1.5h"`、否则 `"23分"`。新写法是「时、分各一段」，
+--      有分才写分：1 小时整 → `1h`，1 小时 5 分 → `1h5m`，13 分钟 → `13m`。
+--      不足 1 分钟写空串（格子宽 ~129px，`0m` 是噪音）。
+--   ③ **热力图**：格子的**底色**按当天数值的深浅分 4 档
+--      （白 / 0xEE / 0xCC / 0xAA / 0x88），比例的分母是「当月最大的一天」。
+--      最深那一档的文字**反白**，保证对比度（e-ink 上 0x88 底 + 黑字会糊）。
+--   ④ **「今天」不再整格反白**，改成「日期加粗 + 一圈 1px 黑描边」
+--      （用户选的方案）—— 底色让给热力图，今天仍然一眼看得出来。
+--      ⚠ 只框**今天这一格**，不会变回 52b 那版「整张日历切成一张网」的网格线。
+--   ⑤ **速度单位轨道**：`字/分钟` ↔ `字/小时`。`GlobalStats.trend` 给的 speed
+--      是**字/分钟**（global_stats.lua:730），选「字/小时」时乘 60。
+--      热力图用的是**同一个换算后的值**，所以切单位不会改变深浅分布。
+--
+-- ★★★ 57-kpw4-perf：**热力图是「指标无关」的** —— 字数 / 速度 / 时间
+--   三种指标**都**有热力图，不是只有时间有。逐日循环里没有任何
+--   `if metric == ...` 分支：取值（`calendarCellValue`）→ 文案
+--   （`calendarCellText`）→ 分档（`heatLevel(value, max_value)`）三件事
+--   共用同一个 `value`，分母是各自指标口径下的当月最大值。
+--
+--   ⚠ 三条**开销约束**（KPW4 很老，这些不是可选项）：
+--     · 分档**不许**引入 store 访问 —— 分母扫描是纯数组遍历（≤31 个元素），
+--       循环体里连 `store` 这个词都不出现；
+--     · 每格**只算一次 value**，文案与档位共用（不是各算一遍）；
+--     · 每次构建**只调一次** `GlobalStats.trend`（走 memo，不是每格一次），
+--       且**不调** `GlobalStats.summarize`（日历不需要总览汇总）。
+--   这三条由 `test_calendar_heat_all_metrics_57.lua` §E 从源码文本上断言。
+--
+--   ⚠ 高度账（KPW4：scaleBySize 系数 1.7867、available_h = 1158）：
+--     标题栏 **95**（按上游 titlebar.lua:86-341 实算，不是估的：
+--       标题字 `x_smalltfont 22` → 40px → 行高 55，padding 0
+--       title_top_padding = round(43×0.85 + 20 − round(40×1.069)) = 14
+--       title_group 14+55 = 69；filler = 69 + max(14, 9) = 83；
+--       底线 `Size.line.thick` = 3；bottom_v_padding `Size.padding.default` = 9
+--       ⇒ 69 + 14 + 3 + 9 = **95**）
+--     网格以上 = 95 + span 4 + 视图轨道 83 + span 9 = 191
+--     cal_avail = 1158 − 191 − 9 = 958
+--     日历页「网格以上」：
+--       时间 → 指标轨道 83 + span 4 + 导航 134 + span 4 = 225 ⇒ 网格预算 733
+--       速度 → 上面 + 单位轨道 68 + span 4 = 297 ⇒ 网格预算 661
+--     网格 5 行 × 88 + 星期头 51 + span 4 = 495，两种指标下都 < 预算
+--     （733/5 = 146、661/5 = 132，都 > 88）⇒ 格子**不会被压扁**。
+--     整页：时间 920px / 速度 992px，都 < 1158px ⇒ 放得下。
+
+-- ★★★ 53-cal-fit：下面这些是**设计像素**，实际高度由 `Screen:scaleBySize` 算，
+--   而且**必须和字体的真实行高取 max** —— 见 faceLineH 的注释（52 轮算错的根因）。
+--
+--   实测（KPW4，scaleBySize 系数 1.7867，NotoSans 行高/em = 1.362）：
+--     日期 `Font:getFace("cfont", 19)`            → 34px → 行高 47
+--     数值 `Font:getFace("x_smallinfofont", 13)`  → 24px → 行高 33
+--     ⇒ 格子内容 **80px**，所以格子高必须 ≥ 80 + 2*内边距；
+--       `CAL_CELL_H_PX = 34`（=61px）**不够**，实际会由 need 撑到 88px。
+--     导航标题 `Font:getFace("cfont", 24)`        → 43px → 行高 59
+--     ⇒ 导航行高必须 ≥ 59 + 2*内边距（`CAL_HEAD_H_PX = 22`（=40px）不够）。
+--     星期头 `Font:getFace("x_smallinfofont", 17)` → 31px → 行高 43
+--     ⇒ 星期头高必须 ≥ 43 + 2*内边距。
+local CAL_CELL_H_PX    = 34   -- 日期格的**设计**高度（下限；实际取 max(它, 内容高)）
+local CAL_CELL_PAD_PX  = 2    -- 日期格内容上下的内边距（scaleBySize(2) = 4px）
+local CAL_HEAD_H_PX    = 22   -- 星期头行 / 月份导航行的**设计**高度（下限）
+local CAL_NAV_PAD_PX   = 2    -- 导航行 / 星期头内容上下的内边距（scaleBySize(2) = 4px）
+local CAL_FMT_ROW_H_PX = 34   -- 「自动 / k / 万」「字/分钟 / 字/小时」那一行（比主轨道矮一档；不够会自动长）
+local CAL_ARROW_W_PX   = 30   -- 月份导航左右箭头的宽度
+-- ★★★ 56：热力图描边宽度（只画在「今天」那一格上，不是网格线）。
+local CAL_TODAY_BORDER_PX = 1
+
+local CAL_METRICS = {
+    { value = "units",   label = _("字数") },
+    { value = "speed",   label = _("速度") },
+    { value = "seconds", label = _("时间") },
+}
+
+--- ★★★ 56：速度单位轨道（只在「速度」指标下出现）。
+---   `GlobalStats.trend` 的 speed 口径是**字/分钟**（global_stats.lua:730），
+---   所以 `hour` 是把那个值 × 60，不是另算一套。
+local CAL_SPEED_UNITS = {
+    { value = "min",  label = _("字/分钟") },
+    { value = "hour", label = _("字/小时") },
+}
+
+local CAL_FORMATS = {
+    { value = "auto", label = _("自动") },
+    { value = "k",    label = _("k") },
+    { value = "wan",  label = _("万") },
+}
+
+--- 格子里的数值文案（**尽量短** —— 格子宽只有 content_w/7 ≈ 129px）。
+---
+--- · 时间（★ 56-cal-time-heat）：`9h` / `7h18m` / `13m`。
+---     · 时、分各一段，**有分才写分** —— 1 小时整写 `1h`（不是 `1h0m`）；
+---     · 不足 1 小时只写分：`13m`；
+---     · 不足 1 分钟写空串（格子太窄，`0m` 是噪音；热力图那格照样有色）。
+---   用户原话：「时间的格式为 9h，7h18m，13m 这种形式显示」。
+---   ⚠ 旧写法是 `>= 3600 → "1.5h"` / 否则 `"23分"` —— 已整体替换，
+---     `分` 这个汉字在 24px 字号下比 `m` 宽得多，5 个汉字就顶满格子了。
+--- · 速度：只写整数（单位「字/分钟」还是「字/小时」由上面那条单位轨道说明，
+---   见 CAL_SPEED_UNITS）。**换算在 `calendarCellValue` 里做**，这里只负责写。
+--- · 字数：三种写法
+---     auto → `formatCount`（跟随设置里的「单位切换」：完整数字 / k / 千 / 万）
+---     k    → 强制 `1.2k`（< 1000 仍写完整数字，0.4k 没有意义）
+---     wan  → 强制 `1.2万`（< 10000 仍写完整数字）
+local function calendarCellText(value, metric, fmt)
+    value = tonumber(value) or 0
+    if value <= 0 then return "" end
+    if metric == "seconds" then
+        local hours = math.floor(value / 3600)
+        local minutes = math.floor((value % 3600) / 60)
+        if hours > 0 then
+            if minutes > 0 then
+                return tostring(hours) .. "h" .. tostring(minutes) .. "m"
+            end
+            return tostring(hours) .. "h"
+        end
+        if minutes > 0 then return tostring(minutes) .. "m" end
+        return ""
+    end
+    if metric == "speed" then
+        local v = math.floor(value + 0.5)
+        if v <= 0 then return "" end
+        return tostring(v)
+    end
+    local n = math.max(0, math.floor(value))
+    if fmt == "k" then
+        if n >= 1000 then return trimZero(string.format("%.1f", n / 1000)) .. "k" end
+        return groupDigits(n)
+    end
+    if fmt == "wan" then
+        if n >= 10000 then return trimZero(string.format("%.1f", n / 10000)) .. _("万") end
+        return groupDigits(n)
+    end
+    return formatCount(n)
+end
+
+--- 把 bucket 的原始值换算成「日历格子里要显示的那个数」。
+---
+--- ★★★ 56-cal-time-heat：速度多了一个单位开关 ——
+---   `GlobalStats.trend` 给的 speed 是**字/分钟**（global_stats.lua:730：
+---   `bucket.value = bucket.units * 60 / bucket.seconds`），
+---   选「字/小时」时就是同一个值 × 60。
+---
+--- ⚠ 热力图用的也是这个换算后的值（`buildCalendarGrid` 里先算 max 再分档），
+---   所以「切单位」只会改格子里写的数字，**不会**改变各格深浅的相对分布 ——
+---   乘一个正常数不改变比例，这是刻意的。
+local function calendarCellValue(bucket, metric, speed_unit)
+    local value = bucket and tonumber(bucket.value) or 0
+    if not value then return 0 end
+    if metric == "speed" and speed_unit == "hour" then
+        return value * 60
+    end
+    return value
+end
+
+--- ★★★ 56-cal-time-heat：热力图分档。
+---
+--- 分 4 档 + 一档「无数据」，比例的分母是**当月最大的那一天**：
+---     0 → 无数据（白底）
+---     1 → 0    ~ 25%  （0xEE，最浅）
+---     2 → 25%  ~ 50%  （0xCC）
+---     3 → 50%  ~ 75%  （0xAA）
+---     4 → 75%  ~ 100% （0x88，最深；文字反白）
+---
+--- 为什么用「当月最大值」当分母，而不是固定阈值：
+---   指标可以在 字数 / 速度 / 时间 之间切，三者的量纲差了三个数量级，
+---   固定阈值没法同时适配。相对分档对三种指标都成立，而且永远有对比度。
+---   ⚠ 代价说清楚：如果某个月有一天特别突出（比如读了 10 小时、其余都是
+---     20 分钟），其余天会全部落进第 1 档，看起来偏平。这是相对分档的固有
+---     取舍；要改成固定阈值（如时间按 15min/1h/3h 分档）随时可以，改这里即可。
+---
+--- 颜色取自上游 `ffi/blitbuffer.lua:2710-2718`（v2026.07 实测）：
+---   COLOR_WHITE=0xFF / COLOR_GRAY_E=0xEE / COLOR_LIGHT_GRAY=0xCC /
+---   COLOR_GRAY=0xAA / COLOR_DARK_GRAY=0x88。
+---   故意**只用灰阶** —— e-ink 上彩色会被抖动成网点，灰阶才干净。
+local CAL_HEAT_FILL = {
+    Blitbuffer.COLOR_WHITE,        -- 0：无数据
+    Blitbuffer.COLOR_GRAY_E,       -- 1
+    Blitbuffer.COLOR_LIGHT_GRAY,   -- 2
+    Blitbuffer.COLOR_GRAY,         -- 3
+    Blitbuffer.COLOR_DARK_GRAY,    -- 4
+}
+
+--- 每档对应的文字色。最深那档**反白**：0x88 底 + 黑字在 e-ink 上会糊成一片，
+--- 白字对比度才够（这也是 KOReader 自己在「选中态」上的做法）。
+local CAL_HEAT_TEXT = {
+    Blitbuffer.COLOR_BLACK,
+    Blitbuffer.COLOR_BLACK,
+    Blitbuffer.COLOR_BLACK,
+    Blitbuffer.COLOR_BLACK,
+    Blitbuffer.COLOR_WHITE,        -- 4
+}
+
+--- 按「当天值 / 当月最大值」的比例返回 0~4 档。抽成纯函数是为了能直接喂输入断言输出。
+local function heatLevel(value, max_value)
+    value = tonumber(value) or 0
+    max_value = tonumber(max_value) or 0
+    if value <= 0 or max_value <= 0 then return 0 end
+    local ratio = value / max_value
+    if ratio <= 0.25 then return 1 end
+    if ratio <= 0.50 then return 2 end
+    if ratio <= 0.75 then return 3 end
+    return 4
+end
+
+--- 日历里的一格：上面日期、下面数值（没数据时只有日期）。
+---
+--- ★★★ 56-cal-time-heat：
+---   · `level`（0~4）= 热力图档位，决定**底色**与**文字色**（见 CAL_HEAT_FILL）。
+---   · 「今天」不再是整格实心黑底白字（那样会把热力图的深浅吃掉），
+---     改成 **日期加粗 + 一圈 1px 黑描边**（用户选的方案）。
+---     ⚠ 描边只画在今天这一格上 —— 52b 那版「每格都描边」才会把整张日历
+---       切成一张网（用户明确否掉了），这里不会。
+local function calendarCell(w, h, day, value_text, is_today, level, on_tap)
+    local f = faces()
+    level = math.max(0, math.min(4, math.floor(tonumber(level) or 0)))
+    local fill = CAL_HEAT_FILL[level + 1]
+    local fg = CAL_HEAT_TEXT[level + 1]
+    local pad = Screen:scaleBySize(4)
+    local col = VerticalGroup:new{ align = "center" }
+    -- ★★★ 52-cell-fit：两行文字都必须 `padding = 0`。
+    --   上游 TextWidget 的高度 = 字体行高 + 2*padding，padding 默认
+    --   `Size.padding.small`(=4px) ⇒ 每行白送 8px。
+    --
+    -- ★★★ 53-cal-fit：**格子高度必须由 buildCalendarGrid 按真实字高算**，
+    --   不能在这里假设。52 轮我写的算式（「19px 日期 + 13px 数值」）漏了
+    --   `Font:getFace` 会把字号乘一遍 `Screen:scaleBySize`（ui/font.lua:276）。
+    --   真实账：日期 `cfont 19` → 34px → 行高 47；数值 `x_smallinfofont 13`
+    --   → 24px → 行高 33；两行 **80px**。所以格子高是 88px（80 + 2×4 内边距），
+    --   不是 52 那版的 61px —— 详见 buildCalendarGrid 与 faceLineH 的注释。
+    col[#col + 1] = text(tostring(day), f.value_small, {
+        color = fg, max_width = math.max(1, w - pad), padding = 0,
+        bold = is_today,   -- ★ 56：今天 = 日期加粗
+    })
+    if value_text ~= "" then
+        col[#col + 1] = text(value_text, f.value, {
+            color = fg, max_width = math.max(1, w - pad), padding = 0,
+        })
+    end
+    -- ⚠ 这里必须用 `SegFill` 而**不能**用 `FrameContainer`：
+    --   `FrameContainer:getSize()`（framecontainer.lua:54-67）**忽略**构造时
+    --   传进来的 width/height，只按「子控件 + 2*(margin+bordersize+padding)」反推
+    --   ⇒ 传 width 根本撑不出整格，今天那格的黑色底会只跟文字一样宽。
+    --   `SegFill` 是按给定 (宽,高) **实心绘制**的（见它自己的注释），正合用。
+    --
+    -- ★★★ 52-cell-fit：尺寸从 (w-2, h-2) 改成 **铺满 (w, h)**。
+    --   老写法四周各留 1px 缝，于是「今天」那格的黑底比格子小一圈 ——
+    --   用户原话「格子填充不完全」，说的就是这个。现在填充铺满整格。
+    --
+    -- ★★★ 52b-no-grid-lines：**不给每格画描边**（用户：「日历不要分隔线」）。
+    --   52 那版给每格加了 1px 深灰细边，相邻两格叠成 2px 线 ⇒ 整张日历被
+    --   切成一张网。用户不要这个，去掉。
+    --   ⚠ 56 把描边**只加回「今天」那一格** —— 单格的一圈框不是网格线，
+    --     而且热力图把底色拿去做深浅了，今天必须换个方式标出来。
+    --     `SegFill` 的描边画在**填充之后、文字之前**（见它的 paintTo），
+    --     所以压在深色底上仍然清晰、也不会盖住文字。
+    local cell = SegFill:new{
+        width = math.max(1, w),
+        height = math.max(1, h),
+        radius = 0,
+        color = fill,
+        border_size = is_today and Screen:scaleBySize(CAL_TODAY_BORDER_PX) or 0,
+        border_color = is_today and Blitbuffer.COLOR_BLACK or nil,
+        col,
+    }
+    local box = FixedBox:new{
+        width = w, height = h,
+        align = "center", vertical_align = "center",
+        cell,
+    }
+    if on_tap then
+        return TapBox:new{ box, on_tap = on_tap }
+    end
+    return box
+end
+
+--- 日历网格：星期头行 + 日期格子（周一起始，与日选择器一致）。
+---
+--- ★★★ 53-cal-fit：`avail_rows_h`（可选）= 网格**能用的像素高**，
+---   由 `buildCalendarPage` 从 `self._available_h` 里扣掉「网格以上已占的高度」
+---   算出来。给了就按它反推每格高度（但不小于内容所需高度）；没给就不压。
+function StatisticsPage:buildCalendarGrid(width, avail_rows_h)
+    local f = faces()
+    local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
+    local metric = self.cal_metric or "seconds"
+    local fmt = self.cal_format or "auto"
+    local speed_unit = self.cal_speed_unit or "min"
+    local year = tonumber(os.date("%Y", self.anchor)) or 1970
+    local month = tonumber(os.date("%m", self.anchor)) or 1
+    local today_key = GlobalStats.dateKey(os.time())
+
+    -- 逐日数据：buckets[1] 是 1 号，以此类推（global_stats.lua:694-702）。
+    local key = "cal:" .. tostring(self.anchor) .. "|" .. tostring(metric)
+    local memo_key = statMemoKey(self.plugin, "month", self.anchor, "calendar")
+    local buckets = memoGet(self.plugin, key, memo_key)
+        or memoSet(self.plugin, key, memo_key,
+            GlobalStats.trend(store, "month", self.anchor, metric))
+
+    local last_day = tonumber(os.date("%d", os.time{
+        year = year, month = month + 1, day = 0, hour = 12, min = 0, sec = 0,
+    })) or 30
+    local first_ts = os.time{ year = year, month = month, day = 1, hour = 12, min = 0, sec = 0 }
+    -- `%w`：0 = 周日 … 6 = 周六；表头是周一起始 ⇒ 前导空格 = (%w + 6) % 7
+    local leading = ((tonumber(os.date("%w", first_ts)) or 0) + 6) % 7
+
+    -- ── ★★★ 56-cal-time-heat：热力图的分母 = **当月最大的那一天** ──
+    --   必须先扫一遍再画格子（分档要知道 max）。这一步是纯 Lua 数组遍历，
+    --   月末 31 个元素，成本可以忽略；不要为了省这点而去缓存，
+    --   缓存反而会在「切指标 / 切速度单位」时忘记失效。
+    --   ⚠ 用的是 `calendarCellValue`（已含速度单位换算），
+    --     和后面画格子时的取值口径**完全一致**，否则深浅会算错。
+    local max_value = 0
+    for day = 1, last_day do
+        local v = calendarCellValue(buckets[day], metric, speed_unit)
+        if v > max_value then max_value = v end
+    end
+
+    -- ── ★★★ 53-cal-fit：尺寸全部**按真实字体行高**算（见 faceLineH 的注释）──
+    --
+    --   52 轮这里写的是 `cell_h = scaleBySize(CAL_CELL_H_PX)` = 61px，
+    --   并且以为「19px 日期 + 13px 数值 = 49px」放得下 —— 那个算式漏了
+    --   `Font:getFace` 会把字号乘一遍 `scaleBySize`。真实账：
+    --     日期 `cfont 19` → 34px → 行高 47
+    --     数值 `x_smallinfofont 13` → 24px → 行高 33
+    --     ⇒ 内容 **80px** > 格子 61px ⇒ 上下各溢出 ~10px，
+    --       被相邻格子的实心填充盖掉 ⇒「上下都有被截断的」。
+    local cell_w = math.floor(width / 7)
+    local nav_pad = Screen:scaleBySize(CAL_NAV_PAD_PX)
+    local cell_pad = Screen:scaleBySize(CAL_CELL_PAD_PX)
+    -- 星期头：`f.axis` 实际 31px ⇒ 行高 43，比设计值 scaleBySize(22)=40 高，
+    -- 所以取 max（否则「一二三四五六日」上下各被切 1~2px）。
+    local head_h = math.max(Screen:scaleBySize(CAL_HEAD_H_PX),
+        faceLineH(f.axis) + 2 * nav_pad)
+    -- 日期格：日期行 + 数值行 + 上下内边距。
+    local day_line_h = faceLineH(f.value_small)   -- 47（34px NotoSans）
+    local val_line_h = faceLineH(f.value)         -- 33（24px NotoSans）
+    local need_cell_h = day_line_h + val_line_h + 2 * cell_pad
+    local cell_h = math.max(Screen:scaleBySize(CAL_CELL_H_PX), need_cell_h)
+    -- 预算：有就压到预算内，但**绝不小于 `need_cell_h`** ——
+    --   宁可不填满整页，也不能再切字。
+    local rows = math.max(1, math.ceil((leading + last_day) / 7))
+    if avail_rows_h and avail_rows_h > 0 then
+        local budget = math.floor(avail_rows_h / rows)
+        if budget > 0 and budget < cell_h then
+            cell_h = math.max(need_cell_h, budget)
+        end
+    end
+    local grid = VerticalGroup:new{ align = "left" }
+
+    local weekdays = { "一", "二", "三", "四", "五", "六", "日" }
+    local head = HorizontalGroup:new{ align = "center" }
+    for i = 1, 7 do
+        head[#head + 1] = FixedBox:new{
+            width = cell_w, height = head_h,
+            align = "center", vertical_align = "center",
+            text(weekdays[i], f.axis, {
+                color = Blitbuffer.COLOR_DARK_GRAY,
+                max_width = math.max(1, cell_w - Screen:scaleBySize(4)),
+                padding = 0,   -- ★ 52-cell-fit：同导航行，去掉 TextWidget 白送的 8px
+            }),
+        }
+    end
+    grid[#grid + 1] = head
+    grid[#grid + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
+
+    local row = HorizontalGroup:new{ align = "center" }
+    local filled = 0
+    local function flush()
+        while filled % 7 ~= 0 do
+            row[#row + 1] = FixedBox:new{ width = cell_w, height = cell_h }
+            filled = filled + 1
+        end
+        grid[#grid + 1] = row
+        row = HorizontalGroup:new{ align = "center" }
+    end
+
+    for _i = 1, leading do
+        row[#row + 1] = FixedBox:new{ width = cell_w, height = cell_h }
+        filled = filled + 1
+    end
+    for day = 1, last_day do
+        -- ★ 56：取值走 `calendarCellValue`（速度在这里做「字/分钟 → 字/小时」换算），
+        --   文案走 `calendarCellText`，深浅走 `heatLevel(value, max_value)`。
+        local value = calendarCellValue(buckets[day], metric, speed_unit)
+        local value_text = calendarCellText(value, metric, fmt)
+        local level = heatLevel(value, max_value)
+        local day_ts = os.time{ year = year, month = month, day = day, hour = 12, min = 0, sec = 0 }
+        local is_today = (GlobalStats.dateKey(day_ts) == today_key)
+        row[#row + 1] = calendarCell(cell_w, cell_h, day, value_text, is_today, level, function()
+            self:reload{ period = "day", anchor = day_ts }
+            return true
+        end)
+        filled = filled + 1
+        if filled % 7 == 0 then flush() end
+    end
+    if filled % 7 ~= 0 then flush() end
+    return grid
+end
+
+--- 日历视图的整页内容：指标轨道 + 写法轨道 + 月份导航 + 网格。
+---
+--- ★★★ 53-cal-fit：`avail_h`（可选）= 这一页**能用的像素高** ——
+---   由 `build()` 从 `self._available_h` 里扣掉「标题栏 + 视图轨道 + 两段大间距」
+---   算出来传进来。有了它，网格才能按剩余空间反推每格高度（见 buildCalendarGrid）；
+---   没给（老调用路径 / 单元测试）就按内容自然高度排，不做任何压缩。
+function StatisticsPage:buildCalendarPage(width, avail_h)
+    local f = faces()
+    local body = VerticalGroup:new{ align = "left" }
+    local metric = self.cal_metric or "seconds"
+    -- 本页「网格以上」已经占掉的高度，用来给网格留预算。
+    local used = 0
+    local function add(w)
+        body[#body + 1] = w
+        local sz = w:getSize()
+        used = used + ((sz and sz.h) or 0)
+        return w
+    end
+
+    -- ── 指标轨道：字数 / 速度 / 时间 ──
+    local metric_items = {}
+    for _i, m in ipairs(CAL_METRICS) do
+        local value = m.value
+        metric_items[#metric_items + 1] = {
+            label = m.label,
+            face = f.tab,
+            active = (value == metric),
+            on_tap = function()
+                if value ~= self.cal_metric then
+                    self:reload{ view = "calendar", cal_metric = value }
+                end
+                return true
+            end,
+        }
+    end
+    add(buildSegmentedRow{
+        width = width,
+        height = Screen:scaleBySize(ROW_TAB_H_PX),
+        radius = Screen:scaleBySize(NAV_TRACK_RADIUS_PX),
+        items = metric_items,
+    })
+
+    -- ── 单位轨道（**按指标二选一出现**）────────────────────────────────
+    --   · 字数 → 「自动 / k / 万」
+    --     46 轮用户回执：「万和k以及速度可以自己选择显示到日历」。
+    --   · 速度 → 「字/分钟 / 字/小时」（★ 56-cal-time-heat）
+    --     用户原话：「日历中阅读速度分为每分钟多少字和每小时多少字，
+    --               可以点击进行切换」。
+    --   · 时间 → 没有单位可选，这一整行不出现。
+    --
+    --   ⚠ 两条轨道互斥：同时出现会让「网格以上」多占 72px，
+    --     而它们是同一个语义位置（「当前指标的显示口径」），没有并存的理由。
+    local function unitRow(defs, active_value, field)
+        add(VerticalSpan:new{ width = Size.span.vertical_default })
+        local items = {}
+        for _i, d in ipairs(defs) do
+            local value = d.value
+            items[#items + 1] = {
+                label = d.label,
+                face = f.tab,
+                active = (value == active_value),
+                on_tap = function()
+                    if value ~= self[field] then
+                        local opts = { view = "calendar" }
+                        opts[field] = value
+                        self:reload(opts)
+                    end
+                    return true
+                end,
+            }
+        end
+        add(buildSegmentedRow{
+            width = width,
+            height = Screen:scaleBySize(CAL_FMT_ROW_H_PX),
+            radius = Screen:scaleBySize(NAV_TRACK_RADIUS_PX),
+            items = items,
+        })
+    end
+
+    if metric == "units" then
+        unitRow(CAL_FORMATS, self.cal_format, "cal_format")
+    elseif metric == "speed" then
+        unitRow(CAL_SPEED_UNITS, self.cal_speed_unit, "cal_speed_unit")
+    end
+
+    add(VerticalSpan:new{ width = Size.span.vertical_default })
+
+    -- ── 月份导航：**年份、月份各占一行**（用户要求「年份和月份放在两行」）──
+    --       ‹   2026 年   ›     ← 这一行切**年**
+    --       ‹   10 月     ›     ← 这一行切**月**
+    --
+    --   两行各带自己的左右箭头：年份行只动年（月份保持不变）、月份行只动月
+    --   （1 月往前退自动落到上年 12 月，靠 `anchorAtMonth` 自己进位）。
+    --   比「一行写完 + 按点击位置猜意图」（37b 那种）清楚得多：
+    --   点哪个箭头 = 改哪个字段，不需要解释。
+    local year = tonumber(os.date("%Y", self.anchor)) or 1970
+    local month = tonumber(os.date("%m", self.anchor)) or 1
+    local nav = VerticalGroup:new{ align = "left" }
+    local arrow_w = Screen:scaleBySize(CAL_ARROW_W_PX)
+    -- ★★★ 53-cal-fit：导航行高按**真实字高**算。
+    --   52 的注释写「`f.section` 是 24px ⇒ ceil(24*1.48)+8 = 44 > 40 ⇒ 被切 2px」——
+    --   那个 24px 是**设计值**，不是真实字号。真实字号是
+    --   `Font:getFace("cfont", 24)` ⇒ `scaleBySize(24) = 43px`，行高
+    --   `ceil(43 × 1.362) = 59`，加 2×4 内边距需要 **67px**。
+    --   ⇒ 设计值 40 差了 27px，「2026 年 / 10 月」和两个 ‹ › 上下各被切十几像素。
+    local nav_pad = Screen:scaleBySize(CAL_NAV_PAD_PX)
+    local head_h = math.max(Screen:scaleBySize(CAL_HEAD_H_PX),
+        faceLineH(f.section) + 2 * nav_pad)
+    -- ★★★ 54-cal-nav：箭头改用 KOReader 原生 chevron（与 buildPeriodNav 统一），
+    --   年份/月份文字点击弹出对应的选择器。
+    local arrow_icon = Screen:scaleBySize(18)
+    local function arrow(icon_name, on_click)
+        return TapBox:new{
+            FixedBox:new{
+                width = arrow_w, height = head_h,
+                align = "center", vertical_align = "center",
+                icon(icon_name, arrow_icon),
+            },
+            on_tap = on_click,
+        }
+    end
+    local title_w = math.max(1, width - 2 * arrow_w)
+    --- kind = "year" 只改年，kind = "month" 只改月。
+    local function navRow(label_text, kind)
+        local function go(delta)
+            return function()
+                local y, m = year, month
+                if kind == "year" then y = y + delta else m = m + delta end
+                self:reload{
+                    view = "calendar",
+                    anchor = anchorAtMonth(self.anchor, y, m),
+                }
+                return true
+            end
+        end
+        local row = HorizontalGroup:new{ align = "center" }
+        row[#row + 1] = arrow("chevron.left", go(-1))
+        -- 中间文字：点击弹出年份/月份选择器
+        local title_widget = FixedBox:new{
+            width = title_w, height = head_h,
+            align = "center", vertical_align = "center",
+            text(label_text, f.section, {
+                color = Blitbuffer.COLOR_BLACK, bold = true,
+                max_width = math.max(1, title_w - Screen:scaleBySize(6)),
+                padding = 0,   -- ★ 52-cell-fit：同上
+            }),
+        }
+        row[#row + 1] = TapBox:new{
+            title_widget,
+            on_tap = function()
+                if kind == "year" then
+                    self:showYearPicker()
+                else
+                    self:showMonthPicker("month")
+                end
+                return true
+            end,
+        }
+        row[#row + 1] = arrow("chevron.right", go(1))
+        return row
+    end
+    nav[#nav + 1] = navRow(T(_("%1 年"), year), "year")
+    nav[#nav + 1] = navRow(T(_("%1 月"), month), "month")
+    add(nav)
+    add(VerticalSpan:new{ width = Size.span.vertical_default })
+
+    -- ── 网格：把「本页剩余可用高」传下去，让它自己决定每格多高 ──
+    local avail_rows_h = nil
+    if avail_h and avail_h > 0 then
+        avail_rows_h = avail_h - used
+    end
+    add(self:buildCalendarGrid(width, avail_rows_h))
+    return body
 end
 
 --- 总览 / 趋势 / 阅读字数 / 阅读速度。
@@ -2373,7 +3801,7 @@ end
 --- ★★★ 44-segmented：整排改成**一个分段控件**（外框一圈 + 单条分隔线），
 ---   不再是一格一个圆角框、也不再有 9px 缝 —— 和周期排观感统一。
 function StatisticsPage:buildViewTabs(width)
-    local face = Font:getFace("cfont", 16)
+    local face = Font:getFace("cfont", 17)
     local items = {}
     for j = 1, #VIEW_TABS do
         local tab = VIEW_TABS[j]
@@ -2392,7 +3820,7 @@ function StatisticsPage:buildViewTabs(width)
     return buildSegmentedRow{
         width = width,
         height = Screen:scaleBySize(ROW_TAB_H_PX),
-        radius = Size.radius.button,
+        radius = Screen:scaleBySize(NAV_TRACK_RADIUS_PX),
         items = items,
     }
 end
@@ -2445,7 +3873,7 @@ function StatisticsPage:buildTabs(width)
     return buildSegmentedRow{
         width = width,
         height = Screen:scaleBySize(ROW_TAB_H_PX),
-        radius = Size.radius.button,
+        radius = Screen:scaleBySize(NAV_TRACK_RADIUS_PX),
         items = items,
     }
 end
@@ -2486,7 +3914,7 @@ end
 ---   ★ 「总」粒度：所有箭头置灰（没有可翻的格子）。
 function StatisticsPage:buildPeriodNav(width, range_label)
     local f = faces()
-    local line_h = Screen:scaleBySize(30)
+    local line_h = Screen:scaleBySize(34)
     -- ★★★ 37f/37i：**两行**（年 / 月日）—— nav_h 相应改成 2 行高。
     --   ⚠ 改这里必须同步改 buildUnitsPage 的 PERIODNAV_H 预算，见那里的注释。
     local nav_h = line_h * 2 + Size.padding.tiny
@@ -2578,28 +4006,32 @@ function StatisticsPage:buildPeriodNav(width, range_label)
             text(year_label or "", f.period, { bold = true }),
         }
     else
-        local year_pill = FrameContainer:new{
-            bordersize = Screen:scaleBySize(1),
-            color = Blitbuffer.COLOR_GRAY_E,
-            radius = Screen:scaleBySize(7),
-            margin = 0,
-            padding = 0,
-            HorizontalGroup:new{
-                align = "center",
-                HorizontalSpan:new{ width = Size.padding.large },
-                text(year_label or "", f.period, { bold = true }),
-                HorizontalSpan:new{ width = Size.padding.large },
-            },
-        }
-        -- ★★★ 37r：点胶囊 = **直接选年份**（弹年份列表），不是 37b 的「下钻到月」。
-        --   用户原话：「选择年份使用左右箭头切换可以，点击年份直接选择年份也可以」。
-        --   左右两侧的年箭头（翻 ±1 年）完全保留，这里只是**多给一条路**。
-        --   ⚠ 触摸热区仍是整条中间带（外层 `FixedBox` 撑满 `width - 2*arrow_w`），
-        --     比胶囊本身大得多 —— 手指没那么准，这样更好按，视觉上也更稳。
+        -- ★★★ 49c-year-no-border：**年份去掉边框**（用户原话：「年份不要有边框」）。
+        --
+        --   37t 原来给年份套了一个胶囊：`FrameContainer{ bordersize =
+        --   scaleBySize(1), color = COLOR_GRAY_E, radius = scaleBySize(7) }`，
+        --   左右还各塞了 `Size.padding.large` 的 HorizontalSpan 把胶囊撑宽，
+        --   理由是「用户一眼就知道这里能点」。49c 用户明确不要这个框。
+        --   ⇒ 整个 FrameContainer 撤掉（边框、圆角、左右 padding 一并没了），
+        --     只留一行加粗文字 —— 与下面「月日」那行的文字样式同一套语言。
+        --     （顺带：本文件里 `Blitbuffer.COLOR_GRAY_E` 到此**没有别的使用者**了，
+        --      留着这条注释是为了让后来者知道那个灰框曾经在这里。）
+        --
+        --   ⚠ **代价**：「年份能点」的可视线索没了。点年份文字**仍然**会弹
+        --     年份列表（37r 加的那条路完整保留），只是看不出能点。
+        --     左右两侧的 ‹ › 年箭头不受影响，仍然是唯一的「看得出来能点」的东西。
+        --     如果哪天觉得「不知道这里能点」，**别把边框加回来** ——
+        --     换成更轻的指示（文字下一条细下划线 / 尾部一个 chevron.down），
+        --     那才跟「无边框」是一套语言。
+        --   ⚠ 触摸热区**不变**：仍是外层 `FixedBox` 撑满 `width - 2*arrow_w`
+        --     的整条中间带（比文字宽得多，手指好按）。
+        --     （撤掉左右 padding 后，文字本身仍然居中 —— 外层是
+        --      `FixedBox{align="center"}`，不靠那两个 span 定位。）
         year_center_widget = TapBox:new{
             FixedBox:new{
                 width = math.max(1, width - 2 * arrow_w), height = line_h,
-                align = "center", vertical_align = "center", year_pill,
+                align = "center", vertical_align = "center",
+                text(year_label or "", f.period, { bold = true }),
             },
             on_tap = function()
                 self:showYearPicker()
@@ -2631,22 +4063,9 @@ function StatisticsPage:buildPeriodNav(width, range_label)
     --     · 中间簇始终居中，与第 1 行「年」对齐。
     if not disabled and month_day_label then
         local md_text = text(month_day_label, f.footer, { bold = true })
-        local md_pill = FrameContainer:new{
-            bordersize = Screen:scaleBySize(1),
-            color = Blitbuffer.COLOR_GRAY_E,
-            radius = Screen:scaleBySize(7),
-            margin = 0,
-            padding = 0,
-            HorizontalGroup:new{
-                align = "center",
-                HorizontalSpan:new{ width = Size.padding.small },
-                md_text,
-                HorizontalSpan:new{ width = Size.padding.small },
-            },
-        }
         -- 中间簇：日‹ + [tiny] + 月日 + [tiny] + 日›
         --   点文字下钻到「日」（保留 37c 手感）。
-        local md_text_widget = md_pill
+        local md_text_widget = md_text
         if not disabled then
             -- ★★★ 43-pickers：点第 2 行文字 = 弹**当前粒度**的选择器。
             --
@@ -2661,7 +4080,7 @@ function StatisticsPage:buildPeriodNav(width, range_label)
             --   ⚠ 第 2 行左右两个**日**箭头、最外端两个**月**箭头的行为
             --     一个字都没动（它们仍是精确翻格）；这里只是把「中间那块文字」
             --     从「切粒度」改成「弹选择器」。
-            md_text_widget = TapBox:new{ md_pill, on_tap = function()
+            md_text_widget = TapBox:new{ md_text, on_tap = function()
                 self:showPeriodPicker(self.period)
                 return true
             end }
@@ -2742,8 +4161,17 @@ end
 ---   所以默认固定 3 列；只有当宽度实在塞不下 3 列（极窄窗/横屏小窗）
 ---   才退到 2 或 1 列。列数不再「越大越好」。
 ---   并支持多套卡片样式（见 CARD_STYLES / wrapCard）。
+---
+--- ★★★ 49-cards：3 → **4**。用户原话：「如果要是卡片放不下的话，缩小一点字体，
+---   变成一行 4 个卡片，把最后的记录笔记卡片删掉」。
+---   三件事是一套：导航栏加高吃掉 ~72px 之后，
+---     · 删掉「记录笔记」⇒ 卡片从 9 张变 8 张；
+---     · 4 列 ⇒ 正好 **2 行 × 4**（原来是 3 行 × 3，整整少一行）；
+---     · 卡片宽度从 298px 掉到 221px，标签放不下 ⇒ 靠
+---       `CARD_LABEL_SIZE_LADDER` / `CARD_DELTA_SIZE_LADDER` 自动降字号。
+---   ⚠ 少一行是**省高度**，不是费高度 —— 这才是解决「放不下」的正路。
 local CARD_MIN_W = Screen:scaleBySize(118)
-local CARD_DEFAULT_COLS = 3     -- 用户要求的每行卡片数
+local CARD_DEFAULT_COLS = 4     -- 49-cards：用户要求的每行卡片数
 local CARD_MAX_COLS = 4         -- 硬上限（宽屏也别超过，否则字太小）
 
 --- 决定列数：优先 3 列；宽度不够才退。纯函数，便于行为测试。
@@ -2772,7 +4200,7 @@ function StatisticsPage:buildCardStyleRow(width)
     -- 左侧小标题「卡片样式」，右侧四个样式按钮
     local label_w = Screen:scaleBySize(76)
     row[#row + 1] = FixedBox:new{
-        width = label_w, height = Screen:scaleBySize(27),
+        width = label_w, height = Screen:scaleBySize(32),
         align = "left", vertical_align = "center",
         text(_("卡片样式"), f.footer, { color = Blitbuffer.COLOR_DARK_GRAY }),
     }
@@ -2783,7 +4211,7 @@ function StatisticsPage:buildCardStyleRow(width)
     if btn_w < Screen:scaleBySize(40) then
         btn_w = math.max(Screen:scaleBySize(28), math.floor(width / n))
     end
-    local btn_h = Screen:scaleBySize(27)
+    local btn_h = Screen:scaleBySize(32)
     local current = cardStyleValid(self.card_style) and self.card_style or "box"
 
     for i, style in ipairs(CARD_STYLES) do
@@ -2792,14 +4220,14 @@ function StatisticsPage:buildCardStyleRow(width)
         local target = style.value
         row[#row + 1] = FrameContainer:new{
             width = btn_w, height = btn_h,
-            bordersize = Screen:scaleBySize(1), color = Blitbuffer.COLOR_GRAY_E,
+            bordersize = Screen:scaleBySize(1), bordercolor = Blitbuffer.COLOR_BLACK,
             radius = Size.radius.button,
             background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
             padding = 0,
             TapBox:new{
                 FixedBox:new{ width = btn_w, height = btn_h,
                     align = "center", vertical_align = "center",
-                    text(style.label, Font:getFace("cfont", 14), {
+                    text(style.label, Font:getFace("cfont", 15), {
                         color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
                         bold = active,
                     }) },
@@ -2885,24 +4313,43 @@ function StatisticsPage:buildCardGrid(width, summary, previous)
             drill = "books_completed",
         },
         -- ★★★ 36：删掉「在读书籍」卡片（用户要求「卡片在读书籍删掉吧」）。
-        {
-            id = "notes", icon = "edit", label = _("记录笔记"),
-            parts = formatCountParts(summary.notes, _("条")),
-            kind = "notes", delta = diff(summary.notes, previous and previous.notes),
-        },
+        -- ★★★ 49-cards：**再删掉「记录笔记」卡片**（用户原话：「把最后的
+        --   记录笔记卡片删掉」）。删完正好 8 张 ⇒ 4 列 × 2 行，一行不多不少。
+        --   ⚠ `summary.notes` 那个数据本身**没有删**（还在 global_stats 里
+        --     算着）—— 万一以后想加回来，恢复这个 spec 就够。
     }
 
     -- 先量出最高的卡片，再统一套用，保证每行严格等高
-    local contents = {}
-    local card_h = 0
-    for i, spec in ipairs(specs) do
+    --
+    -- ★★★ 49-cards：分三步走（原来是一步）——
+    --   ① 先把环比文案算出来（量字号要用到它）；
+    --   ② 用「所有卡片里最宽的那条」在字号梯子里挑一档（pickCardFace）；
+    --   ③ 再建内容、量卡高。
+    for _i, spec in ipairs(specs) do
         if spec.delta and spec.delta ~= 0 then
             spec.delta_text = deltaArrow(spec.delta) .. deltaText(spec.kind, math.abs(spec.delta))
         end
-        contents[i] = buildCardContent(spec, inner_w)
+    end
+    -- ⚠ 标签行要给行尾的 `>`（scaleBySize(13)=23px）留位，所以可用宽要减
+    --   scaleBySize(20)=36px —— 这个数必须和 buildCardContent 里的
+    --   `max_width` 算法**保持一致**，否则「量出来放得下、画出来折行」。
+    local label_avail = inner_w - Screen:scaleBySize(20)
+    local label_face = pickCardFace(specs, "label", label_avail,
+        CARD_LABEL_SIZE_LADDER, "smallinfofont")
+    local delta_face = pickCardFace(specs, "delta_text", inner_w,
+        CARD_DELTA_SIZE_LADDER, "smallinfofont")
+    -- ★★★ 49b-value-unify：大数字也要统一档位（用户：「卡片字体一致一点啊」）。
+    --   原来这里是「每张卡在 buildCardContent 内部各自试档」，同一屏会出现
+    --   32 / 28 / 23 三种字号 —— 详见 pickValuePair 的注释。
+    local value_pair = pickValuePair(specs, inner_w)
+
+    local contents = {}
+    local card_h = 0
+    for i, spec in ipairs(specs) do
+        contents[i] = buildCardContent(spec, inner_w, label_face, delta_face, value_pair)
         card_h = math.max(card_h, contents[i]:getSize().h)
     end
-    card_h = card_h + 2 * Size.padding.small
+    card_h = card_h + 2 * Size.padding.default
 
     local grid = VerticalGroup:new{ align = "left" }
 
@@ -3085,7 +4532,7 @@ function StatisticsPage:buildUnitsPage(width)
     -- ── 列表**上方**的固定占高 ──────────────────────────────────────────
     -- 逐项对应 build() 里的 body 与 buildUnitsPage 开头：
     --   浮窗边框(2×border) + title_bar + span.v_def + viewTabs(38)
-    --   + span.v_def + tabs + span.v_def + periodNav(line_h+btn_h+pad.tiny)
+    --   + span.v_large + tabs(36) + span.v_def + periodNav(line_h+btn_h+pad.tiny)
     --   + span.v_large + sortRow(36) + span.v_def + status(30) + pad.small
     local TITLEBAR_H = Screen:scaleBySize(34)    -- TitleBar 标题文字行高（含下划线内边距的保守值）
     --   ★★★ 44-compact：视图排 / 周期排都改引用统一的 `ROW_TAB_H_PX`。
@@ -3094,16 +4541,16 @@ function StatisticsPage:buildUnitsPage(width)
     --     改一处忘另一处，预算就算错、内容被顶出去（老病根）。
     local VIEWTAB_H  = Screen:scaleBySize(ROW_TAB_H_PX)
     local TABS_H     = Screen:scaleBySize(ROW_TAB_H_PX)
-    --   ★ 37i：buildPeriodNav 现在是「**两**行 × line_h(30)」= scaleBySize(60)，
+    --   ★ 37i：buildPeriodNav 现在是「**两**行 × line_h(34)」= scaleBySize(68)，
     --     这里必须跟着改，否则预算又对不上（这正是翻页栏被顶掉的老病根）。
-    local PERIODNAV_H = Screen:scaleBySize(30)   -- ← 与 buildPeriodNav 的 line_h 一致
+    local PERIODNAV_H = Screen:scaleBySize(34)   -- ← 与 buildPeriodNav 的 line_h 一致
                       * 2                        -- ← 37f/37i 两行（年一行 + 月日一行）
                       + Size.padding.tiny
     local SORTROW_H  = Screen:scaleBySize(36)
     local STATUS_H   = Screen:scaleBySize(30)
     local POPUP_BORDER_H = 2 * Screen:scaleBySize(2)
     local chrome_top = POPUP_BORDER_H + TITLEBAR_H
-        + v_def + VIEWTAB_H + v_def + TABS_H + v_def + PERIODNAV_H
+        + v_def + VIEWTAB_H + v_large + TABS_H + v_def + PERIODNAV_H
         + v_large + SORTROW_H + v_def + STATUS_H + Size.padding.small
     -- ── 列表**下方**的固定占高（点线 + span + 翻页栏 + 底部大间距）─────
     local NAVBAR_H = Screen:scaleBySize(44)      -- ← 与 buildUnitsPage 翻页栏 nav_h 一致
@@ -3121,33 +4568,42 @@ function StatisticsPage:buildUnitsPage(width)
     --------------------------------------------------------------------------
     -- 排序行：字数 / 最近阅读 / 书名（沿用 32 的黑底反白选中样式）
     --------------------------------------------------------------------------
+    local sort_row = HorizontalGroup:new{ align = "center" }
     local sorts = {
         { value = "units", label = _("字数") },
         { value = "date", label = _("最近阅读") },
         { value = "title", label = _("书名") },
     }
-    local sort_items = {}
+    local sort_cell_w = math.floor((width - Size.padding.small * 2) / 3)
     for i, item in ipairs(sorts) do
+        if i > 1 then sort_row[#sort_row + 1] = HorizontalSpan:new{ width = Size.padding.small } end
+        local active = sort == item.value
         local target = item.value
-        sort_items[i] = {
-            label = item.label,
-            face = Font:getFace("cfont", 17),
-            active = sort == target,
-            on_tap = function()
-                -- 换排序时回到第 1 页（排序变了，页码不再有意义）。
-                if target ~= self.unit_sort then
-                    self:reload{ unit_sort = target, view = "units", unit_page = 1 }
-                end
-                return true
-            end,
+        sort_row[#sort_row + 1] = FrameContainer:new{
+            width = sort_cell_w,
+            height = Screen:scaleBySize(36),
+            bordersize = Screen:scaleBySize(1), bordercolor = Blitbuffer.COLOR_BLACK,
+            radius = Size.radius.button,
+            background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+            padding = 0,
+            TapBox:new{
+                FixedBox:new{ width = sort_cell_w, height = Screen:scaleBySize(36),
+                    align = "center", vertical_align = "center",
+                    text(item.label, Font:getFace("cfont", 17), {
+                        color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+                        bold = active,
+                    }) },
+                -- 换排序时**回到第 1 页**（排序变了，页码不再有意义）
+                on_tap = function()
+                    if target ~= self.unit_sort then
+                        self:reload{ unit_sort = target, view = "units", unit_page = 1 }
+                    end
+                    return true
+                end,
+            },
         }
     end
-    group[#group + 1] = buildSegmentedRow{
-        width = width,
-        height = Screen:scaleBySize(36),
-        radius = Size.radius.button,
-        items = sort_items,
-    }
+    group[#group + 1] = sort_row
     group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
 
     --------------------------------------------------------------------------
@@ -3179,7 +4635,7 @@ function StatisticsPage:buildUnitsPage(width)
             HorizontalGroup:new{
                 align = "center",
                 text(T(_("第 %1 / %2 页"), page, total_pages),
-                    faces().footer, { color = Blitbuffer.COLOR_DARK_GRAY, bold = true }),
+                    faces().footer, { color = Blitbuffer.COLOR_BLACK }),
                 HorizontalSpan:new{ width = Size.padding.small },
                 FixedBox:new{ width = math.max(0, width - Screen:scaleBySize(120)),
                     height = Screen:scaleBySize(30), align = "right", vertical_align = "center",
@@ -3198,28 +4654,8 @@ function StatisticsPage:buildUnitsPage(width)
     -- （row_h / line_w 已在函数开头按可用高度算好，这里不再重复定义）
     if total_rows == 0 then
         group[#group + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
-        local empty_h = row_h * 2
-        local empty_padding = Size.padding.default
-        local empty_inner_w = math.max(1, width - 2 * empty_padding)
-        local empty_inner_h = math.max(1, empty_h - 2 * empty_padding)
-        group[#group + 1] = FrameContainer:new{
-            width = width, height = empty_h,
-            bordersize = Screen:scaleBySize(1),
-            color = Blitbuffer.COLOR_GRAY_E,
-            radius = Size.radius.window,
-            background = Blitbuffer.COLOR_WHITE,
-            padding = empty_padding,
-            margin = 0,
-            FixedBox:new{
-                width = empty_inner_w,
-                height = empty_inner_h,
-                align = "center", vertical_align = "center",
-                text(_("当前周期没有阅读字数记录"), faces().footer, {
-                    color = Blitbuffer.COLOR_DARK_GRAY,
-                    max_width = empty_inner_w,
-                }),
-            },
-        }
+        group[#group + 1] = text(_("当前周期没有阅读字数记录"),
+            faces().footer, { color = Blitbuffer.COLOR_BLACK })
         return group
     end
 
@@ -3244,14 +4680,14 @@ function StatisticsPage:buildUnitsPage(width)
                 HorizontalSpan:new{ width = Size.padding.small },
                 FixedBox:new{ width = right_w, height = row_h,
                     align = "right", vertical_align = "center",
-                    text(value, faces().footer, { color = Blitbuffer.COLOR_BLACK, bold = true,
+                    text(value, faces().footer, { color = Blitbuffer.COLOR_BLACK,
                         max_width = right_w }) },
             },
         }
         -- 行间点线（本页最后一行不画，交给翻页栏上方的收口线）
         if _i < last_idx then
             group[#group + 1] = HRule:new{ width = width, height = line_w,
-                color = Blitbuffer.COLOR_GRAY_E, dotted = true }
+                color = Blitbuffer.COLOR_BLACK, dotted = true }
         end
     end
 
@@ -3288,7 +4724,7 @@ function StatisticsPage:buildUnitsPage(width)
     --   ⚠ 不用 IconButton（自带白底 + 边框，去不掉）。
     local nav_h = Screen:scaleBySize(44)
     -- 热区：透明，只负责命中面积（不画任何东西）。
-    local arrow_w = Screen:scaleBySize(30)
+    local arrow_w = Screen:scaleBySize(44)
     -- 箭头与页码之间的**固定留白**（让它们「近一点」但不相撞）
     local gap = Size.padding.small
     -- ── 翻页按钮：裸 chevron（无底色、无边框）+ TapBox 热区 ──
@@ -3349,6 +4785,7 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     local row_h = Screen:scaleBySize(34)
     local chart_h = row_h * TREND_ROWS
     local is_chart = self.trend_view ~= "list"
+    local is_daily_list = self.period == "day" and not is_chart
 
     -- ★★★ 40-unit-free：上限和「这张图用哪个单位」都**提前**算 ——
     --   因为下面的**标题**要拿单位（「阅读时长趋势（分）」）。
@@ -3365,48 +4802,51 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     --     单位总得有个地方说一次 —— 标题最省地方、而且永远看得见；
     --   · 列表视图每行都写着「14分钟」，标题上再重复一遍纯属啰嗦；
     --   · 指标名里已经含这个单位时不重复（「阅读字数」里已经有「字」）。
-    local title_text = metric_label .. _("趋势")
+    local title_text = is_daily_list and _("按小时阅读记录") or metric_label .. _("趋势")
     if is_chart and not string.find(title_text, unit.suffix, 1, true) then
         title_text = title_text .. "（" .. unit.suffix .. "）"
     end
 
     -- 标题行 + 图表/列表切换
-    local toggle_width = Screen:scaleBySize(58)
+    local icon_size = Screen:scaleBySize(22)
+    local toggle_size = Screen:scaleBySize(42)
     local header = HorizontalGroup:new{ align = "center" }
     header[#header + 1] = text(title_text, f.section, {
         bold = true,
-        max_width = inner_w - toggle_width - Size.padding.large,
+        max_width = inner_w - 2 * toggle_size - Size.padding.large,
     })
-    local spacer_w = math.max(0, inner_w - toggle_width
+    local spacer_w = math.max(0, inner_w - 2 * toggle_size
         - Size.padding.large - header[1]:getSize().w)
     header[#header + 1] = HorizontalSpan:new{ width = spacer_w }
-    header[#header + 1] = buildSegmentedRow{
-        width = toggle_width,
-        height = Screen:scaleBySize(28),
-        radius = Size.radius.button,
-        items = {
-            {
-                icon = "column.three",
-                active = self.trend_view ~= "list",
-                on_tap = function()
-                    if self.trend_view == "list" then
-                        self:reload{ trend_view = "chart" }
-                    end
-                    return true
-                end,
+    local function trendToggle(icon_name, target_view)
+        local active = self.trend_view == target_view
+        local indicator_h = Screen:scaleBySize(2)
+        local indicator = active and SolidRect:new{
+            width = icon_size,
+            height = indicator_h,
+            color = Blitbuffer.COLOR_BLACK,
+        } or VerticalSpan:new{ width = indicator_h }
+        return TapBox:new{
+            FixedBox:new{
+                width = toggle_size,
+                height = toggle_size,
+                align = "center",
+                vertical_align = "center",
+                VerticalGroup:new{
+                    align = "center",
+                    icon(icon_name, icon_size),
+                    VerticalSpan:new{ width = Screen:scaleBySize(2) },
+                    indicator,
+                },
             },
-            {
-                icon = "align.justify",
-                active = self.trend_view == "list",
-                on_tap = function()
-                    if self.trend_view ~= "list" then
-                        self:reload{ trend_view = "list" }
-                    end
-                    return true
-                end,
-            },
-        },
-    }
+            on_tap = function()
+                if not active then self:reload{ trend_view = target_view } end
+                return true
+            end,
+        }
+    end
+    header[#header + 1] = trendToggle("column.three", "chart")
+    header[#header + 1] = trendToggle("align.justify", "list")
 
     local section = VerticalGroup:new{ align = "left" }
     section[#section + 1] = header
@@ -3442,9 +4882,23 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
         --   最高的那根柱子的数字会**直接压到标题上**。
         --   所以这里显式补一个 span，高度 = 标签高 + 标签与柱顶的间距 + 余量。
         --   ⚠ 别图省事写死像素：字号一改就不够了（labelMetrics 量的就是真字号）。
+        --
+        -- ★★★ 46-chart-lower：余量从 `scaleBySize(3) + scaleBySize(2)`（=10px）
+        --   放大到 **`scaleBySize(14)`（=28px）**。
+        --
+        --   46 轮用户原话：「统计图可以适当往下一点」。
+        --   算一下就知道原来**刚好够、但一点富余都没有**：
+        --     标签需要 = label_h + gap(scaleBySize(3)=6px)
+        --     原来给的 = label_h + 10px  ⇒ 只剩 4px 富余
+        --   最高柱顶到图顶时，标签上沿离标题就只有 4px，视觉上「贴脸」。
+        --   改后富余 22px，图整体下移约 9px（余量差 18px，其中一半落在图上方），
+        --   标题和图之间终于有呼吸感。
+        --   ⚠ 这个值只影响「图上方那块留白」，**不动图高**（仍是 4*row_h），
+        --     所以 x 轴刻度行、周期导航、翻页栏的位置都不会被顶走 ——
+        --     页面总高只多了 18px，KPW4 上完全吃得下。
         local label_h = labelMetrics("0", f.value).h
         section[#section + 1] = VerticalSpan:new{
-            width = label_h + Screen:scaleBySize(3) + Screen:scaleBySize(2),
+            width = label_h + Screen:scaleBySize(14),
         }
 
         -- ★★★ 37s：图 = 柱状位图 + **每根柱子顶上的数值标签**（用户要求）。
@@ -3465,6 +4919,18 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
         -- ★★★ 40-no-y-axis：不再需要给 Y 轴列让位，刻度行直接铺满。
         local tick_row = buildTickRow(buckets, chart_w, tick_h, Blitbuffer.COLOR_BLACK)
         section[#section + 1] = tick_row
+    elseif is_daily_list then
+        local hourly_rows, total_seconds, total_units = buildHourlyActivityList(buckets, inner_w)
+        if total_seconds > 0 or total_units > 0 then
+            section[#section + 1] = VerticalSpan:new{ width = Screen:scaleBySize(6) }
+            section[#section + 1] = text(
+                T(_("当天共阅读 %1 字，阅读 %2"), formatCount(total_units), formatDuration(total_seconds)),
+                f.footer,
+                { bold = true, max_width = inner_w }
+            )
+            section[#section + 1] = VerticalSpan:new{ width = Screen:scaleBySize(6) }
+        end
+        section[#section + 1] = hourly_rows
     else
         section[#section + 1] = buildTrendList(buckets, metric, selected, inner_w)
     end
@@ -3481,8 +4947,8 @@ function StatisticsPage:buildTrendSection(width, buckets, selected, metric_overr
     section[#section + 1] = VerticalSpan:new{ width = Size.span.vertical_default }
     section[#section + 1] = HorizontalGroup:new{
         align = "center",
-        text(self:footerText(buckets, selected, metric), f.footer, {
-            color = Blitbuffer.COLOR_DARK_GRAY,
+            text(self:footerText(buckets, selected, metric), f.footer, {
+            color = Blitbuffer.COLOR_BLACK,
             max_width = inner_w,
         }),
     }
@@ -3577,7 +5043,7 @@ function StatisticsPage:buildMetricLegend(width)
                     width = cell_w - Size.padding.small, height = cell_h,
                     align = "left", vertical_align = "center",
                     bordersize = Screen:scaleBySize(1),
-                    color = Blitbuffer.COLOR_GRAY_E,
+                    bordercolor = Blitbuffer.COLOR_BLACK,
                     radius = Size.radius.button,
                     background = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
                     padding = 0,
@@ -3625,7 +5091,8 @@ function StatisticsPage:showPeriodDialog()
         title = _("选择统计周期"),
         buttons = buttons,
     }
-    UIManager:show(self.dialog)
+    -- ★★★ 50b：不能写成裸的 `UIManager:show(self.dialog)` —— 见 showNoFlash 的注释。
+    showNoFlash(self.dialog)
 end
 
 --- ★★★ 37r：点「2026年」**直接选年份**（用户要求）。
@@ -3701,7 +5168,8 @@ function StatisticsPage:showYearPicker()
         modal = true,
         buttons = buttons,
     }
-    UIManager:show(self.dialog)
+    -- ★★★ 50b：不能写成裸的 `UIManager:show(self.dialog)` —— 见 showNoFlash 的注释。
+    showNoFlash(self.dialog)
 end
 
 --==========================================================================
@@ -3725,7 +5193,11 @@ end
 ---   翻月箭头那样做没问题（用户本来就在逐月翻），但**选择器**是「我要跳到
 ---   2021 年 7 月」：把日重置成 1 号，等于顺手把用户当前看的这天弄丢了。
 ---   所以这里自己算：保留原来的日，目标月天数不够时夹到该月最后一天。
-local function anchorAtMonth(anchor, year, month)
+--- ★★★ 50c：这里**不能**写成 `local function anchorAtMonth(...)` ——
+---   它已经在上面的前向声明块里 `local anchorAtMonth` 过了，
+---   再写 `local function` 会**另起一个新的 local**，前向声明就白做了
+---   （`buildCalendarPage` 那边看到的仍是 nil）。
+anchorAtMonth = function(anchor, year, month)
     local _y, _m, day = tonumber(os.date("%Y", anchor)), tonumber(os.date("%m", anchor)),
         tonumber(os.date("%d", anchor))
     day = day or 1
@@ -3740,11 +5212,9 @@ end
 --- 统一的入口：按粒度弹对应的选择器。
 ---   「总」没有可选的格子（累计就是全部）⇒ 什么都不做。
 ---
---- ★★★ 44-day-picker：`day` 从「弹月份列表」改成**弹日期列表**。
+--- ★★★ 44-day-picker：`day` 从「弹月份列表」改成**弹日期日历**。
 ---   用户原话：「日的没有选择日的选择器吗」。
----   以前 43 轮把「日」也接到月份列表上（理由：一个月 28~31 天，列表太长），
----   但那样「日」这个粒度其实**选不了具体的日**，只能靠第 2 行内圈箭头一天天翻。
----   现在补上真正的日列表；翻月仍然靠第 2 行的外圈（月）箭头，没丢功能。
+---   可用日历两侧箭头翻月，点日期后直接查看该日。
 function StatisticsPage:showPeriodPicker(granularity)
     granularity = granularity or self.period
     if granularity == "year" then
@@ -3810,283 +5280,366 @@ function StatisticsPage:showMonthPicker(target_period)
         modal = true,
         buttons = buttons,
     }
-    UIManager:show(self.dialog)
+    -- ★★★ 50b：不能写成裸的 `UIManager:show(self.dialog)` —— 见 showNoFlash 的注释。
+    showNoFlash(self.dialog)
 end
 
---- ★★★ 44-day-picker：**月历网格**（点「日」标签或第 2 行文字时弹出）。
+--- 日期日历选择器。月箭头切换月份，选择日期后回到对应的日趋势。
+--- ★★★ 45-flat-dialog：构造一个**不带任何分隔线**的 ButtonDialog。
 ---
---- 用户原话：「日的没有选择日的选择器吗」。
+--- 为什么需要（45 轮用户：「日期选择怎么还是有分割线」）：
+---   日历网格里那些「格与格之间的竖灰线 / 行与行之间的横灰线」**不是按钮的边框**，
+---   而是 `ButtonTable` 自己画的（ui/widget/buttontable.lua）：
+---     · 行内：`vertical_sep = LineWidget{ background = COLOR_GRAY }`（第 121~127 行）
+---     · 行间：`self:addVerticalSeparator()` 也是 `COLOR_GRAY`（第 178~186 行）
+---   在按钮条目上写 `bordersize = 0` **完全没用** —— ButtonTable 给每个 Button
+---   硬编码了 `bordersize = 0`（第 89 行），那条灰线跟按钮边框是两回事。
+---   这就是上一轮「改了还是有分割线」的原因。
 ---
---- 列 anchor 所在**月**的每一天，按周一至周日排成 7 列月历，当前那天带 ✓。
---- 选中某一行 ⇒ `period` 仍是 `day`，只把 anchor 挪到那一天（年月不变）。
+--- 做法：`sep_width` 是 ButtonTable 的**类默认值**（`ButtonTable:extend{ sep_width = … }`），
+---   实例化时经元表取到。这里临时把它置 0 → 构造 → **立刻还原**。
+---   `new()` 内部同步跑完 `init()`（sep_width 就是在 init 里读的，而且
+---   shrink 分支会 `free()` + 再 `init()` 一次，也仍在这次 new 里），
+---   所以还原的时候构造已经结束，不会影响任何别的对话框。
+---   `sep_width = 0` ⇒ 行内的竖线宽 0、行间的横线高 0，LineWidget 画了个空矩形，
+---   等于没有线；顺带把省下的宽度还给按钮。
+local function newFlatButtonDialog(opts)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local ButtonTable = require("ui/widget/buttontable")
+    local saved = ButtonTable.sep_width
+    ButtonTable.sep_width = 0
+    local ok, dlg = pcall(ButtonDialog.new, ButtonDialog, opts)
+    ButtonTable.sep_width = saved
+    if not ok then error(dlg) end
+    return dlg
+end
+
+--- ★★★ 45f：把「当前项」按钮做成**黑底白字**（真正能生效的做法）。
 ---
---- 顶部的 ‹ / › 翻月、« / » 翻年只改变日历显示；选中日期才更新统计锚点。
---- 首日之前的空位用于保持自然的星期对齐。
-function StatisticsPage:showDayPicker(display_year, display_month)
-    local anchor = tonumber(self.anchor) or os.time()
-    local anchor_year = tonumber(os.date("%Y", anchor)) or 1970
-    local anchor_month = tonumber(os.date("%m", anchor)) or 1
-    local anchor_day = tonumber(os.date("%d", anchor)) or 1
-    local year = tonumber(display_year) or anchor_year
-    local month = tonumber(display_month) or anchor_month
-    -- 本月天数：下个月 1 号往前一天
+--- 为什么 `background` + `color` 不行：
+---   · `ButtonTable` **会**透传 `background`（buttontable.lua:98），黑底是能出来的；
+---   · 但 Button 的**文字颜色是硬编码的**，压根没有可配字段 ——
+---     button.lua:114：`local fgcolor = self.enabled and Blitbuffer.COLOR_BLACK
+---     or Blitbuffer.COLOR_DARK_GRAY`，随后原样喂给 TextWidget。
+---     既没有 `text_font_color`，也没有 `color`。
+---   ⇒ `btn.color = COLOR_WHITE` 完全无效 ⇒ 黑底 + 黑字 = **一整块黑**，
+---     这就是用户报的「选中的周直接全变黑了」。
+---   （顺带：`btn.bold` 也是无效字段 —— ButtonTable 透传的是 `font_bold`，
+---     见 buttontable.lua:97。这里干脆不加粗，免得长文本触发缩字号。）
+---
+--- 正解：ButtonTable 会透传 `id`（buttontable.lua:117 存进 `button_by_id`），
+---   构造完 dialog 后按 id 取回 Button 实例，把它的 `frame.invert` 置 true ——
+---   `FrameContainer:paintTo` 里有 `if self.invert then bb:invertRect(...)`
+---   （framecontainer.lua:161），整个按钮区域**反色绘制**：
+---   白底黑字 ⇒ 黑底白字，文字自动跟着反，不用碰 TextWidget。
+---   ⚠ 用了 invert 就**不要**再设 `background = COLOR_BLACK`，否则会被反成白底。
+local function invertButtons(dlg, ids)
+    local bt = dlg and dlg.buttontable
+    if not (bt and bt.button_by_id) then return end
+    for _, id in ipairs(ids) do
+        local b = bt.button_by_id[id]
+        if b and b.frame then b.frame.invert = true end
+    end
+end
+
+function StatisticsPage:showDayPicker(anchor_override)
+    local anchor = tonumber(anchor_override or self.anchor) or os.time()
+    local year = tonumber(os.date("%Y", anchor)) or 1970
+    local month = tonumber(os.date("%m", anchor)) or 1
+    local cur_day = tonumber(os.date("%d", anchor)) or 1
+    local first_of_month = os.time{
+        year = year, month = month, day = 1, hour = 12, min = 0, sec = 0,
+    }
     local last_day = tonumber(os.date("%d", os.time{
         year = year, month = month + 1, day = 0, hour = 12, min = 0, sec = 0,
     })) or 31
-
     local buttons = {}
-    local function closePicker()
-        if self.dialog then
+
+    -- ★★★ 46-day-picker-2rows：头行从**一行**拆成**两行**（年一行、月一行）。
+    --
+    --   46 轮用户原话：「日的选择器里，年和月放到两行」。
+    --
+    --   改前是一行三个按钮：`‹ | 2026年10月 | ›`，两个箭头**都只管月份**
+    --   （一次挪 1 个月，跨年会自动进位/退位）。问题是想看「去年同月」时
+    --   得连点十几次 —— 最坏情况（跨 24 个月）要点 24 下。
+    --   拆成两行后：年行箭头跨 1 年、月行箭头跨 1 月 ⇒ 同样那次跳转只要 3 下。
+    --
+    --   ⚠ 月份行的箭头**保持原来的跨年行为**（12 月的 › 走到次年 1 月），
+    --     这是 anchorAtMonth 的既有语义（os.time 会自动规整越界的 month，
+    --     见它的实现），没有改动。
+    --   ⚠ 年月文字用 `%d 年` / `%d 月`（中间空格）而不是 `%04d年%02d月`：
+    --     拆行后每格宽度从约 110px 涨到 330px 的一半以上，不用再为了省地方
+    --     把年月挤在一起；留个空格在 e-ink 上更透气。
+    --     年份不补零（`2026` 而不是 `2026`）—— `%04d` 本来就是四位，
+    --     但**别写成 `%d` 的裸数字**：年份不会小于 1000，`%04d` 更稳。
+    local function gotoAnchor(target)
+        return function()
             UIManager:close(self.dialog)
             self.dialog = nil
+            self:showDayPicker(target)
+            return true
         end
     end
-    local function showMonthChoices(target_year)
-        local month_buttons = {}
-        local row = {}
-        for m = 1, 12 do
-            local label = string.format("%d月", m)
-            if target_year == year and m == month then label = label .. " ✓" end
-            local selected_month = m
-            row[#row + 1] = {
-                text = label,
-                no_vertical_sep = true,
-                callback = function()
-                    closePicker()
-                    self:showDayPicker(target_year, selected_month)
-                end,
-            }
-            if #row == 3 then
-                month_buttons[#month_buttons + 1] = row
-                row = {}
-            end
-        end
-        local ButtonDialog = require("ui/widget/buttondialog")
-        self.dialog = ButtonDialog:new{
-            title = T(_("%1年 - 选择月份"), target_year),
-            shrink_unneeded_width = true,
-            modal = true,
-            buttons = month_buttons,
-        }
-        UIManager:show(self.dialog)
-    end
-    local function showYearChoices()
-        local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
-        local calendar_anchor = os.time{
-            year = year, month = month, day = 1, hour = 12, min = 0, sec = 0,
-        }
-        local years = GlobalStats.availableYears(store, calendar_anchor)
-        local year_buttons = {}
-        for _i, item in ipairs(years) do
-            local choice_year = item.year
-            local label = tostring(choice_year)
-            if choice_year == year then label = label .. " ✓" end
-            year_buttons[#year_buttons + 1] = {
-                {
-                    text = label,
-                    callback = function()
-                        closePicker()
-                        self:showDayPicker(choice_year, month)
-                    end,
-                },
-            }
-        end
-        local ButtonDialog = require("ui/widget/buttondialog")
-        self.dialog = ButtonDialog:new{
-            title = _("选择年份"),
-            shrink_unneeded_width = true,
-            modal = true,
-            width_factor = 0.96,
-            buttons = year_buttons,
-        }
-        UIManager:show(self.dialog)
-    end
-    local function showAdjacentMonth(month_delta)
-        local target = os.time{
-            year = year, month = month + month_delta, day = 1,
-            hour = 12, min = 0, sec = 0,
-        }
-        local target_year = tonumber(os.date("%Y", target))
-        local target_month = tonumber(os.date("%m", target))
-        closePicker()
-        self:showDayPicker(target_year, target_month)
-    end
-    local function showAdjacentYear(year_delta)
-        showAdjacentMonth(year_delta * 12)
-    end
-    local year_nav = {
-        {
-            text = "«",
-            callback = function()
-                showAdjacentYear(-1)
-                return true
-            end,
-        },
-        {
-            text = string.format("%d年", year),
-            callback = function()
-                showYearChoices()
-                return true
-            end,
-        },
-        {
-            text = "»",
-            callback = function()
-                showAdjacentYear(1)
-                return true
-            end,
-        },
-    }
-    local month_nav = {
-        {
-            text = "‹",
-            callback = function()
-                showAdjacentMonth(-1)
-                return true
-            end,
-        },
-        {
-            text = string.format("%d月", month),
-            callback = function()
-                showMonthChoices(year)
-                return true
-            end,
-        },
-        {
-            text = "›",
-            callback = function()
-                showAdjacentMonth(1)
-                return true
-            end,
-        },
-    }
-    buttons[#buttons + 1] = year_nav
-    buttons[#buttons + 1] = month_nav
+    local function noop() return true end
 
-    local weekdays = { _("一"), _("二"), _("三"), _("四"), _("五"), _("六"), _("日") }
-    local heading = {}
-    for i, name in ipairs(weekdays) do
-        heading[i] = {
-            text = name,
-            no_vertical_sep = true,
-            callback = function() return true end,
-        }
-    end
-    buttons[#buttons + 1] = heading
-
-    local row = nil
-    local function appendBlankCell()
-        row = row or {}
-        row[#row + 1] = {
-            text = " ",
-            enabled = false,
-            no_vertical_sep = true,
-            callback = function() return true end,
-        }
-    end
-    local first_day = os.time{
-        year = year, month = month, day = 1,
-        hour = 12, min = 0, sec = 0,
+    -- 第 1 行：年（箭头跨 1 年，保留当前月/日）
+    buttons[#buttons + 1] = {
+        { text = "‹", callback = gotoAnchor(anchorAtMonth(anchor, year - 1, month)) },
+        { text = string.format("%04d 年", year), callback = noop },
+        { text = "›", callback = gotoAnchor(anchorAtMonth(anchor, year + 1, month)) },
     }
-    local first_weekday = tonumber(os.date("%w", first_day)) or 0 -- Sunday = 0
-    local leading_blanks = (first_weekday + 6) % 7
-    for _i = 1, leading_blanks do
-        appendBlankCell()
+    -- 第 2 行：月（箭头跨 1 月，跨年自动进位 —— 见函数头注释）
+    buttons[#buttons + 1] = {
+        { text = "‹", callback = gotoAnchor(anchorAtMonth(anchor, year, month - 1)) },
+        { text = string.format("%d 月", month), callback = noop },
+        { text = "›", callback = gotoAnchor(anchorAtMonth(anchor, year, month + 1)) },
+    }
+
+    local weekdays = { "一", "二", "三", "四", "五", "六", "日" }
+    local weekday_row = {}
+    for i = 1, #weekdays do
+        weekday_row[i] = { text = weekdays[i], callback = function() return true end }
     end
-    for d = 1, last_day do
-        local label = tostring(d)
-        local is_current = year == anchor_year and month == anchor_month and d == anchor_day
-        if is_current then label = label .. " ✓" end
-        -- 每个按钮各自捕获自己的「日」（别用循环变量闭包）
-        local day = d
-        row = row or {}
-        row[#row + 1] = {
-            text = label,
-            no_vertical_sep = true,
+    buttons[#buttons + 1] = weekday_row
+
+    local row = {}
+    local weekday = tonumber(os.date("%w", first_of_month)) or 0
+    local leading_blanks = (weekday + 6) % 7
+    local function blankCell()
+        return { text = " ", callback = function() return true end, bordersize = 0 }
+    end
+    for _i = 1, leading_blanks do row[#row + 1] = blankCell() end
+    for day = 1, last_day do
+        local selected_day = day
+        local is_today = (selected_day == cur_day)
+        local btn = {
+            text = tostring(day),
             callback = function()
-                if self.dialog then
-                    UIManager:close(self.dialog)
-                    self.dialog = nil
-                end
-                if is_current then return end
+                UIManager:close(self.dialog)
+                self.dialog = nil
                 self:reload{
                     period = "day",
                     anchor = os.time{
-                        year = year, month = month, day = day,
+                        year = year, month = month, day = selected_day,
                         hour = 12, min = 0, sec = 0,
                     },
                 }
+                return true
             end,
+            bordersize = 0,
         }
-        if #row >= 7 then
+        if is_today then
+            -- ★★★ 45f：见 invertButtons 的注释 —— Button 的文字颜色是硬编码黑的，
+            --   `background = BLACK` + `color = WHITE` 只会得到「黑底黑字」。
+            --   改用 id，构造完 dialog 后统一反色成黑底白字。
+            btn.id = "wc_today"
+        end
+        row[#row + 1] = btn
+        if #row == 7 then
             buttons[#buttons + 1] = row
-            row = nil
+            row = {}
         end
     end
-    if row then
-        while #row < 7 do appendBlankCell() end
+    if #row > 0 then
+        while #row < 7 do row[#row + 1] = blankCell() end
         buttons[#buttons + 1] = row
     end
+    while #buttons < 8 do
+        local blank_row = {}
+        for _i = 1, 7 do blank_row[#blank_row + 1] = blankCell() end
+        buttons[#buttons + 1] = blank_row
+    end
 
-    local ButtonDialog = require("ui/widget/buttondialog")
-    self.dialog = ButtonDialog:new{
+    -- ★★★ 45-flat-dialog：走「无分隔线」版本 —— 日历要的是**留白分隔**，
+    --   不是 ButtonTable 默认那套灰线（见 newFlatButtonDialog 的注释）。
+    --
+    -- ★★★ 50-daypicker-wide：**去掉 shrink**（用户原话：「日的选择器太窄了」）。
+    --
+    --   ── 病因（算得出来的，不是感觉）──────────────────────────────────
+    --   45-flat-dialog 起这里带的是 `shrink_unneeded_width = true`。
+    --   上游 `buttontable.lua:143-169` 的语义是「把宽度收到刚好放下最宽的那行」：
+    --     `table_min_needed_width` = 各行 `row_min_width` 的**最大值**，
+    --     `row_min_width = width - (default_button_width - min_needed_button_width) * 列数`。
+    --
+    --   日历是**列数不等的混排行**（年/月行 3 列、星期行和日期行 7 列），
+    --   而 7 列那些行的 `min_needed` 只有「两位数 + 内边距」那么点（≈28px），
+    --   ⇒ 它们的 `row_min_width` 反而**很小**；真正卡住宽度的是
+    --   **年行**（3 列，中间那格是「2026 年」，`min_needed` ≈ 73px）。
+    --   按 KPW4 的尺寸算一遍（scaleBySize 系数 1.7867）：
+    --     ButtonDialog 默认宽 = floor(1072 * 0.9) = 964
+    --     buttontable 宽 = 964 - 2*3(border.window) - 2*4(padding.button) = 950
+    --     年行：  default = floor(950/3) = 316，min_needed ≈ 73
+    --            ⇒ row_min_width = 950 - (316-73)*3 = **221**
+    --     日期行：default = floor(950/7) = 135，min_needed ≈ 28
+    --            ⇒ row_min_width = 950 - (135-28)*7 = 201
+    --     ⇒ 取最大 = **221px**；`shrink_min_width = scaleBySize(100) = 179`
+    --       没兜到它（221 > 179）。
+    --   结果：**日历网格（buttontable）只有 221px 宽**，外面再套
+    --   `padding 4 + border 3` 才 235px（屏宽 1072 的 22%），
+    --   7 列 ⇒ 每格 floor(221/7) = **31px** —— 两位数挤在里面，
+    --   这就是「太窄了」的确切数字。
+    --
+    --   ── 改法 ─────────────────────────────────────────────────────
+    --     · 去掉 `shrink_unneeded_width`（默认 false ⇒ `width` 是真宽度，
+    --       不再被当 max_width 收）；
+    --     · 给一个显式的 `width_factor`：上游 `buttondialog.lua:92-97`
+    --       在没有 `width` 时按 `floor(min(屏宽,屏高) * width_factor)` 算。
+    --
+    --   ★★★ 53-daypicker-narrow：**0.80 → 0.74**。
+    --     用户原话：「日选择器的有点太宽了，但是也不要太窄」。
+    --     50 那轮从 221px（被 shrink 收到每格 31px）一口气放到 857px（每格 120px），
+    --     确实矫枉过正了 —— 每格 120px 装一个两位数，两边空得发慌。
+    --     KPW4 实算：
+    --       floor(1072 × 0.74) = **793** ⇒ buttontable 793 − 2×3 − 2×4 = **779**
+    --       ⇒ 7 列每格 floor(779/7) = **111px**（原 120px，收窄 7.5%）
+    --       ⇒ 年/月行 3 列每格 floor(779/3) = **259px**（「2026 年」还远没占满）
+    --     对话框 793px = 屏宽 74%，比统计浮窗（943px / 88%）明显窄一层，
+    --     「叠在上面的一层」的关系更清楚。
+    --     ⚠ 别再往下收到 0.7 以下：7 列每格会掉到 100px 以内，
+    --       「2026 年」那一行和两位数日期就开始挤了。
+    --     · 取值而不是照抄 ButtonDialog 默认的 0.90：见上面「叠在上面」的理由。
+    --
+    --   ⚠ 为什么不用「给每个格子传 width」撑宽：那样 7 列的 `HorizontalGroup`
+    --     总宽会小于 `container.width`，`VerticalGroup` 里各行左对齐、右边留白，
+    --     反而更难看。走 width_factor 让 ButtonTable 自己均分最稳。
+    --   ⚠ **别把 `shrink_unneeded_width = true` 加回来** —— 加回来立刻退回 221px。
+    --   ⚠ 年 / 月 / 周三个选择器**保持 shrink 不动**：它们是竖排列表
+    --     （一列一行），收窄到「刚好放下最宽那行」正是想要的；
+    --     只有日历这种网格才需要满宽。
+    self.dialog = newFlatButtonDialog{
         title = _("选择日期"),
-        shrink_unneeded_width = true,
+        width_factor = 0.74,   -- ★★★ 53-daypicker-narrow：0.80 → 0.74（见上）
         modal = true,
-        width_factor = 0.96,
         buttons = buttons,
     }
-    UIManager:show(self.dialog)
+    -- ★★★ 45f：今天的那个格子反色成黑底白字（见 invertButtons 的注释）。
+    invertButtons(self.dialog, { "wc_today" })
+    -- ★★★ 50b：不能写成裸的 `UIManager:show(self.dialog)` —— 见 showNoFlash 的注释。
+    showNoFlash(self.dialog)
 end
 
---- ★★★ 43-pickers：周列表（点「周」标签或第 2 行文字时弹出）。
+--- ★★★ 45-week-pager：周列表改成**图标翻页**，不再靠滚动。
 ---
 --- 每行 = 「第N周  MM.DD–MM.DD」（用户明确要求「第几周后面跟着时间」，
 ---   44 轮把日期区间从「10月05日–10月11日」改成「10.05–10.11」）。
---- 只列 anchor 所在年（最多 53 行）—— 理由见 GlobalStats.availableWeeks 的注释。
-function StatisticsPage:showWeekPicker()
+--- 只列 anchor 所在年（最多 53 周）—— 理由见 GlobalStats.availableWeeks 的注释。
+---
+--- ⚠ 45 轮用户反馈：「周选择器还是太长了」。
+---   算一下就明白：ButtonTable 的按钮字号是 20（⇒ 设备上 40px），
+---   一行「第53周  12.28–01.03」约 390px 宽、行高约 78px。
+---   53 行 = **4134px**，而 KPW4 一屏最多放 ~17 行 ⇒ 要滚 3 屏才到底。
+---   改成两列能减半，但对话框会从 ~410px 涨到 ~820px（用户上一轮明确说过
+---   「选择器不需要那么宽」）⇒ **不行**。
+---   所以沿用本插件的既定约定：「不用滚动、用图标翻页」
+---   （见 buildUnitsPage：每页 N 条 + 底部 ‹ › 箭头）。
+---
+--- ★★★ 45c-week-8：每页从 15 周**砍到 8 周**。
+---   45b 改成翻页后用户仍回执「周选择选还是太长」—— 嫌的是**弹窗高度**。
+---   15 行 + 1 行翻页栏 ≈ 16 行 ≈ 1250px，弹窗 206×660（占屏 91%），
+---   基本顶到屏幕上下沿。砍到 8 行后：弹窗 ≈ 206×382（占屏 53%），
+---   代价是页数 4 → 7。这是用户从 4 个候选里明确选的方案 B
+---   （预览见 ui-shots/字数统计UI修改-45c-周选择器方案.png）。
+local WEEK_PAGE_SIZE = 8
+
+function StatisticsPage:showWeekPicker(page)
     local store = self.plugin and self.plugin:_globalStore() or GlobalStats.newState()
     local anchor = tonumber(self.anchor) or os.time()
     local anchor_year = tonumber(os.date("%Y", anchor)) or 1970
     local weeks = GlobalStats.availableWeeks(store, anchor)
     local current_monday = GlobalStats.weekStart(anchor)
 
+    local total = #weeks
+    local page_count = math.max(1, math.ceil(total / WEEK_PAGE_SIZE))
+
+    -- 默认落在**当前正在看的那一周**所在的页，省得每次都从第 1 页翻起。
+    if not tonumber(page) then
+        page = 1
+        for i, item in ipairs(weeks) do
+            if item.monday == current_monday then
+                page = math.ceil(i / WEEK_PAGE_SIZE)
+                break
+            end
+        end
+    end
+    page = math.max(1, math.min(tonumber(page) or 1, page_count))
+
+    local first = (page - 1) * WEEK_PAGE_SIZE + 1
+    local last = math.min(total, first + WEEK_PAGE_SIZE - 1)
+
+    local function gotoPage(target)
+        return function()
+            if self.dialog then
+                UIManager:close(self.dialog)
+                self.dialog = nil
+            end
+            self:showWeekPicker(target)
+        end
+    end
+    local function noop() return true end
+
     local buttons = {}
-    for _i, item in ipairs(weeks) do
-        -- ★ 标签里不再重复年份（标题已经写了「（2026年）」）——
-        --   省下的宽度让「第41周 10月05日–10月11日」这一行在 KPW4 上不至于被裁。
+    -- 翻页行：‹  第 N/M 页  ›（到底时对应的箭头变成空白，不可点）
+    buttons[#buttons + 1] = {
+        {
+            text = page > 1 and "‹" or " ",
+            callback = page > 1 and gotoPage(page - 1) or noop,
+        },
+        {
+            -- ⚠ 这里**不能**写「第 N / M 页」：ButtonTable 把一行三等分，
+            --   每格只有 table_width/3 ≈ 137px，而「第 1 / 7 页」在 40px 字号下
+            --   约 174px ⇒ 会被压到缩字号（Button 的 avoid_text_truncation）。
+            --   写成「1 / 7」约 74px，稳稳放得下；两边就是 ‹ ›，含义也不含糊。
+            text = string.format("%d / %d", page, page_count),
+            callback = noop,
+        },
+        {
+            text = page < page_count and "›" or " ",
+            callback = page < page_count and gotoPage(page + 1) or noop,
+        },
+    }
+
+    for _i = first, last do
+        local item = weeks[_i]
         local label = item.label .. "  " .. item.range
         local is_current = (item.monday == current_monday)
-        if is_current then label = label .. " ✓" end
         local monday = item.monday
-        buttons[#buttons + 1] = {
-            {
-                text = label,
-                callback = function()
-                    if self.dialog then
-                        UIManager:close(self.dialog)
-                        self.dialog = nil
-                    end
-                    if is_current then return end
-                    -- 用 shiftAnchor("week", …) 平移：**保留星期几**（它加的是 7 天整数倍）
-                    local delta = math.floor((monday - current_monday) / (7 * 86400) + 0.5)
-                    self:reload{
-                        period = "week",
-                        anchor = GlobalStats.shiftAnchor("week", anchor, delta),
-                    }
-                end,
-            },
+        local btn = {
+            text = label,
+            callback = function()
+                if self.dialog then
+                    UIManager:close(self.dialog)
+                    self.dialog = nil
+                end
+                if is_current then return end
+                local delta = math.floor((monday - current_monday) / (7 * 86400) + 0.5)
+                self:reload{
+                    period = "week",
+                    anchor = GlobalStats.shiftAnchor("week", anchor, delta),
+                }
+            end,
+            bordersize = 0,
         }
+        if is_current then
+            -- ★ 当前周：黑底反白就够了 —— 44 轮那个尾随的「 ✓」不再需要，
+            --   去掉之后整行窄了约 20px（用户一直嫌它宽）。
+            -- ★★★ 45f：见 invertButtons 的注释 —— Button 的文字颜色是硬编码黑的，
+            --   原来那句 `btn.color = COLOR_WHITE` 是**无效字段**，结果黑底黑字，
+            --   就是用户报的「选中的周直接全变黑了」。改用 id + frame.invert。
+            btn.id = "wc_current_week"
+        end
+        buttons[#buttons + 1] = { btn }
     end
 
-    local ButtonDialog = require("ui/widget/buttondialog")
-    self.dialog = ButtonDialog:new{
+    self.dialog = newFlatButtonDialog{
         title = T(_("选择周（%1年）"), anchor_year),
         shrink_unneeded_width = true,
         modal = true,
         buttons = buttons,
     }
-    UIManager:show(self.dialog)
+    -- ★★★ 45f：当前周那一行反色成黑底白字（见 invertButtons 的注释）。
+    invertButtons(self.dialog, { "wc_current_week" })
+    -- ★★★ 50b：不能写成裸的 `UIManager:show(self.dialog)` —— 见 showNoFlash 的注释。
+    showNoFlash(self.dialog)
 end
 
 --==========================================================================
@@ -4094,18 +5647,24 @@ end
 --==========================================================================
 
 function M.show(plugin, period, anchor, metric)
+    period = period or "year"
     local ok, page = pcall(StatisticsPage.new, StatisticsPage, {
         plugin = plugin,
-        period = period or "year",
+        period = period,
         anchor = anchor,
         metric = metric or "units",
+        trend_view = period == "day" and "list" or "chart",
     })
     if not ok then
         logger.err("WordCount: statistics page initial build failed", page)
-        UIManager:show(InfoMessage:new{ text = T(_("统计页面打开失败：%1"), tostring(page)) })
+        -- ★★★ 50b：同上，走 showNoFlash，避免整屏无 region 的 "partial" 兜底刷新。
+        showNoFlash(InfoMessage:new{ text = T(_("统计页面打开失败：%1"), tostring(page)) })
         return nil
     end
-    UIManager:show(page)
+    -- ★★★ 50b：见 `showNoFlash` 的注释 —— 裸的 `UIManager:show(page)` 会让
+    --   `_repaint` 兜底排一次**整屏**无 region 的 "partial"（每 6 次还提升成
+    --   "full" = 整屏黑闪）。这是「打开统计页闪一下」的来源。
+    showNoFlash(page)
     return page
 end
 
