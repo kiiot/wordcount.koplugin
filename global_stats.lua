@@ -536,12 +536,31 @@ function M.summarize(store, period, anchor)
         result.notes = 0
         for path, book in pairs(store.books) do
             if type(book) == "table" then
-                result.books_read = result.books_read + 1
+                -- ★★★ cachegc 归档条目（由 cachegc.koplugin 生成，path 固定为
+                --   "@cachegc:archived"）：**一条记录代表已从设备移除的 N 本书**。
+                --
+                --   为什么需要它：books 表既是索引也是账本（累计时长/字数/页数/
+                --   笔记都是 Σ books[*].read_*），删掉已删书的条目就等于删历史。
+                --   归档把这些条目的数字先累加进一条汇总记录再删原件，
+                --   于是 Σ 一分不少、条目数从几百条降到 1 条。
+                --
+                --   `archived_books` 是这个条目代表几本：
+                --     有它 ⇒ 读过几本加 N（而不是加 1），完成/在读各加 archived_*；
+                --     没有它 ⇒ 与改动前完全一致（每本加 1），老数据零影响。
+                local archived = tonumber(book.archived_books) or 0
+                result.books_read = result.books_read + (archived > 0 and archived or 1)
                 result.seconds = result.seconds + safeNumber(book.read_seconds)
                 result.units = result.units + safeNumber(book.read_units)
                 result.pages = result.pages + safeNumber(book.read_pages)
                 result.notes = result.notes + safeNumber(book.notes)
-                if book.status == "complete" then
+                if archived > 0 then
+                    -- 归档条目的 status 是 "archived"，两个 if 都不会命中，
+                    -- 所以完成/在读必须走它自己的两个字段。
+                    result.books_completed = result.books_completed
+                        + safeNumber(book.archived_completed)
+                    result.books_in_progress = result.books_in_progress
+                        + safeNumber(book.archived_in_progress)
+                elseif book.status == "complete" then
                     result.books_completed = result.books_completed + 1
                 elseif book.status == "reading" or book.status == nil then
                     result.books_in_progress = result.books_in_progress + 1
