@@ -64,11 +64,6 @@ end
 
 -- Add one extracted page to the running count. `state.in_word` crosses page
 -- boundaries so a word split between two pages is not counted twice.
---
--- ★ 31-huge-book-guard：返回值里补上「本页新增了几个单位」。
---   以前调用方为了拿「这一页有多少字」，会**把同一个 text 再遍历一遍**
---   （`Counter.count(text)`）—— 页大时就是白白两倍 CPU。现在一次遍历同时
---   得到「累计值」和「本页增量」，调用方不必再数第二遍。
 function M.addPage(state, text)
     if type(state) ~= "table" then state = M.newState() end
     state.count = tonumber(state.count) or 0

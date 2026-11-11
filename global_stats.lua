@@ -77,13 +77,11 @@ function M.upsertBook(store, info)
     local units = safeNumber(info.read_units)
     local seconds = safeNumber(info.read_seconds)
     local pages = safeNumber(info.read_pages)
-    -- ★★★ 37b：以前这里只看「读了没有」（units/seconds/pages），一条都没读就直接
-    --   丢弃整条记录。但「重置设置」之后会出现一种合法情况：
-    --     · 全书字数在全局缓存里（KEY_CACHE）—— 我们**知道这本书多少字**
-    --     · 但阅读状态（KEY_READ_STATS）已被清掉 —— read_units = 0
-    --   这时如果还按老判据丢弃，`total_units`（全书字数）就永远进不了聚合，
-    --   用户看到的还是「总览里这本书 0 / 不显示」——正是他报的 bug。
-    --   所以：**只要带了 total_units，就值得记一条**（哪怕还没读）。
+    -- 以前这里只看「读了没有」（units/seconds/pages），一条都没读就直接
+    -- 丢弃整条记录。但「重置设置」之后会出现一种合法情况：
+    -- · 全书字数在全局缓存里（KEY_CACHE）—— 我们**知道这本书多少字**
+    -- · 但阅读状态（KEY_READ_STATS）已被清掉 —— read_units = 0
+    -- 这时如果还按老判据丢弃，`total_units`（全书字数）就永远进不了聚合，
     if units <= 0 and seconds <= 0 and pages <= 0 and not info.new_page
             and info.notes == nil
             and not (tonumber(info.total_units) and tonumber(info.total_units) > 0) then
@@ -107,8 +105,8 @@ function M.upsertBook(store, info)
     return store
 end
 
---- 记录新增的笔记（KOReader 把标注/书签都存在 sidecar 的 "annotations" 里）。
---- info.notes 是"本次新增条数"，info.total_notes 是这本书当前的笔记总数。
+-- 记录新增的笔记（KOReader 把标注/书签都存在 sidecar 的 "annotations" 里）。
+-- info.notes 是"本次新增条数"，info.total_notes 是这本书当前的笔记总数。
 function M.recordNotes(store, info)
     store = M.normalize(store)
     info = info or {}
@@ -137,7 +135,7 @@ function M.recordNotes(store, info)
     return store
 end
 
---- 只回写某本书的笔记存量，不动阅读量（阅读量由 upsertBook 负责）。
+-- 只回写某本书的笔记存量，不动阅读量（阅读量由 upsertBook 负责）。
 function M.setBookNotes(store, info)
     store = M.normalize(store)
     info = info or {}
@@ -230,17 +228,6 @@ function M.shiftAnchor(period, anchor, delta)
     return anchor
 end
 
---- ★★★ 37b：周期导航的**双行标题**（用户要求）。
----
---- 用户原话：「日期做成双标题，第一行标题是年，第二行是月日，第二行的
----   内部是日切换，外部是月切换」。
----
---- 返回两行文字：
----   · line1 = 年（如 "2026年"）
----   · line2 = 月日（如 "10月03日"）—— ★ 任何粒度下都显示**锚点那天的月日**，
----     这样第二行的「内=日 / 外=月」热区在所有粒度下语义一致，不会出现
----     「年视图第二行写『全年』却点出个月视图」的割裂感。
----   · "total" 时只有一行「累计」，第二行返回 nil。
 function M.navLabels(period, anchor)
     anchor = tonumber(anchor) or os.time()
     local year, month, day = parts(anchor)
@@ -252,19 +239,7 @@ function M.navLabels(period, anchor)
     return line1, line2
 end
 
---- ★★★ 37r：列出可选年份，供统计页「点年份直接跳转」用。
---
---   用户要求：「选择年份使用左右箭头切换可以，点击年份直接选择年份也可以」。
---   箭头是「一格一格翻」，这里提供的是「一次跳到目标年」。
---
---   口径：
---     · 年份来源是 `store.days` 的日期键（形如 "2026-10-03"）；
---     · **永远**把 anchor 所在年与今年也算进去 —— 否则「刚装上还没读过书」
---       或「今年还没开始读」时列表会是空的，用户点开一片空白；
---     · 从新到旧排序（最近的年份最常被点，放最上面）。
---
---   返回：{ { year = 2026, has_data = true }, ... }
---   `has_data` 供调用方把没数据的年份画灰（点了也不会白跑一趟）。
+-- 列出可选年份，供统计页「点年份直接跳转」用。
 function M.availableYears(store, anchor)
     anchor = tonumber(anchor) or os.time()
     local anchor_year = parts(anchor)
@@ -295,18 +270,9 @@ function M.availableYears(store, anchor)
     return list
 end
 
---==========================================================================
--- ★★★ 43-pickers：周期选择器的数据源（月份列表 / 周列表）
---==========================================================================
---
--- 背景：用户要求「年的点击可以选择年份，月的点击可以选择月份，日的点击可以
---   选择月份，周的点击可以选择第几周（第几周后面跟着时间）」。
---   年份列表 37r 就有了（availableYears），这里补上月份和周。
+-- 周期选择器的数据源（月份列表 / 周列表）
 
---- 某一周（周一为一周之始）的周一零点时间戳。
---- ★ 口径必须与 `M.bounds("week", …)` 完全一致：都是
----   `day_start - ((weekday + 6) % 7) * 86400`（Sunday=0 ⇒ 周一偏移 6）。
----   两处一旦不一致，选择器里选的那一周和统计页显示的那一周就会差一天。
+-- 某一周（周一为一周之始）的周一零点时间戳。
 function M.weekStart(anchor)
     anchor = tonumber(anchor) or os.time()
     local year, month, day = parts(anchor)
@@ -315,20 +281,7 @@ function M.weekStart(anchor)
     return day_start - ((weekday + 6) % 7) * 86400
 end
 
---- 周序号（1 起）。
----
---- ★ 口径 = ISO 8601：「含当年**第一个周四**的那一周是第 1 周」。
----   等价说法：用「该周**周四**」所在的年 + 它距该年第一个周四几周。
----   跨年的那一周（例如 2025-12-29 周一 ~ 2026-01-04 周日）按周一算会被
----   归到上一年的第 53 周；按周四算它属于 2026 年第 1 周 —— 这才是大家
----   习惯的「第几周」。
----
---- ★ 全部用 `os.date("*t")` + `os.time` **自己算**，不用 `os.date("%W")`：
----   `%W` 虽然也是 C89，但插件没必要为了一个数字去赌 strftime 的实现；
----   而且自己算能在没有 KOReader 的环境里跑行为测试。
---- ★ 参数是「**任意一天**」，内部先归一到那一周的周一 —— 这样传周一、传周四、
----   传今天都对，不会因为调用方忘了归一而算出离谱的周号
----   （实测：直接把周四喂进来会得到 0）。
+-- 周序号（1 起）。
 function M.weekNumber(any_day)
     local monday = M.weekStart(tonumber(any_day) or os.time())
     local thursday = monday + 3 * 86400
@@ -341,14 +294,7 @@ function M.weekNumber(any_day)
     return math.floor((thursday - first_thursday) / (7 * 86400) + 0.5) + 1
 end
 
---- 列出可选月份，供统计页「点月份直接跳转」用。
---
---   口径与 availableYears 一致：
---     · 来源是 `store.days` 的日期键（形如 "2026-10-03"）；
---     · **永远**把 anchor 所在月与本月算进去（刚装插件时列表不至于空白）；
---     · 从新到旧排序（最近的月份最常被点）。
---
---   返回：{ { year = 2026, month = 10, label = "2026年10月", has_data = true }, … }
+-- 列出可选月份，供统计页「点月份直接跳转」用。
 function M.availableMonths(store, anchor)
     anchor = tonumber(anchor) or os.time()
     local anchor_year, anchor_month = parts(anchor)
@@ -385,31 +331,16 @@ function M.availableMonths(store, anchor)
         return a.month > b.month
     end)
     for _i, item in ipairs(list) do
-        -- ★★★ 44-month-label：**只显示月份**（用户原话「选择月份只显示月份」）。
-        --   原来是 `"%d年%d月"`（「2026年10月」），在选择器里 7 个字太占宽。
-        --   年份没丢，仍在 `item.year` 里；要拼回「2026年10月」随时可以。
-        --   ⚠ 已知取舍：列表若跨年（如 2026年1月 与 2025年1月 同时出现），
-        --     两行的「1月」会长得一模一样。当前列表是「有数据的月 ∪ anchor 月
-        --     ∪ 当前月」，一般 ≤ 13 行、跨 1~2 年，实际很少撞。
-        --     真撞了的话，选择器标题里会补一句「跨 20xx–20xx 年」提示。
+        -- **只显示月份**（用户原话「选择月份只显示月份」）。
+        -- ⚠ 已知取舍：列表若跨年（如 2026年1月 与 2025年1月 同时出现），
+        -- 两行的「1月」会长得一模一样。当前列表是「有数据的月 ∪ anchor 月
+        -- ∪ 当前月」，一般 ≤ 13 行、跨 1~2 年，实际很少撞。
         item.label = string.format("%d月", item.month)
     end
     return list
 end
 
---- 列出某一年的所有周（含「第几周 + 日期区间」），从新到旧。
---
---   用户原话：「周的点击可以选择第几周（第几周后面跟着时间）」——
---   所以每一项都带 `range`（如 "10.05–10.11"），选择器里
---   拼成「第41周  10.05–10.11」。
---
---   ★ 只列 anchor 所在年（year_override 可指定别的年）：
---     一年最多 53 周，弹窗可控；要是把「有数据的周」全列出来，
---     读三年就是 150+ 行 —— 那种列表没人会去翻。
---     想看别的年，先在「年」标签里选年，再点「周」。
---
---   返回：{ { monday = ts, year = 2026, week_no = 41,
---            label = "第41周", range = "10.05–10.11", has_data = true }, … }
+-- 列出某一年的所有周（含「第几周 + 日期区间」），从新到旧。
 function M.availableWeeks(store, anchor, year_override)
     anchor = tonumber(anchor) or os.time()
     local anchor_year = parts(anchor)
@@ -439,7 +370,7 @@ function M.availableWeeks(store, anchor, year_override)
                 if has_data[dayKey(monday + k * 86400)] then any = true break end
             end
             -- ⚠ weekNumber 只算一次：它内部要 os.date/os.time 三次，
-            --   这里循环 55 次，重复调用纯属白烧 CPU（KPW4 是单核 1GHz）。
+            -- 这里循环 55 次，重复调用纯属白烧 CPU（KPW4 是单核 1GHz）。
             local week_no = M.weekNumber(monday)
             weeks[#weeks + 1] = {
                 monday = monday,
@@ -447,10 +378,8 @@ function M.availableWeeks(store, anchor, year_override)
                 week_no = week_no,
                 has_data = any,
                 label = string.format("第%d周", week_no),
-                -- ★★★ 44-week-range：日期区间改成 `12.28–01.03` 这种「月.日」形式
-                --   （用户原话「选择周的周后面的日期是12.28这种形式」）。
-                --   原来是 `12月28日–01月03日`（14 字），一行塞不下、被裁；
-                --   改成 `12.28–01.03`（11 字）后整行短了一大截。
+                -- 日期区间改成 `12.28–01.03` 这种「月.日」形式
+                -- （用户原话「选择周的周后面的日期是12.28这种形式」）。
                 range = os.date("%m.%d", monday) .. "–" .. os.date("%m.%d", sunday),
             }
         end
@@ -468,19 +397,7 @@ local function countSet(set)
     return n
 end
 
---- ★★★ 37b：某个周期内「该算进来的书」的路径集合。
----
---- 老实现只看 `store.days`（按天记录），所以**只知道「当天真的读过」的书**。
---- 但「重置设置」之后，我们只能靠 `_resyncBookFromCache` 把书补进
---- `store.books`（字数在、当天没有阅读记录）——这类书在 days 里根本不存在，
---- 于是总览的「累计读过」数字与明细列表都看不到它，用户看到的还是「重置后
---- 不显示」。
----
---- 所以统一在这里收口：
----   · total 周期：store.books 里全部（口径本来就是「所有统计过的书」）
----   · 其它周期：days 里出现过的书  ∪  「已知全书字数(total_units>0)」且
----               last_read_date 落在周期内（或没有日期）的书
---- 两个调用方（summarize / details）都用它，保证「数字」和「列表」一致。
+-- 某个周期内「该算进来的书」的路径集合。
 local function booksInPeriod(store, period, first, last)
     local paths = {}
     if period == "total" then
@@ -536,17 +453,8 @@ function M.summarize(store, period, anchor)
         result.notes = 0
         for path, book in pairs(store.books) do
             if type(book) == "table" then
-                -- ★★★ cachegc 归档条目（由 cachegc.koplugin 生成，path 固定为
-                --   "@cachegc:archived"）：**一条记录代表已从设备移除的 N 本书**。
-                --
-                --   为什么需要它：books 表既是索引也是账本（累计时长/字数/页数/
-                --   笔记都是 Σ books[*].read_*），删掉已删书的条目就等于删历史。
-                --   归档把这些条目的数字先累加进一条汇总记录再删原件，
-                --   于是 Σ 一分不少、条目数从几百条降到 1 条。
-                --
-                --   `archived_books` 是这个条目代表几本：
-                --     有它 ⇒ 读过几本加 N（而不是加 1），完成/在读各加 archived_*；
-                --     没有它 ⇒ 与改动前完全一致（每本加 1），老数据零影响。
+                -- cachegc 归档条目（由 cachegc.koplugin 生成，path 固定为
+                -- "@cachegc:archived"）：**一条记录代表已从设备移除的 N 本书**。
                 local archived = tonumber(book.archived_books) or 0
                 result.books_read = result.books_read + (archived > 0 and archived or 1)
                 result.seconds = result.seconds + safeNumber(book.read_seconds)
@@ -574,9 +482,9 @@ function M.summarize(store, period, anchor)
             end
         end
     else
-        -- ★★★ 37b：用 booksInPeriod 而不是只数 days —— 这样「重置后靠缓存
-        --   补写进 store.books、但当天没读过」的书也能计入「累计读过」，
-        --   与 details() 的口径完全一致（数字和列表不会打架）。
+        -- 用 booksInPeriod 而不是只数 days —— 这样「重置后靠缓存
+        -- 补写进 store.books、但当天没读过」的书也能计入「累计读过」，
+        -- 与 details() 的口径完全一致（数字和列表不会打架）。
         local period_books = booksInPeriod(store, period, first, last)
         result.books_read = countSet(period_books)
         for path in pairs(period_books) do
@@ -600,8 +508,8 @@ function M.summarize(store, period, anchor)
     return result
 end
 
---- 下钻明细，供统计页卡片上的 ">" 使用。
---- kind: "days"（按天，降序）| "books_read" | "books_completed" | "books_in_progress"
+-- 下钻明细，供统计页卡片上的 ">" 使用。
+-- "days"（按天，降序）| "books_read" | "books_completed" | "books_in_progress"
 function M.details(store, period, anchor, kind)
     store = M.normalize(store)
     local first, last = M.bounds(period, anchor)

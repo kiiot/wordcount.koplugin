@@ -11,16 +11,12 @@ function M.newState(page_count, mtime, size)
         file_size = tonumber(size),
         page_units = {},
         page_seconds = {},
-        -- ★★★ 30-estimate-shadow-fix：「抽页估算垫进来的」页 key 集合。
-        --   这些 page_units[key] 是**样本均值**，不是该页真实字数。
-        --   留着这个集合的意义：_getPageUnits 读到某页时，若发现它是估算值，
-        --   就**照常走真实文本抽取并覆盖**，而不是被 `page_units[key] ~= nil`
-        --   短路掉 —— 否则用户真读到的页会永远显示平均字数，逐页精度再也回不来。
+        -- 「抽页估算垫进来的」页 key 集合。
         page_units_estimated = {},
-        -- ★★★ 39-jump-overcount：本书**全书字数**（由 main.lua 的
-        --   `_ensureReadState` / `_syncGlobalBook` 填）。放在 state 里而不是
-        --   加函数参数，是为了让 `recompute` 无论被谁调用都能拿到 —— 它要用来
-        --   守住「已读字数 ≤ 全书字数」这条硬不变式。
+        -- 本书**全书字数**（由 main.lua 的
+        -- `_ensureReadState` / `_syncGlobalBook` 填）。放在 state 里而不是
+        -- 加函数参数，是为了让 `recompute` 无论被谁调用都能拿到 —— 它要用来
+        -- 守住「已读字数 ≤ 全书字数」这条硬不变式。
         total_units = nil,
         read_units = 0,
         read_seconds = 0,
@@ -72,21 +68,7 @@ function M.addPageVisit(state, key, units, elapsed, min_sec, max_sec)
     return true, new_page, added_seconds
 end
 
---- ★★★ 39-jump-overcount：**最后一道闸门 —— 「已读字数 ≤ 全书字数」**。
----
---- 用户报：「当从某一章节跳另一章节的时候，中间未阅读的部分也会计算进去，
----   并且也会计算到阅读速度里」。
----
---- 上面那些修复（页映射失效停记账、单页字数钳制、页区间单调性闸门）都在
---- **源头**挡；但「已读字数超过全书字数」这件事**在任何情况下都不可能成立**，
---- 所以这里再守一条与机制无关的硬不变式：
----
----   · 全书字数已知（`state.total_units > 0`）时，
----     `read_units` 与由它派生的 `speed_units_per_minute` 一律不超过它。
----   · 全书字数未知时不动（不能凭空造一个上限）。
----
---- 这条闸门的价值：即便将来又冒出某个未知的抽取退化路径，
---- 「已读 150 万字 / 全书 153 万字，而只读了 2 页」这种荒谬组合也不会再出现。
+-- **最后一道闸门 —— 「已读字数 ≤ 全书字数」**。
 function M.recompute(state)
     local units, seconds = 0, 0
     local page_units = state.page_units or {}

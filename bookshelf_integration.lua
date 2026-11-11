@@ -11,13 +11,13 @@ local TOKENS_MARKER = "_word_count_koplugin_expand_wrapper"
 
 local TOKEN_NAMES = { "word_count_read", "word_speed", "word_count" }
 
---- 千分位。与 statistics_page.lua:groupDigits 同一份实现。
+-- 千分位。与 statistics_page.lua:groupDigits 同一份实现。
 local function groupDigits(n)
     local reversed = tostring(n):reverse():gsub("(%d%d%d)", "%1,"):reverse()
     return (reversed:gsub("^,", ""))
 end
 
---- 合法的单位显示模式。37r 新增 k / qian 两种。
+-- 合法的单位显示模式。37r 新增 k / qian 两种。
 local function normalizeUnitMode(mode)
     if mode == "full" or mode == "wan" or mode == "auto"
             or mode == "k" or mode == "qian" then
@@ -26,41 +26,15 @@ local function normalizeUnitMode(mode)
     return "auto"
 end
 
---- 把字数格式化成带单位的字符串。
---
---  ★★★ 37q：**必须与 `statistics_page.lua:formatCount` 语义完全一致**。
---
---  修的是一个用户直接看得见的显示不一致（37o 引入「单位显示」二级菜单后暴露）：
---    · 统计页（statistics_page.formatCount）在 wan 模式下、n < 10000 时
---      回退成完整数字 `1,234`；
---    · 而本文件旧实现（`mode == "wan" and n >= 10000` 之后直接落到 `return ...万`）
---      对 n < 10000 会算出 `0.1万` —— **1234 字被显示成「0.1万」**。
---  于是同一本书的字数在两处显示不同：统计页 `1,234`，书架占位符 `0.1万`。
---
---  修法：逐分支照抄 statistics_page.formatCount 的判定顺序，
---  三处（本文件 / statistics_page / main.unitFormatMode）口径统一。
---  ⚠ 改这里时务必同步 statistics_page.lua:formatCount —— 两处是同一份规则。
---
---  ★★★ 37r：新增 `k` 与 `qian` 两种「千」进制。
---    · k    → 358k    （英文千后缀，紧凑、适合跟数字混排）
---    · qian → 358千    （中文千，与「万/亿」同一套读法）
---    两者都只在 n >= 1000 时启用；不足 1000 一律回退完整数字
---    （否则 0.4千 / 0.4k 这种读数没有意义）。
---  ⚠ 新增/调整分支时，**必须同步 statistics_page.lua:formatCount 与
---    formatCountParts**，否则书架占位符与统计页会再次出现同一个数两种写法。
+-- 把字数格式化成带单位的字符串。
+-- ⚠ 改这里时务必同步 statistics_page.lua:formatCount —— 两处是同一份规则。
 local function formatUnits(value)
     local n = math.max(0, math.floor(tonumber(value) or 0))
     local mode = G_reader_settings and G_reader_settings:readSetting("word_count_unit_format") or "auto"
     mode = normalizeUnitMode(mode)
 
     -- 与 statistics_page.formatCount 一一对应：
-    --   1) full        → 完整数字（带千分位）
-    --   2) k   且 >= 1千 → 「k」
-    --   3) qian 且 >= 1千 → 「千」
-    --   4) wan  且 >= 1万 → 强制「万」
-    --   5) >= 1亿       → 「亿」
-    --   6) 其余且 >= 1万（auto）→ 「万」
-    --   7) 其余         → 完整数字（这就是旧实现漏掉的回退分支）
+    -- 1) full        → 完整数字（带千分位）
     if mode == "full" then
         return groupDigits(n)
     end
@@ -159,9 +133,8 @@ function M.register(Tokens, data_reader)
     if Tokens._word_count_koplugin_registered then return true, "already enabled" end
 
     local read_data = data_reader or cachedDataFor
-    -- ★★★ 39-terms：**术语统一**。三条描述原来都写 "reading units"，
-    --   而统计页/卡片一律叫「字」—— 同一个量两种叫法，用户反馈「术语混乱」。
-    --   本插件数出来的就是**字数**，英文也用 words 而不是 units。
+    -- **术语统一**。三条描述原来都写 "reading units"，
+    -- 而统计页/卡片一律叫「字」—— 同一个量两种叫法，用户反馈「术语混乱」。
     local descriptions = {
         { "word_count", "Total word count measured by the KOReader Word count plugin" },
         { "word_count_read", "Word count on pages actually read" },
