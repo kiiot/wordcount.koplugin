@@ -793,6 +793,67 @@ local function pageCount(doc)
     return ok and math.max(0, math.floor(tonumber(n) or 0)) or 0
 end
 
+--- 去掉所有空白后的文本：用来跨 API 比对「是不是同一段文字」。
+local function compactText(s)
+    return (tostring(s or ""):gsub("%s+", ""))
+end
+
+--- 整书文本的结尾，是否真的落在全书结尾？
+--- 这是比「总长度够不够」更硬的证据：取最后两页末尾的一小段做指纹，
+--- 在整书文本里**找不到** ⇒ 取的区间根本没走到书末（跨 DocFragment 被截断）。
+--- @return boolean|nil true=对得上, false=明显没覆盖到书末, nil=拿不到页文本无从判断
+local function wholeBookEndsAtBookEnd(doc, whole_text, pages)
+    local flat = compactText(whole_text)
+    if #flat == 0 then return false end
+    local probes, matched = 0, 0
+    for offset = 0, 1 do
+        local p = pages - offset
+        if p >= 1 then
+            local ok, text = pcall(PageText.extract, doc, p, pages)
+            if ok and type(text) == "string" then
+                local probe = compactText(text):sub(-24)
+                if #probe >= 8 then
+                    probes = probes + 1
+                    if flat:find(probe, 1, true) then matched = matched + 1 end
+                end
+            end
+        end
+    end
+    if probes == 0 then return nil end
+    return matched > 0
+end
+
+--- 整书一次取到的文本，是否真的覆盖了全书？
+--- 只看「取到了非空字符串」是不够的：xpointer 跨 DocFragment 时很容易只拿到
+--- 开头的几个章节，字数就会大幅偏少而且毫无提示。两道检查：
+---   ① 硬证据：书末的指纹必须出现在整书文本里；
+---   ② 软证据：按抽样页平均字数反推全书规模，差太多也判为截断。
+--- 抽不到页文本时不做判断（信任整书结果）。
+local function wholeBookCoversAllPages(doc, whole_text, pages)
+    if type(whole_text) ~= "string" or #whole_text == 0 then return false end
+    pages = tonumber(pages) or 0
+    if pages < 8 then return true end
+    if wholeBookEndsAtBookEnd(doc, whole_text, pages) == false then return false end
+    -- 样本取全书 1/4、1/2、3/4 处：开头往往是封面/版权/目录（字数极少），
+    -- 拿它们算平均会把「期望值」压得太低，漏掉真正的截断。
+    local spots = {
+        math.max(1, math.floor(pages / 4)),
+        math.max(1, math.floor(pages / 2)),
+        math.max(1, math.min(pages, math.floor(pages * 3 / 4))),
+    }
+    local chars, got = 0, 0
+    for _i, p in ipairs(spots) do
+        local ok, text = pcall(PageText.extract, doc, p, pages)
+        if ok and type(text) == "string" and #text > 0 then
+            chars = chars + #text
+            got = got + 1
+        end
+    end
+    if got == 0 or chars == 0 then return true end
+    local expect = (chars / got) * pages
+    return #whole_text >= expect * 0.5
+end
+
 -- 打开一个「后台文档」并把它**准备好**，让 getPageCount() 能返回真实页数。
 local HUGE_FILE_BYTES = 32 * 1024 * 1024        -- 一般格式：32MB
 local HUGE_FILE_BYTES_EPUB = 20 * 1024 * 1024   -- epub（压缩）：20MB
@@ -3389,6 +3450,16 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                     job.progress_dialog:setStatus(_("正在读取全书文本…"))
                 end
                 local whole, whole_err = PageText.extractWholeBook(scan_doc)
+                -- 取到了但可能只覆盖开头几个章节 —— 这种「静默少算」比失败更坑，
+                -- 所以先做覆盖率自检，不合格就当作没取到，退回逐页。
+                if type(whole) == "string" and #whole > 0
+                        and not wholeBookCoversAllPages(scan_doc, whole, job.page_count) then
+                    logger.warn("WordCount: whole-book text looks truncated, len="
+                        .. #whole .. " pages=" .. tostring(job.page_count)
+                        .. " → falling back to per-page scan")
+                    whole = nil
+                    whole_err = "whole-book text too short (truncated range)"
+                end
                 if type(whole) == "string" and #whole > 0 then
                     logger.info("WordCount: whole-book extraction OK, text length=" .. #whole)
                     job.whole_book = true

@@ -36,24 +36,51 @@ function M.extractWholeBook(doc)
         if okc and tonumber(n) and tonumber(n) > 0 then total = tonumber(n) end
     end
 
+    -- 终点必须落在**文档真正的末尾**。
+    --
+    -- epub 的 XPointer 由多个 DocFragment 组成（每个 xhtml 文件一段），形如
+    --   /body/DocFragment[7]/body/div[2]/p[5].12
+    -- 旧实现用 `first_xp:match("^(.*%])")` 取「最后一个 ] 之前」再拼 .99999999，
+    -- 拿到的是 `.../div[2]/p[5].99999999` —— 只覆盖**第一页所在的那个段落**，
+    -- 后面整本书都不在范围内。表现就是字数严重偏少（一本 60 万字的书少十万）。
+    local function endPointerFor(xp)
+        local frag = xp:match("/DocFragment%[(%d+)%]")
+        if frag then
+            -- 该片段内第「极大」个字符 ⇒ 覆盖到这个 html 文件的末尾
+            return "/body/DocFragment[" .. frag .. "].99999999"
+        end
+        local head = xp:match("^(.*)%.[0-9]+$")
+        if head then return head .. ".99999999" end
+        return xp .. ".99999999"
+    end
+
+    local function isForward(a, b)
+        if type(doc.compareXPointers) ~= "function" then return true end
+        local ok, cmp = pcall(doc.compareXPointers, doc, a, b)
+        return ok and cmp == 1
+    end
+
+    -- 最后一页的指针：先问 total（真实存在的页），再试 total+1。
+    local last_xp
+    for _i, page_no in ipairs({ total, total + 1 }) do
+        local okp, xp = pcall(doc.getPageXPointer, doc, page_no)
+        if okp and type(xp) == "string" and xp ~= "" and xp ~= first_xp then
+            last_xp = xp
+            break
+        end
+    end
+
     local end_xp
-    -- 优先：用 getXPointer()（当前阅读位置）试一次末尾偏移法
-    do
-        local okp, last_xp = pcall(doc.getPageXPointer, doc, total + 1)
-        if okp and type(last_xp) == "string" and last_xp ~= ""
-                and last_xp ~= first_xp then
+    if last_xp then
+        local candidate = endPointerFor(last_xp)
+        if isForward(first_xp, candidate) then
+            end_xp = candidate
+        else
+            -- 「片段末尾」这种构造万一不被接受，退回最后一页起点（只丢最后一页）
             end_xp = last_xp
         end
     end
-    -- 退一步：把首页 XPointer 的最后一个 "]" 之后的字符位置改成极大值
-    if not end_xp then
-        -- 形如 "/body/DocFragment[1]/body/div/p[3].0" → 末尾 ".0" 是字符偏移
-        local stem = first_xp:match("^(.*%])")
-        if stem then end_xp = stem .. ".99999999" end
-    end
-    if not end_xp then
-        return nil, "cannot build end XPointer"
-    end
+    if not end_xp then end_xp = endPointerFor(first_xp) end
 
     local ok, text = pcall(doc.getTextFromXPointers, doc, first_xp, end_xp)
     if not ok then
@@ -105,16 +132,21 @@ local function crePageText(doc, page, page_count)
                 local ok_cmp, cmp = pcall(doc.compareXPointers, doc, start_xp, end_xp)
                 if ok_cmp then ordered = cmp end
             end
-            if ordered == 0 or ordered == -1 then
-                return nil, "non-monotonic page span (page boundaries snapped)"
+            if ordered == 0 then
+                -- 起点 = 终点：这一页没有新的文字（整页插图之类），记 0 字即可，
+                -- 不该当成错误 —— 旧代码在这里 return nil，等于把整页丢掉。
+                return ""
             end
-            local ok_text, text = pcall(doc.getTextFromXPointers, doc, start_xp, end_xp)
-            if ok_text then
-                local normalized = normalize(text)
-                if normalized ~= nil and #normalized <= M.MAX_PAGE_TEXT_BYTES then
-                    return normalized
+            if ordered ~= -1 then
+                local ok_text, text = pcall(doc.getTextFromXPointers, doc, start_xp, end_xp)
+                if ok_text then
+                    local normalized = normalize(text)
+                    if normalized ~= nil and #normalized <= M.MAX_PAGE_TEXT_BYTES then
+                        return normalized
+                    end
                 end
             end
+            -- ordered == -1（起点跑到终点后面）：不用整段取文本，往下走兜底。
         end
     end
 
