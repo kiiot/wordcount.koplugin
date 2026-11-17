@@ -26,6 +26,24 @@ local ReadingStats = dofile(plugin_dir .. "reading_stats.lua")
 local GlobalStats = dofile(plugin_dir .. "global_stats.lua")
 local StatisticsPage = dofile(plugin_dir .. "statistics_page.lua")
 local BookshelfIntegration = dofile(plugin_dir .. "bookshelf_integration.lua")
+-- 内存探测（读 /proc）。扫描期间用它决定「块取多大」和「什么时候必须停手」。
+-- 加载失败不影响统计，只是退回固定的保守块大小。
+local ok_mem, Mem = pcall(dofile, plugin_dir .. "mem.lua")
+if not ok_mem or type(Mem) ~= "table" then
+    logger.warn("WordCount: mem 模块加载失败：" .. tostring(Mem))
+    Mem = {
+        availableMB = function() return nil end,
+        rssMB = function() return nil end,
+        peakMB = function() return nil end,
+        critical = function() return false, nil end,
+        tight = function() return false, nil end,
+        describe = function() return "unavailable" end,
+        beginScan = function() end,
+        endScan = function() end,
+        ABORT_AVAIL_MB = 28,
+        TIGHT_AVAIL_MB = 70,
+    }
+end
 -- 「来源 → 字数口径」规则表。只读书档里的 custom_props.platform，
 -- 不依赖元数据插件是否安装（详见模块头注释）。
 local SourcePolicy = dofile(plugin_dir .. "source_policy.lua")
@@ -502,8 +520,10 @@ function LiveProgressDialog:onCloseWidget()
 end
 
 local KEY_COUNT = "word_count_total_v1"
--- 同一本书的「含标点」口径字数。两种口径一起存，切开关不用重扫。
+-- 同一本书的「含标点」口径字数。三种口径一起存，切口径不用重扫。
 local KEY_COUNT_PUNCT = "word_count_total_punct_v1"
+-- 「严格字符数」口径（每个非空白字符算 1，对齐晋江/番茄后台那个数）
+local KEY_COUNT_CHAR = "word_count_total_char_v1"
 local KEY_MTIME = "word_count_file_mtime_v1"
 local KEY_SIZE = "word_count_file_size_v1"
 -- 记录「这个字数是估算的还是精确的」。
@@ -535,11 +555,6 @@ local SAMPLE_PAGES = 100          -- 抽页统计的样本页数
 local MODE_FULL = "full"
 local MODE_SAMPLE = "sample"
 
--- 整书一次取文本的页数上限。
-local WHOLE_BOOK_MAX_PAGES = 5000
--- 整书路径的**体积**闸门（和页数闸门并列，任一条命中就不走整书路径）。
-local WHOLE_BOOK_MAX_BYTES = 24 * 1024 * 1024
-
 -- **「极端大书」的口头确认线**（不是限制！）。
 local EXTREME_PAGES = 30000
 
@@ -548,8 +563,8 @@ local EXTREME_PAGES = 30000
 local PER_PAGE_SCAN_MAX_PAGES = EXTREME_PAGES
 
 -- **把「降级/拒绝」的触发点交给用户**。
--- ⚠ 内存保护并没有消失，只是从「替用户否决」改成「不选最危险的那条路径」：
--- · 整书一次取文本的路径（`WHOLE_BOOK_MAX_PAGES` / `WHOLE_BOOK_MAX_BYTES`）
+-- ⚠ 内存保护并没有消失：1.4.2 起改成「按剩余内存决定块大小 + 跌破安全线自动停手」
+--   （见 mem.lua 与 chooseBlockPages），不再靠页数/体积这类静态阈值去猜。
 local DEFAULT_DOWNGRADE_PAGES = 0   -- 0 = 不限制（58 起）
 
 -- 是否允许「自动降级」。（默认 false = 完整优先，不够就断）
@@ -604,31 +619,86 @@ local function scanModeName(mode)
     return _("完整扫描（精确）")
 end
 
--- 全局字数口径（**兜底**）：false = 只算文字（默认），true = 连标点一起算。
--- ⚠ 开了「按来源设定口径」之后，每本书按来源规则表决定口径，
--- 这个开关就不再影响那些书了 —— 它只负责「来源规则关闭」的情况。
-local function globalPunct()
-    return G_reader_settings ~= nil
-        and G_reader_settings:readSetting("word_count_count_punct") == true
+-- ================= 字数口径：三档 =================
+--
+--   "plain"  只算文字 —— 汉字/假名/谚文各 1，英文按词 1，标点不计
+--   "punct"  含标点   —— 上面的基础上，每个**全角**标点 +1
+--   "chars"  严格字符数 —— 每个非空白字符 +1（半角标点、英文字母逐个算）
+--
+-- ⚠ 前两档是「阅读单位」，不是平台后台那个数；第三档才是**对齐平台**的：
+--   平台按字符算，`2019年` 是 5 个字符，前两档只会记 2 个字。
+--
+-- 三种值在同一次扫描里同时累计，切口径只是换一个字段读，不用重扫。
+local COUNT_MODES = { plain = true, punct = true, chars = true }
+local SET_COUNT_MODE = "word_count_count_mode"
+local SET_COUNT_PUNCT_LEGACY = "word_count_count_punct"
+
+local function normalizeMode(value)
+    if value == true then return "punct" end
+    if value == false then return "plain" end
+    if type(value) == "string" and COUNT_MODES[value] then return value end
+    return nil
 end
 
---- 这本书该用什么口径。
--- @param path 书籍路径；nil = 不知道是哪本（按「未标注来源」的口径）
--- @return boolean true = 含标点
-local function punctIncluded(path)
-    local from_source = SourcePolicy.punctFor(path)   -- 总开关关闭时返回 nil
-    if from_source ~= nil then return from_source end
-    return globalPunct()
+-- 口径的显示名（和 SourcePolicy.modeLabel 保持一致）
+local function modeLabel(mode)
+    if mode == "punct" then return _("含标点") end
+    if mode == "chars" then return _("严格字符数") end
+    return _("只算文字")
 end
 
--- 从一组计数里按当前口径取值（两个值都来自同一次扫描，切口径不用重扫）。
--- 含标点口径下**没有**这个数时返回 nil —— 宁可让调用方当「没统计过」，
--- 也不能拿只算文字的数冒充，那正是「数字偏少」的根源。
-local function pickCount(plain, punct, path)
-    if punctIncluded(path) then
+-- 全局口径（**兜底**）：开了「按来源设定口径」之后，它只对来源规则
+-- 覆盖不到的书起作用。旧版本存的是布尔值 → 这里继续认。
+local function globalMode()
+    if not G_reader_settings then return "plain" end
+    local saved = normalizeMode(G_reader_settings:readSetting(SET_COUNT_MODE))
+    if saved then return saved end
+    if G_reader_settings:readSetting(SET_COUNT_PUNCT_LEGACY) == true then
+        return "punct"
+    end
+    return "plain"
+end
+
+local function setGlobalMode(mode)
+    mode = normalizeMode(mode) or "plain"
+    if not G_reader_settings then return end
+    G_reader_settings:saveSetting(SET_COUNT_MODE, mode)
+    -- 旧键同步写，避免降级到老版本时口径突变
+    G_reader_settings:saveSetting(SET_COUNT_PUNCT_LEGACY, mode == "punct")
+    G_reader_settings:flush()
+end
+
+--- 这本书该用什么口径（来源规则优先，否则全局兜底）。
+-- 返回模式字符串，**永远不是 nil** —— 调用方不用再判空。
+local function countModeOf(path)
+    local from_source = SourcePolicy.modeFor(path)   -- 总开关关闭时返回 nil
+    if from_source then return from_source end
+    return globalMode()
+end
+
+-- 某个口径要看哪个字段（缓存有效性检查用）
+local function modeField(mode)
+    if mode == "chars" then return "count_char" end
+    if mode == "punct" then return "count_punct" end
+    return "count"
+end
+
+--- 一次扫描的三个结果里，按口径取一个。
+-- ⚠ 该口径**没有**这个数时返回 nil —— 宁可让调用方当「没统计过」，
+-- 也绝不能拿另一种口径的数冒充，那正是「数字偏少」的根源。
+-- `strict` 为 true 时不做任何回退（缓存读路径用）；false 时允许退到
+-- 「更保守的那个」（收尾展示用，避免 0 字这种明显错误）。
+local function valueFor(mode, plain, punct, chars, strict)
+    if mode == "chars" then
+        local v = tonumber(chars)
+        if v and v > 0 then return v end
+        if strict then return nil end
+        return tonumber(punct) or tonumber(plain) or 0
+    elseif mode == "punct" then
         local v = tonumber(punct)
         if v and v > 0 then return v end
-        return nil
+        if strict then return nil end
+        return tonumber(plain) or 0
     end
     return tonumber(plain) or 0
 end
@@ -657,12 +727,13 @@ local function readCachedCount(path, prefer_settings)
                 and tonumber(e.mtime) == mtime
                 and tonumber(e.size) == size
                 and tonumber(e.count) and tonumber(e.count) > 0 then
-            -- 老缓存只有「只算文字」的 count；要含标点却没有 count_punct 时
+            -- 老缓存只有「只算文字」的 count；要别的口径却没有那个字段时
             -- 视为失效（重扫一次即可拿到），不能拿纯文字值冒充。
-            if punctIncluded(path) and not tonumber(e.count_punct) then return nil end
+            local mode = countModeOf(path)
+            if mode ~= "plain" and not tonumber(e[modeField(mode)]) then return nil end
             -- 第三个返回值告诉调用方这是不是估算值
-            return pickCount(e.count, e.count_punct, path), prefer_settings,
-                e.estimated == true
+            return valueFor(mode, e.count, e.count_punct, e.count_char, true),
+                prefer_settings, e.estimated == true
         end
         -- 全局里有这个 path 但指纹不符 → 明确失效，不用再看 DocSettings
         if type(e) == "table" then return nil end
@@ -678,27 +749,33 @@ local function readCachedCount(path, prefer_settings)
 
     local ok_m, saved_mtime = pcall(settings.readSetting, settings, KEY_MTIME)
     local ok_s, saved_size  = pcall(settings.readSetting, settings, KEY_SIZE)
-    local ok_c, saved_count = pcall(settings.readSetting, settings, KEY_COUNT)
-    if not (ok_m and ok_s and ok_c) then return nil end
+    local ok_plain, saved_count = pcall(settings.readSetting, settings, KEY_COUNT)
+    if not (ok_m and ok_s and ok_plain) then return nil end
 
     if tonumber(saved_mtime) ~= mtime then return nil end
     if tonumber(saved_size)  ~= size  then return nil end
     local count = tonumber(saved_count)
     if not count or count <= 0 then return nil end
-    -- 含标点口径：sidecar 里没这个键 ⇒ 当作没统计过（让用户重扫一次）
+    -- 当前口径在 sidecar 里没有对应字段 ⇒ valueFor 返回 nil ⇒ 当作没统计过
+    -- （让用户重扫一次），绝不拿另一种口径的数冒充。
+    local mode = countModeOf(path)
     local ok_p, saved_punct = pcall(settings.readSetting, settings, KEY_COUNT_PUNCT)
-    if punctIncluded(path) and not (ok_p and tonumber(saved_punct)) then return nil end
-    count = pickCount(count, saved_punct, path)
+    local ok_ch, saved_char = pcall(settings.readSetting, settings, KEY_COUNT_CHAR)
+    count = valueFor(mode, count,
+        ok_p and tonumber(saved_punct) or nil,
+        ok_ch and tonumber(saved_char) or nil, true)
+    if count == nil then return nil end
     -- 旧数据没有 KEY_ESTIMATED 键 → readSetting 返回 nil → 当作精确值（向后兼容）
     local ok_e, saved_est = pcall(settings.readSetting, settings, KEY_ESTIMATED)
     return count, settings, (ok_e and saved_est == true) or false
 end
 
--- 把统计结果写进**全局缓存**（键 = 文件路径，值 = 指纹 + 两种口径的字数）。
-local function writeCachedCount(path, count, count_punct, mtime, size, estimated)
+-- 把统计结果写进**全局缓存**（键 = 文件路径，值 = 指纹 + 三种口径的字数）。
+local function writeCachedCount(path, count, count_punct, count_char, mtime, size, estimated)
     if type(path) ~= "string" or path == "" then return false end
     count, mtime, size = tonumber(count), tonumber(mtime), tonumber(size)
     count_punct = tonumber(count_punct)
+    count_char = tonumber(count_char)
     if not count or count <= 0 or not mtime or not size then return false end
     if not (G_reader_settings and type(G_reader_settings.saveSetting) == "function") then
         return false
@@ -706,7 +783,7 @@ local function writeCachedCount(path, count, count_punct, mtime, size, estimated
     local ok_read, t = pcall(G_reader_settings.readSetting, G_reader_settings, KEY_CACHE)
     if not ok_read or type(t) ~= "table" then t = {} end
     t[path] = {
-        count = count, count_punct = count_punct,
+        count = count, count_punct = count_punct, count_char = count_char,
         mtime = mtime, size = size, at = os.time(),
         -- 估算标记。false 时也显式写出来，便于排查「为什么标了约」
         estimated = (estimated == true) and true or false,
@@ -766,6 +843,7 @@ local function removeCachedCount(path, prefer_settings)
     if settings then
         pcall(settings.delSetting, settings, KEY_COUNT)
         pcall(settings.delSetting, settings, KEY_COUNT_PUNCT)
+        pcall(settings.delSetting, settings, KEY_COUNT_CHAR)
         pcall(settings.delSetting, settings, KEY_MTIME)
         pcall(settings.delSetting, settings, KEY_SIZE)
         pcall(settings.delSetting, settings, KEY_ESTIMATED)
@@ -857,66 +935,6 @@ local function pageCount(doc)
     return ok and math.max(0, math.floor(tonumber(n) or 0)) or 0
 end
 
---- 去掉所有空白后的文本：用来跨 API 比对「是不是同一段文字」。
-local function compactText(s)
-    return (tostring(s or ""):gsub("%s+", ""))
-end
-
---- 整书文本的结尾，是否真的落在全书结尾？
---- 这是比「总长度够不够」更硬的证据：取最后两页末尾的一小段做指纹，
---- 在整书文本里**找不到** ⇒ 取的区间根本没走到书末（跨 DocFragment 被截断）。
---- @return boolean|nil true=对得上, false=明显没覆盖到书末, nil=拿不到页文本无从判断
-local function wholeBookEndsAtBookEnd(doc, whole_text, pages)
-    local flat = compactText(whole_text)
-    if #flat == 0 then return false end
-    local probes, matched = 0, 0
-    for offset = 0, 1 do
-        local p = pages - offset
-        if p >= 1 then
-            local ok, text = pcall(PageText.extract, doc, p, pages)
-            if ok and type(text) == "string" then
-                local probe = compactText(text):sub(-24)
-                if #probe >= 8 then
-                    probes = probes + 1
-                    if flat:find(probe, 1, true) then matched = matched + 1 end
-                end
-            end
-        end
-    end
-    if probes == 0 then return nil end
-    return matched > 0
-end
-
---- 整书一次取到的文本，是否真的覆盖了全书？
---- 只看「取到了非空字符串」是不够的：xpointer 跨 DocFragment 时很容易只拿到
---- 开头的几个章节，字数就会大幅偏少而且毫无提示。两道检查：
----   ① 硬证据：书末的指纹必须出现在整书文本里；
----   ② 软证据：按抽样页平均字数反推全书规模，差太多也判为截断。
---- 抽不到页文本时不做判断（信任整书结果）。
-local function wholeBookCoversAllPages(doc, whole_text, pages)
-    if type(whole_text) ~= "string" or #whole_text == 0 then return false end
-    pages = tonumber(pages) or 0
-    if pages < 8 then return true end
-    if wholeBookEndsAtBookEnd(doc, whole_text, pages) == false then return false end
-    -- 样本取全书 1/4、1/2、3/4 处：开头往往是封面/版权/目录（字数极少），
-    -- 拿它们算平均会把「期望值」压得太低，漏掉真正的截断。
-    local spots = {
-        math.max(1, math.floor(pages / 4)),
-        math.max(1, math.floor(pages / 2)),
-        math.max(1, math.min(pages, math.floor(pages * 3 / 4))),
-    }
-    local chars, got = 0, 0
-    for _i, p in ipairs(spots) do
-        local ok, text = pcall(PageText.extract, doc, p, pages)
-        if ok and type(text) == "string" and #text > 0 then
-            chars = chars + #text
-            got = got + 1
-        end
-    end
-    if got == 0 or chars == 0 then return true end
-    local expect = (chars / got) * pages
-    return #whole_text >= expect * 0.5
-end
 
 -- 打开一个「后台文档」并把它**准备好**，让 getPageCount() 能返回真实页数。
 local HUGE_FILE_BYTES = 32 * 1024 * 1024        -- 一般格式：32MB
@@ -951,6 +969,34 @@ local function hardRenderGuardBytes(path)
         return v * 1024 * 1024
     end
     return hugeFileThreshold(path)
+end
+
+-- 分块扫描的块大小：按**实测剩余内存**定，不看文件大小。
+--
+-- 为什么不看文件大小：epub 是压缩包，文件大小和实际文本量没有稳定关系
+-- （图片多的书很小却极吃内存，纯文字书反过来），而且同样一本书在别的设备上
+-- 可能刚好、换成 512MB 的机器就崩。剩余内存是唯一直接对应的量。
+local function chooseBlockPages(job)
+    local pages = math.max(1, tonumber(job.page_count) or 1)
+    if pages <= 1 then return pages end
+
+    local avail = Mem.availableMB()
+    local base
+    if avail == nil then
+        -- 读不到 /proc（极少数设备）：取中间偏保守，不要指望探测。
+        base = 80
+    elseif avail < 45 then
+        base = 16       -- 已经贴地：小块慢走，给 GC 喘气的机会
+    elseif avail < 70 then
+        base = 48
+    elseif avail < 110 then
+        base = 120
+    else
+        base = 200      -- 宽裕：块大一点，少几次 crengine 调用
+    end
+
+    if pages < base then return pages end
+    return base
 end
 
 local function prepareDocument(doc)
@@ -1076,8 +1122,9 @@ function WordCount:init()
     -- 把「按来源口径」的解析函数交给书架占位符那边。
     -- ⇒ 不然书架上的 %word_count 永远是最早写进去的「只算文字」数，
     --   和阅读器里按来源算出来的数字对不上（用户一眼就发现）。
+    -- 传过去的是**口径字符串**（plain/punct/chars），不是布尔值。
     BookshelfIntegration.setPunctResolver(function(path)
-        return punctIncluded(path)
+        return countModeOf(path)
     end)
     local ok, err = BookshelfIntegration.install()
     if not ok then logger.dbg("WordCount: Bookshelf token integration unavailable", err) end
@@ -1995,7 +2042,7 @@ end
 -- ⚠ 这里说的是**全局兜底**口径：开了「按来源设定口径」之后，
 -- 它只对「来源规则没覆盖到」的书起作用，所以标签要如实标出来。
 function WordCount:countScopeLabel()
-    local base = globalPunct() and _("字数口径：含标点") or _("字数口径：只算文字")
+    local base = T(_("字数口径：%1"), modeLabel(globalMode()))
     if SourcePolicy.enabled() then
         return base .. _("（兜底）")
     end
@@ -2003,37 +2050,45 @@ function WordCount:countScopeLabel()
 end
 
 -- 构造「字数口径」的 radio 子菜单。
--- 两种口径在一次扫描里同时算好并存下来，所以**切换不需要重扫**。
+-- 三种口径在一次扫描里同时算好并存下来，所以**切换不需要重扫**。
 function WordCount:countScopeSubMenu()
     return {
         {
             text = _("只算文字"),
-            desc = _("汉字/假名/谚文各算 1 字，英文按词算，标点不计。"),
-            checked_func = function() return not globalPunct() end,
+            desc = _("汉字/假名/谚文各算 1 字，英文按词算，标点不计。"
+                .. "这是「阅读单位」，不是平台后台那个数。"),
+            checked_func = function() return globalMode() == "plain" end,
             radio = true,
-            callback = function()
-                G_reader_settings:saveSetting("word_count_count_punct", false)
-                G_reader_settings:flush()
-            end,
+            callback = function() setGlobalMode("plain") end,
         },
         {
             text = _("含标点"),
-            desc = _("标点也各算 1 字。晋江、番茄书页显示的字数就是这个口径"
-                .. "（中文小说里标点约占 12~15%）。"),
-            checked_func = function() return globalPunct() end,
+            desc = _("在只算文字的基础上，每个全角标点再加 1 字。"
+                .. "半角标点仍然不计，英文仍按词算。"),
+            checked_func = function() return globalMode() == "punct" end,
             radio = true,
-            callback = function()
-                G_reader_settings:saveSetting("word_count_count_punct", true)
-                G_reader_settings:flush()
-            end,
+            callback = function() setGlobalMode("punct") end,
+        },
+        {
+            text = _("严格字符数（对齐平台）"),
+            desc = _("每个非空白字符各算 1：英文字母逐个算、数字逐个算、"
+                .. "半角标点也算。这一档才是和平台后台对齐的，"
+                .. "相当于 Word 的「字符数（不计空格）」。"),
+            checked_func = function() return globalMode() == "chars" end,
+            radio = true,
+            callback = function() setGlobalMode("chars") end,
         },
         {
             text = _("说明"),
             desc = _("开了「按来源设定口径」后，来源能匹配上的书按来源规则算，"
-                .. "匹配不上的按这里的「未标注来源」设置算；这一项只作兜底。"),
+                .. "匹配不上的按「未标注来源」那条算；这一项只作兜底。"),
             callback = function()
                 notifyUser(_("这一项是全局兜底口径。\n"
-                    .. "想让晋江、起点各用各的口径，去开「按来源设定口径」。"), 5)
+                    .. "想让晋江、起点各用各的口径，去开「按来源设定口径」。\n\n"
+                    .. "三档的区别（以「2019年3月5日」为例）：\n"
+                    .. "· 只算文字 = 6（数字按词）\n"
+                    .. "· 含标点 = 6（没有全角标点）\n"
+                    .. "· 严格字符数 = 9（逐字符，和平台一致）"), 9)
             end,
             keep_menu_open = true,
         },
@@ -2071,16 +2126,16 @@ function WordCount:sourceInfoLabel()
         return _("当前这本书：未打开书籍")
     end
     local info = SourcePolicy.describe(path)
-    local punct_label = info.punct and _("含标点") or _("只算文字")
+    local scope_label = modeLabel(info.mode or "plain")
     if info.name then
-        return T(_("当前这本书：%1 · %2"), info.name, punct_label)
+        return T(_("当前这本书：%1 · %2"), info.name, scope_label)
     end
     -- ⚠ 书档里没有 platform 是**最常见的状态**：元数据插件那边
     -- 「写入来源平台」默认是关的。不提示的话，用户会以为开关坏了。
-    return T(_("当前这本书：未标注来源 · %1（书档里没有来源平台）"), punct_label)
+    return T(_("当前这本书：未标注来源 · %1（书档里没有来源平台）"), scope_label)
 end
 
--- 一个来源的三种状态：跟随未标注 / 只算文字 / 含标点
+-- 一个来源的四种状态：跟随未标注 / 只算文字 / 含标点 / 严格字符数
 function WordCount:sourceRuleSubMenu(key)
     local function apply(value, msg)
         return function()
@@ -2094,8 +2149,8 @@ function WordCount:sourceRuleSubMenu(key)
         {
             text = _("跟随「未标注来源」"),
             desc = T(_("不单独设，跟着这一条走：%1"),
-                SourcePolicy.unlabeledPunct() and _("含标点") or _("只算文字")),
-            checked_func = function() return SourcePolicy.rules()[key] == nil end,
+                modeLabel(SourcePolicy.unlabeledMode())),
+            checked_func = function() return SourcePolicy.ruleMode(key) == nil end,
             radio = true,
             callback = apply(nil, _("已改为跟随「未标注来源」")),
             keep_menu_open = true,
@@ -2103,17 +2158,25 @@ function WordCount:sourceRuleSubMenu(key)
         {
             text = _("只算文字"),
             desc = _("汉字/假名/谚文各算 1 字，英文按词算，标点不计。"),
-            checked_func = function() return SourcePolicy.rules()[key] == false end,
+            checked_func = function() return SourcePolicy.ruleMode(key) == "plain" end,
             radio = true,
-            callback = apply(false, _("已设为只算文字")),
+            callback = apply("plain", _("已设为只算文字")),
             keep_menu_open = true,
         },
         {
             text = _("含标点"),
-            desc = _("标点也各算 1 字。"),
-            checked_func = function() return SourcePolicy.rules()[key] == true end,
+            desc = _("在全角标点上也各算 1 字。"),
+            checked_func = function() return SourcePolicy.ruleMode(key) == "punct" end,
             radio = true,
-            callback = apply(true, _("已设为含标点")),
+            callback = apply("punct", _("已设为含标点")),
+            keep_menu_open = true,
+        },
+        {
+            text = _("严格字符数（对齐平台）"),
+            desc = _("每个非空白字符各算 1，和平台后台那个数一致。"),
+            checked_func = function() return SourcePolicy.ruleMode(key) == "chars" end,
+            radio = true,
+            callback = apply("chars", _("已设为严格字符数")),
             keep_menu_open = true,
         },
     }
@@ -2123,7 +2186,7 @@ end
 function WordCount:sourceUnlabeledSubMenu()
     local function apply(value, msg)
         return function()
-            SourcePolicy.setUnlabeledPunct(value)
+            SourcePolicy.setUnlabeledMode(value)
             BookshelfIntegration.clearCache()
             notifyUser(msg, 2)
         end
@@ -2132,17 +2195,25 @@ function WordCount:sourceUnlabeledSubMenu()
         {
             text = _("只算文字"),
             desc = _("没有来源标注的书（自己转的、来源不明的）按这个算。"),
-            checked_func = function() return SourcePolicy.unlabeledPunct() == false end,
+            checked_func = function() return SourcePolicy.unlabeledMode() == "plain" end,
             radio = true,
-            callback = apply(false, _("未标注来源：只算文字")),
+            callback = apply("plain", _("未标注来源：只算文字")),
             keep_menu_open = true,
         },
         {
             text = _("含标点"),
-            desc = _("标点也各算 1 字。"),
-            checked_func = function() return SourcePolicy.unlabeledPunct() == true end,
+            desc = _("在全角标点上也各算 1 字。"),
+            checked_func = function() return SourcePolicy.unlabeledMode() == "punct" end,
             radio = true,
-            callback = apply(true, _("未标注来源：含标点")),
+            callback = apply("punct", _("未标注来源：含标点")),
+            keep_menu_open = true,
+        },
+        {
+            text = _("严格字符数（对齐平台）"),
+            desc = _("每个非空白字符各算 1。自己转的书想和平台对账，选这个。"),
+            checked_func = function() return SourcePolicy.unlabeledMode() == "chars" end,
+            radio = true,
+            callback = apply("chars", _("未标注来源：严格字符数")),
             keep_menu_open = true,
         },
     }
@@ -2221,8 +2292,7 @@ function WordCount:sourcePolicySubMenu()
         },
         {
             text_func = function()
-                return T(_("未标注来源：%1"), SourcePolicy.unlabeledPunct()
-                    and _("含标点") or _("只算文字"))
+                return T(_("未标注来源：%1"), modeLabel(SourcePolicy.unlabeledMode()))
             end,
             sub_item_table_func = function() return self:sourceUnlabeledSubMenu() end,
         },
@@ -2258,9 +2328,11 @@ function WordCount:sourcePolicySubMenu()
     }
     items[#items + 1] = {
         text = _("恢复预设"),
-        desc = _("晋江＝含标点，起点＝只算文字，番茄＝含标点，其余来源跟随未标注。"),
+        desc = _("晋江＝严格字符数，起点＝只算文字，番茄＝严格字符数，"
+            .. "其余来源跟随未标注。"),
         callback = function()
             SourcePolicy.resetPresets()
+            BookshelfIntegration.clearCache()
             notifyUser(_("已恢复预设规则"), 2)
         end,
         keep_menu_open = true,
@@ -2338,11 +2410,12 @@ function WordCount:_bookInfo(doc, total_units_override)
     local total_units
     if settings and tonumber(settings:readSetting(KEY_MTIME)) == mtime
             and tonumber(settings:readSetting(KEY_SIZE)) == size then
-        total_units = pickCount(settings:readSetting(KEY_COUNT),
-            settings:readSetting(KEY_COUNT_PUNCT), path)
-        if punctIncluded(path) and not tonumber(settings:readSetting(KEY_COUNT_PUNCT)) then
-            total_units = nil      -- 这本还没按含标点口径统计过
-        end
+        local mode = countModeOf(path)
+        total_units = valueFor(mode,
+            settings:readSetting(KEY_COUNT),
+            settings:readSetting(KEY_COUNT_PUNCT),
+            settings:readSetting(KEY_COUNT_CHAR), true)
+        -- valueFor 在当前口径缺字段时返回 nil → 这本还没按该口径统计过
     end
     -- 调用方明确给了全书字数（例如来自全局缓存）就用它 ——
     -- 「重置设置」后 DocSettings 里的 KEY_COUNT 可能已被清掉，
@@ -2831,23 +2904,26 @@ end
 function WordCount:showSavedStats()
     local settings = self.ui.doc_settings
     local doc_path = self.ui.document and self.ui.document.file
+    local mode = countModeOf(doc_path)
     local total
     if settings and self.ui.document then
         local mtime, size = fileFingerprint(doc_path)
         if tonumber(settings:readSetting(KEY_MTIME)) == mtime
                 and tonumber(settings:readSetting(KEY_SIZE)) == size then
-            total = pickCount(settings:readSetting(KEY_COUNT),
-                settings:readSetting(KEY_COUNT_PUNCT), doc_path)
+            total = valueFor(mode,
+                settings:readSetting(KEY_COUNT),
+                settings:readSetting(KEY_COUNT_PUNCT),
+                settings:readSetting(KEY_COUNT_CHAR), true)
         end
     end
     local state = self._read_state
     if type(state) == "table" then ReadingStats.recompute(state) end
     if total == nil then
-        -- 含标点口径下这本书还没算过（老数据/刚切口径）—— 别拿 0 或
-        -- 只算文字的数糊过去，直接告诉用户重算一次。
-        if punctIncluded(doc_path) then
-            notifyUser(_("这本书还没按「含标点」口径统计过。\n"
-                .. "点「统计全书字数」重算一次即可。"), 5)
+        -- 当前口径下这本书还没算过（老数据 / 刚切口径）—— 别拿 0 或
+        -- 另一种口径的数糊过去，直接告诉用户重算一次。
+        if mode ~= "plain" then
+            notifyUser(T(_("这本书还没按「%1」口径统计过。\n"
+                .. "点「统计全书字数」重算一次即可。"), modeLabel(mode)), 5)
         else
             notifyUser(_("本书还没有可显示的字数统计"))
         end
@@ -2957,6 +3033,8 @@ function WordCount:cancelCount()
     end
     self._job = nil
     self._batch = nil
+    -- 取消也要把 GC 恢复默认（扫描期间被调成了激进模式）
+    Mem.endScan()
     -- 用户取消扫描时，也把「扫完自动开统计页」的挂起请求清掉，
     -- 否则取消后统计页还会突然弹出来。
     self._stat_open_pending = nil
@@ -3519,6 +3597,9 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
     end
 
     local pages = pageCount(doc)
+    -- 扫描期间把 GC 调激进。LuaJIT 默认 pause=200 的含义是「等内存涨到上轮的
+    -- 两倍再回收」，在一台只剩几十 MB 可用的机器上等于放任它顶到 OOM。
+    Mem.beginScan()
     -- 页数来自**哪一份文档**，直接决定它和用户翻书时看到的页数是否一致：
     -- · reader     = 正在读的那份 doc，和状态栏「页面 x / y」的 y 同源，必然相同
     -- · background = 书架/批量时后台重新打开的 doc，只走 setupDefaultView()，
@@ -3527,13 +3608,23 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
     do
         local live_doc = self.ui and self.ui.document
         local is_reader_doc = (live_doc ~= nil and live_doc == doc)
-        local live_pages = nil
-        if live_doc and not is_reader_doc then
-            live_pages = pageCount(live_doc)
+        local parts = {
+            "WordCount: pageCount=" .. tostring(pages),
+            "source=" .. (is_reader_doc and "reader" or "background"),
+        }
+        if is_reader_doc then
+            -- 同一个 doc，两个数必然相同，写出来只是让日志自证
+            parts[#parts + 1] = "reader_pages=" .. tostring(pages)
+        elseif live_doc then
+            -- 书架统计时若阅读界面恰好还开着另一本书，这里能拿到对照值
+            parts[#parts + 1] = "other_reader_pages=" .. tostring(pageCount(live_doc))
+        else
+            -- 从书架统计时阅读界面根本没开书 —— 没有对照值可打。
+            -- ⚠ 以前这里写 `reader_pages = live_pages or pages`，nil 时兜底成
+            -- pages 自己，日志看起来像「两个数一样」，纯属误导。
+            parts[#parts + 1] = "reader_doc=none"
         end
-        logger.info("WordCount: pageCount=" .. tostring(pages)
-            .. " source=" .. (is_reader_doc and "reader" or "background")
-            .. " reader_pages=" .. tostring(live_pages or pages))
+        logger.info(table.concat(parts, " "))
     end
     if pages < 1 then
         logger.info("WordCount: EARLY-RETURN pages<1")
@@ -3627,6 +3718,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             .. "注：页数按统计时的排版计算（书架统计走默认排版），"
             .. "和你翻书时看到的页数可能不同。"),
             limit_desc), 10)
+        Mem.endScan()
         return
     end
 
@@ -3675,6 +3767,9 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 end)
             end,
         })
+        -- 三个分支都要退出本函数：恢复 GC 参数（重新开始扫描的那两个分支
+        -- 会再次调用 beginScan，重复设置无害）。
+        Mem.endScan()
         return
     end
     -- 一次性标记：用完即清，否则下次同一本书会跳过确认。
@@ -3698,6 +3793,11 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         sampled = sampled,
         page = 1,
         state = Counter.newState(),
+        -- ★ 口径**只解析一次**并存进 job。
+        -- 旧写法在每页循环里调 punctIncluded(path)，一次扫描要问
+        -- 设置/来源表几千次；更重要的是「扫到一半用户改了口径」会让
+        -- 已读字数的累加基准前后不一致。
+        count_mode = countModeOf(path),
         page_units = {},
         mtime = mtime,
         size = size,
@@ -3793,6 +3893,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         if not scan_doc then
             self._job = nil
             releaseBackgroundDocument()
+            Mem.endScan()
             -- 文件过大导致无法重开时，给出明确说明，
             -- 不要显示成含糊的「无法打开文档」。
             local message
@@ -3821,117 +3922,63 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
 
         local stop_at = math.min(job.page + PAGES_PER_TICK - 1, job.page_count)
 
-        -- 精确路径（23-accurate-count）：第一个 tick 先试「整书一次取文本」。
+        -- ★ 1.4.2：不再「一次性取回全本文本」。
+        --
+        -- 旧做法要为整本书分配一个 Lua 字符串，crengine 内部还会再复制一份临时
+        -- 缓冲；分配量取决于「书有多大」，而书有多大在取之前是不知道的。
+        -- 在 512MB 内存的机器上这一步会把进程顶穿：日志里只剩下一个
+        -- 「Killed」，没有任何 Lua 报错，KOReader 直接重启，用户看到的就是闪退。
+        --
+        -- 现在改成按块取：每次只 hold 住 block_pages 页的文本，数完立刻丢掉。
+        -- 块大小由「实测剩余内存」决定（不看文件大小），内存越紧块越小。
         if job.page == 1 and not job.whole_book_tried and not job.sampled then
             job.whole_book_tried = true
-            -- 整书路径会**一次性**把全本文本读成
-            -- 一个 Lua 字符串（外加 crengine 内部缓冲）。页数特别多的书，
-            -- 这一步就能吃掉几百 MB ⇒ OOM ⇒ 设备重启。
-            local total_pages = tonumber(job.total_pages) or 0
-            -- 整书路径阈值也受用户设置控制。
-            -- ⇒ 必然 OOM ⇒ 设备重启（37i 的崩溃日志就是这么来的）。
-            local job_size = tonumber(job.size) or 0
-            local skip_whole_book = total_pages > WHOLE_BOOK_MAX_PAGES
-                or job_size > WHOLE_BOOK_MAX_BYTES
-            if skip_whole_book then
-                logger.info("WordCount: skip whole-book path, total_pages="
-                    .. tostring(total_pages) .. " size=" .. tostring(job_size)
-                    .. " (memory guard: pages>" .. tostring(WHOLE_BOOK_MAX_PAGES)
-                    .. " or bytes>" .. tostring(WHOLE_BOOK_MAX_BYTES) .. ")")
-                if job.progress_dialog then
-                    job.progress_dialog:setStatus(_("正在逐页统计字数…"))
-                end
-            else
-                if job.progress_dialog then
-                    job.progress_dialog:setStatus(_("正在读取全书文本…"))
-                end
-                local whole, whole_err = PageText.extractWholeBook(scan_doc)
-                -- 取到了但可能只覆盖开头几个章节 —— 这种「静默少算」比失败更坑，
-                -- 所以先做覆盖率自检，不合格就当作没取到，退回逐页。
-                if type(whole) == "string" and #whole > 0
-                        and not wholeBookCoversAllPages(scan_doc, whole, job.page_count) then
-                    logger.warn("WordCount: whole-book text looks truncated, len="
-                        .. #whole .. " pages=" .. tostring(job.page_count)
-                        .. " → falling back to per-page scan")
-                    whole = nil
-                    whole_err = "whole-book text too short (truncated range)"
-                end
-                if type(whole) == "string" and #whole > 0 then
-                    logger.info("WordCount: whole-book extraction OK, text length=" .. #whole)
-                    job.whole_book = true
-                    -- 一次性计数。注意：这里不做 per-page page_units（无法从整段文本
-                    -- 反推每页归属），所以「已读字数」在这次统计里会退化成
-                    -- 「按比例均分」。这是精度与「已读进度」之间的取舍，
-                    -- 我们选择先保证**总字数准确**。
-                    Counter.addPage(job.state, whole)
-                    job.pages_with_text = job.page_count
-                    job.page = job.page_count + 1
-                    -- 整书取文本拿不到「每页各有多少字」，但「已读字数」需要每页归属。
-                    do
-                        -- 按当前口径均分（含标点与实际显示的数字保持一致）
-                        -- ⚠ 取不到当前口径的值时（老缓存没有 count_punct）退回
-                        -- 纯文字值，绝不能把 nil 丢给 math.floor。
-                        local whole_total = pickCount(job.state.count,
-                            job.state.count_punct, job.path) or job.state.count or 0
-                        local per = math.floor(whole_total
-                            / math.max(1, job.page_count))
-                        local acc = 0
-                        -- 模板逻辑抽到 `_pageKeyTemplate`，
-                        -- 和逐页路径共用一份 —— 两处各写一遍正是
-                        -- 25-cache-perf 修完又漏掉逐页路径的原因。
-                        local stem = self:_pageKeyTemplate(scan_doc)
-                        for p = 1, job.page_count do
-                            local units = per
-                            if p == job.page_count then
-                                units = whole_total - acc
-                            else
-                                acc = acc + per
-                            end
-                            local key
-                            if stem then
-                                -- 双保险：即使 stem 因为某种未知 xpointer 形态仍留下
-                                -- 多个 %d，pcall 也只是让这一页退回页号 key，
-                                -- 不会把整个扫描带崩。
-                                local ok_fmt, formatted = pcall(string.format, stem, p)
-                                if ok_fmt and type(formatted) == "string" then
-                                    key = formatted
-                                else
-                                    key = "p:" .. tostring(p)
-                                end
-                            else
-                                -- 兜底：拿不到模板就直接用页号 key（仍然 O(1)）
-                                key = "p:" .. tostring(p)
-                            end
-                            -- 与逐页路径使用同一个容量闸门。旧代码在这里直接写表，
-                            -- 绕过 _recordPageUnits；自定义超大阈值时会为几十万页
-                            -- 创建 key/value，老设备可能因此 OOM。总字数仍然准确。
-                            if job.page_count <= MAX_TRACKED_PAGES then
-                                job.page_units[key] = units
-                            end
-                        end
-                        -- 顺带把模板记在 job 上，后续若因故重扫同一本可复用。
-                        job._key_stem = stem
-                        job._key_stem_tried = true
-                    end
-                    -- whole 是本地变量；先断开引用，给增量 GC 回收大字符串的机会。
-                    whole = nil
-                    job.whole_text = nil
-                    collectgarbage("step")
-                    if job.progress_dialog then
-                        job.progress_dialog:updateProgress(job.page_count, true)
-                    end
-                    UIManager:scheduleIn(0.05, step)
-                    return
-                end
-                logger.info("WordCount: whole-book extraction unavailable ("
-                    .. tostring(whole_err) .. "), falling back to per-page scan")
-                if job.progress_dialog then
-                    job.progress_dialog:setStatus(_("正在逐页统计字数…"))
-                end
-            end   -- ★ 31: 闭合「页数未超阈值才走整书路径」的 else 分支
+            job.block_pages = chooseBlockPages(job)
+            job.block_scan = true
+            logger.info("WordCount: block scan start pages=" .. tostring(job.page_count)
+                .. " block=" .. tostring(job.block_pages) .. " " .. Mem.describe())
+            if job.progress_dialog then
+                job.progress_dialog:setStatus(_("正在统计全书字数…"))
+            end
         end
 
         while job.page <= stop_at do
+            if job.block_scan then
+                -- 块模式：一次取 block_pages 页，数完立刻丢掉这段文本。
+                local finish = math.min(job.page + job.block_pages - 1, job.page_count)
+                local text, range_err = PageText.extractRange(scan_doc, job.page,
+                    finish, job.page_count)
+                if text == nil then
+                    -- 取不到就**永久**退回逐页，不要每个 tick 都再撞一次。
+                    logger.warn("WordCount: block extract failed (" .. tostring(range_err)
+                        .. ") pages=" .. tostring(job.page) .. "-" .. tostring(finish)
+                        .. " → per-page scan")
+                    job.block_scan = false
+                else
+                    local n = finish - job.page + 1
+                    if text ~= "" then
+                        job.pages_with_text = job.pages_with_text + n
+                        local _t, plain_u, _tp, punct_u, _tc, char_u
+                            = Counter.addPage(job.state, text)
+                        -- 按 job 上记下的口径取本块的字数（三选一）
+                        local units_total = valueFor(job.count_mode,
+                            plain_u, punct_u, char_u, false)
+                        -- 块内拿不到逐页字数，按块总量平均分给每一页（「已读字数」用）。
+                        local per = math.floor((units_total or 0) / n)
+                        for p = job.page, finish do
+                            self:_recordPageUnits(job, scan_doc, p, per)
+                        end
+                        text = nil      -- 断开引用，让 GC 能立刻回收这一块
+                    else
+                        for p = job.page, finish do
+                            self:_recordPageUnits(job, scan_doc, p, 0)
+                        end
+                    end
+                    job.page = finish + 1
+                    collectgarbage("step")
+                end
+            end
+            if not job.block_scan then
             local ok, text, extract_error = pcall(PageText.extract, scan_doc, job.page, job.page_count)
             if not ok or text == nil then
                 job.failed_pages = job.failed_pages + 1
@@ -3941,11 +3988,12 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             else
                 if text ~= "" then
                     job.pages_with_text = job.pages_with_text + 1
-                    -- 一次遍历同时得到「累计」与「本页增量」。
-                    local _total, page_units, _punct_total, punct_units
+                    -- 一次遍历同时得到「三种口径的累计」与「本页增量」。
+                    local _t, plain_u, _tp, punct_u, _tc, char_u
                         = Counter.addPage(job.state, text)
                     -- 已读字数按当前口径累计，否则「已读 / 全书」的比例会算错
-                    if punctIncluded(job.path) then page_units = punct_units end
+                    local page_units = valueFor(job.count_mode,
+                        plain_u, punct_u, char_u, false)
                     -- **逐页路径也不能每页问一次
                     -- `getPageXPointer`**！
                     self:_recordPageUnits(job, scan_doc, job.page, page_units)
@@ -3954,6 +4002,24 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 end
             end
             job.page = job.page + 1
+            end
+        end
+
+        -- 内存闸门：每个 tick 检查一次剩余内存。
+        -- 跌破安全线就**立刻停手**，按已扫页数的比例估算剩下部分 ——
+        -- 扫到一半被内核 SIGKILL，用户连结果都拿不到，还不如早点给个约数。
+        if job.page <= job.page_count then
+            local critical, avail = Mem.critical()
+            if critical then
+                logger.warn("WordCount: memory critical (" .. Mem.describe()
+                    .. ", abort line=" .. tostring(Mem.ABORT_AVAIL_MB) .. "MB), stop at page "
+                    .. tostring(job.page - 1) .. "/" .. tostring(job.page_count) .. " → estimate")
+                job.memory_stopped = true
+                job.memory_stop_page = job.page - 1
+                job.sampled = true
+                job.whole_book = false
+                job.page = job.page_count + 1
+            end
         end
 
         if job.page <= job.page_count then
@@ -4002,8 +4068,18 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         end
 
         self._job = nil
+        Mem.endScan()
+        -- 块模式一路扫到最后一页 = 覆盖了全书，语义等同原来的「整书一次取完」，
+        -- 下游据此禁止外推（数完就是数完了，不是估算）。
+        if job.block_scan and not job.memory_stopped then
+            job.whole_book = true
+        end
         if job.progress_dialog then job.progress_dialog:updateProgress(job.page_count, true) end
         releaseBackgroundDocument()
+        -- 关掉后台文档后立刻全量回收一次。
+        -- 批量连跑几十本时，上一本的 native 内存不一定会还给系统，下一本再叠上来
+        -- 就可能触顶；此刻正在写结果/准备提示，停顿被藏在里面，用户感知不到。
+        collectgarbage("collect")
         if job.failed_pages > 0 then
             if job.progress_dialog and type(job.progress_dialog.setStatus) == "function" then
                 job.progress_dialog:setStatus(T(_("扫描完成，但有 %1 页失败：%2"),
@@ -4045,10 +4121,13 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             settings = DocSettings:open(path)
         end
         -- 抽页模式的结果要从「样本页字数」外推到「全书字数」。
-        -- 两种口径同时外推，存起来后切换口径不用重扫。
+        -- 三种口径同时外推，存起来后切换口径不用重扫。
         local sample_plain = tonumber(job.state.count) or 0
         local sample_punct = tonumber(job.state.count_punct) or sample_plain
+        local sample_char = tonumber(job.state.count_char) or sample_punct
         local total_plain, total_punct = sample_plain, sample_punct
+        local total_char = sample_char
+        local mode = job.count_mode or countModeOf(path)
         local total
         local sampled = job.sampled == true
         if job.whole_book == true then
@@ -4062,24 +4141,28 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 local full_pages = tonumber(job.total_pages) or job.page_count
                 total_plain = math.floor(sample_plain / eff * full_pages + 0.5)
                 total_punct = math.floor(sample_punct / eff * full_pages + 0.5)
+                total_char = math.floor(sample_char / eff * full_pages + 0.5)
             end
         end
-        total = (punctIncluded(path) and total_punct > 0) and total_punct or total_plain
+        total = valueFor(mode, total_plain, total_punct, total_char, false)
         logger.info("WordCount: result plain=" .. tostring(total_plain)
             .. " punct=" .. tostring(total_punct)
+            .. " chars=" .. tostring(total_char)
             .. " scan_pages=" .. tostring(job.page_count)
             .. " total_pages=" .. tostring(job.total_pages)
             .. " sampled=" .. tostring(sampled)
-            .. " mode=" .. (punctIncluded(path) and "punct" or "plain")
+            .. " mode=" .. tostring(mode)
             .. " final_total=" .. tostring(total))
 
         -- 把外推后的总量回写到 state，让下游（读状态、全局统计、
         -- 提示文案）拿到的是**全书**口径，而不是样本口径。
         job.state.count = total_plain
         job.state.count_punct = total_punct
+        job.state.count_char = total_char
 
         settings:saveSetting(KEY_COUNT, total_plain)
         settings:saveSetting(KEY_COUNT_PUNCT, total_punct)
+        settings:saveSetting(KEY_COUNT_CHAR, total_char)
         settings:saveSetting(KEY_MTIME, job.mtime)
         settings:saveSetting(KEY_SIZE, job.size)
         -- 记录「这个数字是怎么来的」：下次读缓存时能告诉用户「这是估算值，
@@ -4101,7 +4184,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         -- 同时写全局缓存 —— 下次点「统计全书字数」
         do
             local cur_mtime, cur_size = fileFingerprint(path)
-            writeCachedCount(path, total_plain, total_punct,
+            writeCachedCount(path, total_plain, total_punct, total_char,
                 cur_mtime or job.mtime, cur_size or job.size, sampled)
         end
 
@@ -4149,12 +4232,17 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         -- startCountForPath（从书菜单点单本）也会传 batch_mode=true，但它
         -- 根本不是批量任务（self._batch 为 nil），对话框必须照常关闭。
         local in_batch = self:_batchAlive(job)
-        -- 结果文案：主数字按当前口径，后面附带另一种口径的值。
+        -- 结果文案：主数字按当前口径，后面附带另一个参照值。
         -- 用户拿它和晋江/起点的书页字数一比就知道该用哪种口径。
-        local mode_punct = punctIncluded(path)
-        local other_total = mode_punct and total_plain or total_punct
-        local count_label = mode_punct and _("含标点") or _("只算文字")
-        local other_label = mode_punct and _("只算文字") or _("含标点")
+        local count_label = modeLabel(mode)
+        local other_total, other_label
+        if mode == "plain" then
+            other_total, other_label = total_punct, _("含标点")
+        else
+            -- 含标点 / 严格字符数：都附带「只算文字」这个基准值，
+            -- 它是最不容易混淆的那个数（标点、字母都不另算）。
+            other_total, other_label = total_plain, _("只算文字")
+        end
         -- 开了「按来源设定口径」就把来源一起标出来，
         -- 用户一眼能确认「这次用的是哪条规则」，不用去菜单里翻。
         if SourcePolicy.enabled() then
@@ -4162,6 +4250,13 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             if src_name then count_label = count_label .. " · " .. src_name end
         end
         local function resultLine()
+            if job.memory_stopped then
+                -- 内存不足提前停手：必须说清这是「前 N 页推算出来的约数」，
+                -- 否则用户会拿这个数去和平台对账，越对越糊涂。
+                return T(_("内存不足：只统计了前 %1 / %2 页，全书约 %3 字"),
+                    fmtCount(job.memory_stop_page or 0), fmtCount(job.page_count),
+                    fmtCount(total))
+            end
             local line = T(_("统计完成：%1 字（%2）"), fmtCount(total), count_label)
             if tonumber(other_total) and other_total > 0 and other_total ~= total then
                 line = line .. T(_("；%1 %2"), other_label, fmtCount(other_total))

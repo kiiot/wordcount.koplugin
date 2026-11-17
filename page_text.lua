@@ -2,14 +2,35 @@
 -- CRE (EPUB/HTML/FB2/TXT) uses XPointers and page coordinates, not openPage().
 local M = {}
 
--- 整书取文本（23-accurate-count）—— 这是**唯一精确**的取文本方式。
-M.WHOLE_BOOK_CHUNK = nil   -- 占位，便于外部探测版本
-
 -- **一页文本的字节上限**。
 M.MAX_PAGE_TEXT_BYTES = 60000
 
+-- 块扫描的文本长度闸门。单块超过这个量，说明 crengine 没有理会终点
+-- （直接把整段 DOM 倒了回来），这块必须作废并退回逐页 —— 否则「分块」
+-- 就退化成了「一次性整书」，内存保护的初衷全部落空。
+M.BLOCK_MAX_TEXT_BYTES = 3 * 1024 * 1024
+
+-- 由「某个 XPointer」构造「它所在 DocFragment 的末尾」。
+--
+-- epub 的 XPointer 由多个 DocFragment 组成（每个 xhtml 文件一段），形如
+--   /body/DocFragment[7]/body/div[2]/p[5].12
+-- 旧实现用 `first_xp:match("^(.*%])")` 取「最后一个 ] 之前」再拼 .99999999，
+-- 拿到的是 `.../div[2]/p[5].99999999` —— 只覆盖**第一页所在的那个段落**，
+-- 后面整本书都不在范围内。表现就是字数严重偏少（一本 60 万字的书少十万）。
+local function endPointerFor(xp)
+    local frag = xp:match("/DocFragment%[(%d+)%]")
+    if frag then
+        -- 该片段内第「极大」个字符 ⇒ 覆盖到这个 html 文件的末尾
+        return "/body/DocFragment[" .. frag .. "].99999999"
+    end
+    local head = xp:match("^(.*)%.[0-9]+$")
+    if head then return head .. ".99999999" end
+    return xp .. ".99999999"
+end
+
 -- 尝试一次性取回整本文本的函数（返回 text 或 nil, err）。
--- 这是 page_text.lua 里唯一不会重复/漏计数的路径。
+-- ⚠ 1.4.2 起主扫描路径已改用 extractRange 分块，这个函数只保留给
+-- 覆盖率自检 / 少数需要全文的场合。在低内存设备上直接调它仍有 OOM 风险。
 function M.extractWholeBook(doc)
     if type(doc) ~= "table" and type(doc) ~= "userdata" then
         return nil, "invalid document"
@@ -36,23 +57,7 @@ function M.extractWholeBook(doc)
         if okc and tonumber(n) and tonumber(n) > 0 then total = tonumber(n) end
     end
 
-    -- 终点必须落在**文档真正的末尾**。
-    --
-    -- epub 的 XPointer 由多个 DocFragment 组成（每个 xhtml 文件一段），形如
-    --   /body/DocFragment[7]/body/div[2]/p[5].12
-    -- 旧实现用 `first_xp:match("^(.*%])")` 取「最后一个 ] 之前」再拼 .99999999，
-    -- 拿到的是 `.../div[2]/p[5].99999999` —— 只覆盖**第一页所在的那个段落**，
-    -- 后面整本书都不在范围内。表现就是字数严重偏少（一本 60 万字的书少十万）。
-    local function endPointerFor(xp)
-        local frag = xp:match("/DocFragment%[(%d+)%]")
-        if frag then
-            -- 该片段内第「极大」个字符 ⇒ 覆盖到这个 html 文件的末尾
-            return "/body/DocFragment[" .. frag .. "].99999999"
-        end
-        local head = xp:match("^(.*)%.[0-9]+$")
-        if head then return head .. ".99999999" end
-        return xp .. ".99999999"
-    end
+    -- 终点必须落在**文档真正的末尾**（endPointerFor 已提到模块级，块扫描共用）。
 
     local function isForward(a, b)
         if type(doc.compareXPointers) ~= "function" then return true end
@@ -108,6 +113,73 @@ local function normalize(value)
         if type(value[1]) == "string" then return table.concat(value, "\n") end
     end
     return nil
+end
+
+-- 取 [p1, p2] 这个**闭区间**的页文本 —— 分块扫描的核心。
+--
+-- 和「一次性取全本」的区别只在切法：这里用第 p2+1 页的 XPointer 当右开边界
+-- （最后一页才退到 DocFragment 末尾），所以块与块之间既不重叠也不留缝。
+-- 内存占用只跟**块内页数**有关，跟整本书有多长无关 —— 这正是要的效果。
+function M.extractRange(doc, p1, p2, page_count)
+    if type(doc) ~= "table" and type(doc) ~= "userdata" then
+        return nil, "invalid document"
+    end
+    if type(doc.getPageXPointer) ~= "function"
+            or type(doc.getTextFromXPointers) ~= "function" then
+        return nil, "document has no XPointer API"
+    end
+    p1 = math.max(1, math.floor(tonumber(p1) or 1))
+    p2 = math.max(p1, math.floor(tonumber(p2) or p1))
+    page_count = math.max(p2, math.floor(tonumber(page_count) or p2))
+
+    local ok1, start_xp = pcall(doc.getPageXPointer, doc, p1)
+    if not ok1 or type(start_xp) ~= "string" or start_xp == "" then
+        return nil, "cannot get page " .. tostring(p1) .. " XPointer"
+    end
+
+    local end_xp
+    if p2 < page_count then
+        local ok2, next_xp = pcall(doc.getPageXPointer, doc, p2 + 1)
+        if ok2 and type(next_xp) == "string" and next_xp ~= "" then
+            end_xp = next_xp
+        end
+    end
+    if not end_xp then
+        -- 走到最后一块：没有「下一页起点」可用，推到文档真正的末尾。
+        local last_xp = start_xp
+        if p2 > p1 then
+            local ok3, xp = pcall(doc.getPageXPointer, doc, p2)
+            if ok3 and type(xp) == "string" and xp ~= "" then last_xp = xp end
+        end
+        end_xp = endPointerFor(last_xp)
+        if type(doc.compareXPointers) == "function" then
+            local okc, cmp = pcall(doc.compareXPointers, doc, start_xp, end_xp)
+            -- 只在「构造出来的末尾 == 起点」时才退回最后一页起点（那说明这个
+            -- fragment 末尾指针没被接受，继续用它会取到空文本）。
+            -- ⚠ 不判断大小方向：不同 crengine 版本对 -1/1 的含义并不一致，
+            -- 猜错方向会让最后一块少掉一整页。
+            if okc and cmp == 0 then end_xp = last_xp end
+        end
+    end
+
+    if type(doc.compareXPointers) == "function" then
+        local okc, cmp = pcall(doc.compareXPointers, doc, start_xp, end_xp)
+        -- 起点 == 终点 ⇒ 这一块没有文字（整页插图之类），记 0 字即可。
+        -- 同上：不靠方向判断，交给后面的长度闸门兜底。
+        if okc and cmp == 0 then return "" end
+    end
+
+    local ok, text = pcall(doc.getTextFromXPointers, doc, start_xp, end_xp)
+    if not ok then
+        return nil, "getTextFromXPointers failed: " .. tostring(text)
+    end
+    local normalized = normalize(text)
+    if normalized == nil then return nil, "range text not a string" end
+    if #normalized > M.BLOCK_MAX_TEXT_BYTES then
+        -- crengine 没理终点，把远超一块的内容倒了回来。交给调用方降级。
+        return nil, "block text too large: " .. #normalized
+    end
+    return normalized
 end
 
 local function crePageText(doc, page, page_count)

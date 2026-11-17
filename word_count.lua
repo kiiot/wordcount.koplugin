@@ -77,29 +77,56 @@ local function isPunctUnit(cp)
         or cp == 0x00B7                     -- ·
 end
 
---- 一次遍历同时累计**两种口径**：
+--- 「严格字符数」口径：除空白之外的每个字符都算 1 ——
+--- 汉字、字母（**逐字母**）、数字（逐数字）、全角标点、半角标点、符号、emoji 全算。
+--- 这就是 Word 的「字符数（不计空格）」，也是网文平台后台那个数的算法。
+local function isBlank(cp)
+    return cp == 0x20 or cp == 0x09 or cp == 0x0A or cp == 0x0B or cp == 0x0C
+        or cp == 0x0D or cp == 0x3000 or cp == 0x00A0
+        or (cp >= 0x2000 and cp <= 0x200A)   -- en/em space、窄空格等
+        or cp == 0x2028 or cp == 0x2029      -- 行/段分隔符
+        or cp == 0x202F or cp == 0x205F
+end
+
+local function countsAsChar(cp)
+    if cp < 0 then return false end                    -- 解不出来的坏字节
+    if isBlank(cp) then return false end
+    if cp < 0x20 or cp == 0x7F then return false end   -- C0 控制符
+    if cp >= 0x80 and cp <= 0x9F then return false end -- C1 控制符
+    return true
+end
+
+--- 一次遍历同时累计**三种口径**：
 ---   state.count       = 只算文字（汉字/假名/谚文各 1，英文按词 1）
 ---   state.count_punct = 含标点（在上一行基础上，每个全角标点 +1）
---- 两种都留着，用户切「字数口径」时不必重扫。
+---   state.count_char  = 严格字符数（每个非空白字符 1，对齐平台后台）
+--- 三种都留着，用户切口径时不必重扫。
 function M.newState()
-    return { count = 0, count_punct = 0, in_word = false }
+    return { count = 0, count_punct = 0, count_char = 0, in_word = false }
 end
 
 -- Add one extracted page to the running count. `state.in_word` crosses page
 -- boundaries so a word split between two pages is not counted twice.
--- @return count, delta, count_punct, punct_delta
+-- @return count, delta, count_punct, punct_delta, count_char, char_delta
 function M.addPage(state, text)
     if type(state) ~= "table" then state = M.newState() end
     state.count = tonumber(state.count) or 0
     state.count_punct = tonumber(state.count_punct) or state.count
-    if type(text) ~= "string" then return state.count, 0, state.count_punct, 0 end
+    state.count_char = tonumber(state.count_char) or 0
+    if type(text) ~= "string" then
+        return state.count, 0, state.count_punct, 0, state.count_char, 0
+    end
 
     local before = state.count
     local before_punct = state.count_punct
+    local before_char = state.count_char
     local i = 1
     while i <= #text do
         local cp
         cp, i = decodeAt(text, i)
+        if countsAsChar(cp) then
+            state.count_char = state.count_char + 1
+        end
         if isCjkUnit(cp) then
             state.count = state.count + 1
             state.count_punct = state.count_punct + 1
@@ -118,7 +145,8 @@ function M.addPage(state, text)
         end
     end
     return state.count, state.count - before,
-        state.count_punct, state.count_punct - before_punct
+        state.count_punct, state.count_punct - before_punct,
+        state.count_char, state.count_char - before_char
 end
 
 function M.count(text)
