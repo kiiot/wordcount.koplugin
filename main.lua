@@ -26,6 +26,9 @@ local ReadingStats = dofile(plugin_dir .. "reading_stats.lua")
 local GlobalStats = dofile(plugin_dir .. "global_stats.lua")
 local StatisticsPage = dofile(plugin_dir .. "statistics_page.lua")
 local BookshelfIntegration = dofile(plugin_dir .. "bookshelf_integration.lua")
+-- 「来源 → 字数口径」规则表。只读书档里的 custom_props.platform，
+-- 不依赖元数据插件是否安装（详见模块头注释）。
+local SourcePolicy = dofile(plugin_dir .. "source_policy.lua")
 
 -- 更新模块单独一个文件；加载失败也不该拖垮整个插件。
 local ok_updater, Updater = pcall(dofile, plugin_dir .. "updater.lua")
@@ -480,6 +483,8 @@ function LiveProgressDialog:onCloseWidget()
 end
 
 local KEY_COUNT = "word_count_total_v1"
+-- 同一本书的「含标点」口径字数。两种口径一起存，切开关不用重扫。
+local KEY_COUNT_PUNCT = "word_count_total_punct_v1"
 local KEY_MTIME = "word_count_file_mtime_v1"
 local KEY_SIZE = "word_count_file_size_v1"
 -- 记录「这个字数是估算的还是精确的」。
@@ -580,6 +585,35 @@ local function scanModeName(mode)
     return _("完整扫描（精确）")
 end
 
+-- 全局字数口径（**兜底**）：false = 只算文字（默认），true = 连标点一起算。
+-- ⚠ 开了「按来源设定口径」之后，每本书按来源规则表决定口径，
+-- 这个开关就不再影响那些书了 —— 它只负责「来源规则关闭」的情况。
+local function globalPunct()
+    return G_reader_settings ~= nil
+        and G_reader_settings:readSetting("word_count_count_punct") == true
+end
+
+--- 这本书该用什么口径。
+-- @param path 书籍路径；nil = 不知道是哪本（按「未标注来源」的口径）
+-- @return boolean true = 含标点
+local function punctIncluded(path)
+    local from_source = SourcePolicy.punctFor(path)   -- 总开关关闭时返回 nil
+    if from_source ~= nil then return from_source end
+    return globalPunct()
+end
+
+-- 从一组计数里按当前口径取值（两个值都来自同一次扫描，切口径不用重扫）。
+-- 含标点口径下**没有**这个数时返回 nil —— 宁可让调用方当「没统计过」，
+-- 也不能拿只算文字的数冒充，那正是「数字偏少」的根源。
+local function pickCount(plain, punct, path)
+    if punctIncluded(path) then
+        local v = tonumber(punct)
+        if v and v > 0 then return v end
+        return nil
+    end
+    return tonumber(plain) or 0
+end
+
 local function fileFingerprint(path)
     local attr = path and lfs.attributes(path)
     if type(attr) ~= "table" then return nil, nil end
@@ -604,8 +638,12 @@ local function readCachedCount(path, prefer_settings)
                 and tonumber(e.mtime) == mtime
                 and tonumber(e.size) == size
                 and tonumber(e.count) and tonumber(e.count) > 0 then
+            -- 老缓存只有「只算文字」的 count；要含标点却没有 count_punct 时
+            -- 视为失效（重扫一次即可拿到），不能拿纯文字值冒充。
+            if punctIncluded(path) and not tonumber(e.count_punct) then return nil end
             -- 第三个返回值告诉调用方这是不是估算值
-            return tonumber(e.count), prefer_settings, e.estimated == true
+            return pickCount(e.count, e.count_punct, path), prefer_settings,
+                e.estimated == true
         end
         -- 全局里有这个 path 但指纹不符 → 明确失效，不用再看 DocSettings
         if type(e) == "table" then return nil end
@@ -628,15 +666,20 @@ local function readCachedCount(path, prefer_settings)
     if tonumber(saved_size)  ~= size  then return nil end
     local count = tonumber(saved_count)
     if not count or count <= 0 then return nil end
+    -- 含标点口径：sidecar 里没这个键 ⇒ 当作没统计过（让用户重扫一次）
+    local ok_p, saved_punct = pcall(settings.readSetting, settings, KEY_COUNT_PUNCT)
+    if punctIncluded(path) and not (ok_p and tonumber(saved_punct)) then return nil end
+    count = pickCount(count, saved_punct, path)
     -- 旧数据没有 KEY_ESTIMATED 键 → readSetting 返回 nil → 当作精确值（向后兼容）
     local ok_e, saved_est = pcall(settings.readSetting, settings, KEY_ESTIMATED)
     return count, settings, (ok_e and saved_est == true) or false
 end
 
--- 把统计结果写进**全局缓存**（键 = 文件路径，值 = 指纹 + 字数）。
-local function writeCachedCount(path, count, mtime, size, estimated)
+-- 把统计结果写进**全局缓存**（键 = 文件路径，值 = 指纹 + 两种口径的字数）。
+local function writeCachedCount(path, count, count_punct, mtime, size, estimated)
     if type(path) ~= "string" or path == "" then return false end
     count, mtime, size = tonumber(count), tonumber(mtime), tonumber(size)
+    count_punct = tonumber(count_punct)
     if not count or count <= 0 or not mtime or not size then return false end
     if not (G_reader_settings and type(G_reader_settings.saveSetting) == "function") then
         return false
@@ -644,7 +687,8 @@ local function writeCachedCount(path, count, mtime, size, estimated)
     local ok_read, t = pcall(G_reader_settings.readSetting, G_reader_settings, KEY_CACHE)
     if not ok_read or type(t) ~= "table" then t = {} end
     t[path] = {
-        count = count, mtime = mtime, size = size, at = os.time(),
+        count = count, count_punct = count_punct,
+        mtime = mtime, size = size, at = os.time(),
         -- 估算标记。false 时也显式写出来，便于排查「为什么标了约」
         estimated = (estimated == true) and true or false,
     }
@@ -702,6 +746,7 @@ local function removeCachedCount(path, prefer_settings)
     end
     if settings then
         pcall(settings.delSetting, settings, KEY_COUNT)
+        pcall(settings.delSetting, settings, KEY_COUNT_PUNCT)
         pcall(settings.delSetting, settings, KEY_MTIME)
         pcall(settings.delSetting, settings, KEY_SIZE)
         pcall(settings.delSetting, settings, KEY_ESTIMATED)
@@ -1009,6 +1054,12 @@ function WordCount:init()
     -- 诊断打点：确认设备上加载的是哪一版、以及 Bookshelf 钩子装没装上。
     -- 用 logger.info（会落进 crash.log），便于出问题时直接对日志。
     logger.info("WordCount: plugin init start")
+    -- 把「按来源口径」的解析函数交给书架占位符那边。
+    -- ⇒ 不然书架上的 %word_count 永远是最早写进去的「只算文字」数，
+    --   和阅读器里按来源算出来的数字对不上（用户一眼就发现）。
+    BookshelfIntegration.setPunctResolver(function(path)
+        return punctIncluded(path)
+    end)
     local ok, err = BookshelfIntegration.install()
     if not ok then logger.dbg("WordCount: Bookshelf token integration unavailable", err) end
     self.ui.menu:registerToMainMenu(self)
@@ -1379,10 +1430,10 @@ function WordCount:addToMainMenu(menu_items)
             {
                 -- 点一下显示当前版本（方便核对装的是哪一包）。
                 text_func = function()
-                    return T(_("版本：%1"), tostring(version_text))
+                    return T(_("版本：v%1"), tostring(version_text))
                 end,
                 callback = function()
-                    notifyUser(T(_("字数与阅读速度\n当前版本：%1"), tostring(version_text)), 5)
+                    notifyUser(T(_("字数与阅读速度\n当前版本：v%1"), tostring(version_text)), 5)
                 end,
                 keep_menu_open = true,
             },
@@ -1421,6 +1472,16 @@ function WordCount:addToMainMenu(menu_items)
                 -- 统计模式 —— 同样改成二级菜单选择。
                 text_func = function() return self:scanModeLabel() end,
                 sub_item_table_func = function() return self:scanModeSubMenu() end,
+            },
+            {
+                -- 字数口径：只算文字 / 含标点（对齐晋江、起点等平台）
+                text_func = function() return self:countScopeLabel() end,
+                sub_item_table_func = function() return self:countScopeSubMenu() end,
+            },
+            {
+                -- 按来源设定口径：晋江按含标点、起点按只算文字，各站各算
+                text_func = function() return self:sourcePolicyLabel() end,
+                sub_item_table_func = function() return self:sourcePolicySubMenu() end,
             },
             {
                 -- 大书处理方式 —— 原来是「点一下开关」的 toggle，
@@ -1909,6 +1970,283 @@ function WordCount:scanModeSubMenu()
     }
 end
 
+-- 字数口径的显示名。
+-- ⚠ 这里说的是**全局兜底**口径：开了「按来源设定口径」之后，
+-- 它只对「来源规则没覆盖到」的书起作用，所以标签要如实标出来。
+function WordCount:countScopeLabel()
+    local base = globalPunct() and _("字数口径：含标点") or _("字数口径：只算文字")
+    if SourcePolicy.enabled() then
+        return base .. _("（兜底）")
+    end
+    return base
+end
+
+-- 构造「字数口径」的 radio 子菜单。
+-- 两种口径在一次扫描里同时算好并存下来，所以**切换不需要重扫**。
+function WordCount:countScopeSubMenu()
+    return {
+        {
+            text = _("只算文字"),
+            desc = _("汉字/假名/谚文各算 1 字，英文按词算，标点不计。"),
+            checked_func = function() return not globalPunct() end,
+            radio = true,
+            callback = function()
+                G_reader_settings:saveSetting("word_count_count_punct", false)
+                G_reader_settings:flush()
+            end,
+        },
+        {
+            text = _("含标点"),
+            desc = _("标点也各算 1 字。晋江、番茄书页显示的字数就是这个口径"
+                .. "（中文小说里标点约占 12~15%）。"),
+            checked_func = function() return globalPunct() end,
+            radio = true,
+            callback = function()
+                G_reader_settings:saveSetting("word_count_count_punct", true)
+                G_reader_settings:flush()
+            end,
+        },
+        {
+            text = _("说明"),
+            desc = _("开了「按来源设定口径」后，来源能匹配上的书按来源规则算，"
+                .. "匹配不上的按这里的「未标注来源」设置算；这一项只作兜底。"),
+            callback = function()
+                notifyUser(_("这一项是全局兜底口径。\n"
+                    .. "想让晋江、起点各用各的口径，去开「按来源设定口径」。"), 5)
+            end,
+            keep_menu_open = true,
+        },
+    }
+end
+
+-- ================= 「按来源设定口径」 =================
+--
+-- 每个网文站对「字数含不含标点」的算法不一样（晋江含、起点不含），
+-- 所以口径不能是一个全局开关，得按**书的来源**分别设。
+-- 来源读的是书档里的 custom_props.platform —— 元数据插件写进去的那个值，
+-- 也就是书架 %platform 显示的东西。本插件只读不写，两个插件互不依赖。
+
+-- 当前这本书的路径（菜单里回显用；文件管理器里没打开书 → nil）
+function WordCount:currentBookPath()
+    local doc = self.ui and self.ui.document
+    if doc and doc.file then return doc.file end
+    return self._read_doc_path or self._scan_path
+end
+
+function WordCount:sourcePolicyLabel()
+    if SourcePolicy.enabled() then
+        return _("按来源设定口径：开")
+    end
+    return _("按来源设定口径：关")
+end
+
+-- 「当前这本书用的哪个口径」——让用户能就地验证规则有没有生效
+function WordCount:sourceInfoLabel()
+    if not SourcePolicy.enabled() then
+        return _("当前这本书：按全局「字数口径」统计（来源规则未启用）")
+    end
+    local path = self:currentBookPath()
+    if not path then
+        return _("当前这本书：未打开书籍")
+    end
+    local info = SourcePolicy.describe(path)
+    local punct_label = info.punct and _("含标点") or _("只算文字")
+    if info.name then
+        return T(_("当前这本书：%1 · %2"), info.name, punct_label)
+    end
+    -- ⚠ 书档里没有 platform 是**最常见的状态**：元数据插件那边
+    -- 「写入来源平台」默认是关的。不提示的话，用户会以为开关坏了。
+    return T(_("当前这本书：未标注来源 · %1（书档里没有来源平台）"), punct_label)
+end
+
+-- 一个来源的三种状态：跟随未标注 / 只算文字 / 含标点
+function WordCount:sourceRuleSubMenu(key)
+    local function apply(value, msg)
+        return function()
+            SourcePolicy.setRule(key, value)
+            -- 书架的 %word_count 有 5 秒 memo，改了口径要立刻失效
+            BookshelfIntegration.clearCache()
+            notifyUser(msg, 2)
+        end
+    end
+    return {
+        {
+            text = _("跟随「未标注来源」"),
+            desc = T(_("不单独设，跟着这一条走：%1"),
+                SourcePolicy.unlabeledPunct() and _("含标点") or _("只算文字")),
+            checked_func = function() return SourcePolicy.rules()[key] == nil end,
+            radio = true,
+            callback = apply(nil, _("已改为跟随「未标注来源」")),
+            keep_menu_open = true,
+        },
+        {
+            text = _("只算文字"),
+            desc = _("汉字/假名/谚文各算 1 字，英文按词算，标点不计。"),
+            checked_func = function() return SourcePolicy.rules()[key] == false end,
+            radio = true,
+            callback = apply(false, _("已设为只算文字")),
+            keep_menu_open = true,
+        },
+        {
+            text = _("含标点"),
+            desc = _("标点也各算 1 字。"),
+            checked_func = function() return SourcePolicy.rules()[key] == true end,
+            radio = true,
+            callback = apply(true, _("已设为含标点")),
+            keep_menu_open = true,
+        },
+    }
+end
+
+-- 「未标注来源」的口径（单独设置，与全局「字数口径」互不影响）
+function WordCount:sourceUnlabeledSubMenu()
+    local function apply(value, msg)
+        return function()
+            SourcePolicy.setUnlabeledPunct(value)
+            BookshelfIntegration.clearCache()
+            notifyUser(msg, 2)
+        end
+    end
+    return {
+        {
+            text = _("只算文字"),
+            desc = _("没有来源标注的书（自己转的、来源不明的）按这个算。"),
+            checked_func = function() return SourcePolicy.unlabeledPunct() == false end,
+            radio = true,
+            callback = apply(false, _("未标注来源：只算文字")),
+            keep_menu_open = true,
+        },
+        {
+            text = _("含标点"),
+            desc = _("标点也各算 1 字。"),
+            checked_func = function() return SourcePolicy.unlabeledPunct() == true end,
+            radio = true,
+            callback = apply(true, _("未标注来源：含标点")),
+            keep_menu_open = true,
+        },
+    }
+end
+
+function WordCount:addCustomSource()
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("添加自定义来源"),
+        description = _("填来源平台名（和书档里「来源平台」显示的一致即可，"
+            .. "大小写和首尾空格不敏感）。\n加完回上一级菜单点它，就能设口径。"),
+        input = "",
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    id = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("添加"),
+                    is_enter_default = true,
+                    callback = function()
+                        local name = dialog:getInputValue()
+                        local ok, key = SourcePolicy.addCustomSource(name)
+                        UIManager:close(dialog)
+                        if ok then
+                            notifyUser(T(_("已添加来源：%1"), key:sub(2)), 2)
+                        else
+                            notifyUser(key or _("来源名不能为空"), 3)
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    showNoFlash(dialog)
+    dialog:onShowKeyboard()
+end
+
+function WordCount:sourcePolicySubMenu()
+    local items = {
+        {
+            text = _("启用（按来源自动选口径）"),
+            desc = _("默认关闭：关着时全部走全局「字数口径」，一个字都不读。"
+                .. "开启后每本书按书档里的「来源平台」决定口径，"
+                .. "没有来源标注的书走下面「未标注来源」这一条。"),
+            checked_func = function() return SourcePolicy.enabled() end,
+            callback = function()
+                local on = SourcePolicy.setEnabled(not SourcePolicy.enabled())
+                BookshelfIntegration.clearCache()
+                notifyUser(on and _("已启用：按来源自动选口径")
+                    or _("已关闭：全部走全局「字数口径」"), 3)
+            end,
+            keep_menu_open = true,
+        },
+        {
+            text_func = function() return self:sourceInfoLabel() end,
+            callback = function() notifyUser(self:sourceInfoLabel(), 4) end,
+            keep_menu_open = true,
+        },
+        {
+            text = _("来源平台从哪来？"),
+            desc = _("元数据插件 → 配置 → 「写入来源平台」默认是关的，"
+                .. "开启后对每本书应用一次元数据，才会写进书档。"),
+            callback = function()
+                notifyUser(_("本功能读的是书档里的「来源平台」。\n\n"
+                    .. "元数据插件的「写入来源平台」默认关闭，"
+                    .. "要在那边打开、并对书应用一次元数据，"
+                    .. "书档里才会出现来源。\n\n"
+                    .. "没写来源的书一律按上面「未标注来源」算，"
+                    .. "不影响统计本身。"), 8)
+            end,
+            keep_menu_open = true,
+        },
+        {
+            text_func = function()
+                return T(_("未标注来源：%1"), SourcePolicy.unlabeledPunct()
+                    and _("含标点") or _("只算文字"))
+            end,
+            sub_item_table_func = function() return self:sourceUnlabeledSubMenu() end,
+        },
+    }
+    -- 预置来源（顺序固定，方便肌肉记忆）
+    for _i, src in ipairs(SourcePolicy.SOURCES) do
+        items[#items + 1] = {
+            text_func = function()
+                return T(_("%1：%2"), src.name, SourcePolicy.ruleLabel(src.key))
+            end,
+            sub_item_table_func = function() return self:sourceRuleSubMenu(src.key) end,
+        }
+    end
+    -- 用户自己加的来源（键以 @ 开头）
+    local custom = {}
+    for key in pairs(SourcePolicy.rules()) do
+        if key:sub(1, 1) == "@" then custom[#custom + 1] = key end
+    end
+    table.sort(custom)
+    for _i, key in ipairs(custom) do
+        items[#items + 1] = {
+            text_func = function()
+                return T(_("%1：%2"), key:sub(2), SourcePolicy.ruleLabel(key))
+            end,
+            sub_item_table_func = function() return self:sourceRuleSubMenu(key) end,
+        }
+    end
+    items[#items + 1] = {
+        text = _("添加自定义来源…"),
+        desc = _("来源平台名不在内置列表里时，自己加一条。"),
+        callback = function() self:addCustomSource() end,
+        keep_menu_open = true,
+    }
+    items[#items + 1] = {
+        text = _("恢复预设"),
+        desc = _("晋江＝含标点，起点＝只算文字，番茄＝含标点，其余来源跟随未标注。"),
+        callback = function()
+            SourcePolicy.resetPresets()
+            notifyUser(_("已恢复预设规则"), 2)
+        end,
+        keep_menu_open = true,
+    }
+    return items
+end
+
 function WordCount:_globalStore()
     if self._global_stats then return self._global_stats end
     local saved = G_reader_settings and G_reader_settings:readSetting(KEY_GLOBAL_STATS)
@@ -1979,7 +2317,11 @@ function WordCount:_bookInfo(doc, total_units_override)
     local total_units
     if settings and tonumber(settings:readSetting(KEY_MTIME)) == mtime
             and tonumber(settings:readSetting(KEY_SIZE)) == size then
-        total_units = tonumber(settings:readSetting(KEY_COUNT))
+        total_units = pickCount(settings:readSetting(KEY_COUNT),
+            settings:readSetting(KEY_COUNT_PUNCT), path)
+        if punctIncluded(path) and not tonumber(settings:readSetting(KEY_COUNT_PUNCT)) then
+            total_units = nil      -- 这本还没按含标点口径统计过
+        end
     end
     -- 调用方明确给了全书字数（例如来自全局缓存）就用它 ——
     -- 「重置设置」后 DocSettings 里的 KEY_COUNT 可能已被清掉，
@@ -2467,21 +2809,30 @@ end
 
 function WordCount:showSavedStats()
     local settings = self.ui.doc_settings
+    local doc_path = self.ui.document and self.ui.document.file
     local total
     if settings and self.ui.document then
-        local mtime, size = fileFingerprint(self.ui.document.file)
+        local mtime, size = fileFingerprint(doc_path)
         if tonumber(settings:readSetting(KEY_MTIME)) == mtime
                 and tonumber(settings:readSetting(KEY_SIZE)) == size then
-            total = tonumber(settings:readSetting(KEY_COUNT))
+            total = pickCount(settings:readSetting(KEY_COUNT),
+                settings:readSetting(KEY_COUNT_PUNCT), doc_path)
         end
     end
     local state = self._read_state
     if type(state) == "table" then ReadingStats.recompute(state) end
-    if total == nil and type(state) ~= "table" then
-        notifyUser(_("本书还没有可显示的字数统计"))
+    if total == nil then
+        -- 含标点口径下这本书还没算过（老数据/刚切口径）—— 别拿 0 或
+        -- 只算文字的数糊过去，直接告诉用户重算一次。
+        if punctIncluded(doc_path) then
+            notifyUser(_("这本书还没按「含标点」口径统计过。\n"
+                .. "点「统计全书字数」重算一次即可。"), 5)
+        else
+            notifyUser(_("本书还没有可显示的字数统计"))
+        end
         return
     end
-    total = total or 0
+    total = tonumber(total) or 0
     local read_units = state and tonumber(state.read_units) or 0
     local speed = state and tonumber(state.speed_units_per_minute)
     if speed then
@@ -3472,7 +3823,12 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                     job.page = job.page_count + 1
                     -- 整书取文本拿不到「每页各有多少字」，但「已读字数」需要每页归属。
                     do
-                        local per = math.floor((tonumber(job.state.count) or 0)
+                        -- 按当前口径均分（含标点与实际显示的数字保持一致）
+                        -- ⚠ 取不到当前口径的值时（老缓存没有 count_punct）退回
+                        -- 纯文字值，绝不能把 nil 丢给 math.floor。
+                        local whole_total = pickCount(job.state.count,
+                            job.state.count_punct, job.path) or job.state.count or 0
+                        local per = math.floor(whole_total
                             / math.max(1, job.page_count))
                         local acc = 0
                         -- 模板逻辑抽到 `_pageKeyTemplate`，
@@ -3482,7 +3838,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                         for p = 1, job.page_count do
                             local units = per
                             if p == job.page_count then
-                                units = (tonumber(job.state.count) or 0) - acc
+                                units = whole_total - acc
                             else
                                 acc = acc + per
                             end
@@ -3541,7 +3897,10 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 if text ~= "" then
                     job.pages_with_text = job.pages_with_text + 1
                     -- 一次遍历同时得到「累计」与「本页增量」。
-                    local _total, page_units = Counter.addPage(job.state, text)
+                    local _total, page_units, _punct_total, punct_units
+                        = Counter.addPage(job.state, text)
+                    -- 已读字数按当前口径累计，否则「已读 / 全书」的比例会算错
+                    if punctIncluded(job.path) then page_units = punct_units end
                     -- **逐页路径也不能每页问一次
                     -- `getPageXPointer`**！
                     self:_recordPageUnits(job, scan_doc, job.page, page_units)
@@ -3641,8 +4000,11 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             settings = DocSettings:open(path)
         end
         -- 抽页模式的结果要从「样本页字数」外推到「全书字数」。
-        local sample_total = tonumber(job.state.count) or 0
-        local total = sample_total
+        -- 两种口径同时外推，存起来后切换口径不用重扫。
+        local sample_plain = tonumber(job.state.count) or 0
+        local sample_punct = tonumber(job.state.count_punct) or sample_plain
+        local total_plain, total_punct = sample_plain, sample_punct
+        local total
         local sampled = job.sampled == true
         if job.whole_book == true then
             -- 整书一次数完 → 本身即全书口径，禁止外推。
@@ -3652,23 +4014,27 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
             local eff = tonumber(job.pages_with_text) or 0
             if eff <= 0 then eff = tonumber(job.page_count) or 1 end
             if eff > 0 then
-                local per_page = sample_total / eff
-                total = math.floor(per_page * (tonumber(job.total_pages) or job.page_count) + 0.5)
+                local full_pages = tonumber(job.total_pages) or job.page_count
+                total_plain = math.floor(sample_plain / eff * full_pages + 0.5)
+                total_punct = math.floor(sample_punct / eff * full_pages + 0.5)
             end
         end
-        logger.info("WordCount: result sample_total=" .. tostring(sample_total)
+        total = (punctIncluded(path) and total_punct > 0) and total_punct or total_plain
+        logger.info("WordCount: result plain=" .. tostring(total_plain)
+            .. " punct=" .. tostring(total_punct)
             .. " scan_pages=" .. tostring(job.page_count)
             .. " total_pages=" .. tostring(job.total_pages)
             .. " sampled=" .. tostring(sampled)
+            .. " mode=" .. (punctIncluded(path) and "punct" or "plain")
             .. " final_total=" .. tostring(total))
 
-        -- 把外推后的总量回写到 state.count，让下游（读状态、全局统计、
+        -- 把外推后的总量回写到 state，让下游（读状态、全局统计、
         -- 提示文案）拿到的是**全书**口径，而不是样本口径。
-        if sampled then
-            job.state.count = total
-        end
+        job.state.count = total_plain
+        job.state.count_punct = total_punct
 
-        settings:saveSetting(KEY_COUNT, total)
+        settings:saveSetting(KEY_COUNT, total_plain)
+        settings:saveSetting(KEY_COUNT_PUNCT, total_punct)
         settings:saveSetting(KEY_MTIME, job.mtime)
         settings:saveSetting(KEY_SIZE, job.size)
         -- 记录「这个数字是怎么来的」：下次读缓存时能告诉用户「这是估算值，
@@ -3690,8 +4056,8 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         -- 同时写全局缓存 —— 下次点「统计全书字数」
         do
             local cur_mtime, cur_size = fileFingerprint(path)
-            writeCachedCount(path, total, cur_mtime or job.mtime, cur_size or job.size,
-                sampled)
+            writeCachedCount(path, total_plain, total_punct,
+                cur_mtime or job.mtime, cur_size or job.size, sampled)
         end
 
         -- 26-sample-estimate 修的一个真 bug：
@@ -3738,6 +4104,25 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         -- startCountForPath（从书菜单点单本）也会传 batch_mode=true，但它
         -- 根本不是批量任务（self._batch 为 nil），对话框必须照常关闭。
         local in_batch = self:_batchAlive(job)
+        -- 结果文案：主数字按当前口径，后面附带另一种口径的值。
+        -- 用户拿它和晋江/起点的书页字数一比就知道该用哪种口径。
+        local mode_punct = punctIncluded(path)
+        local other_total = mode_punct and total_plain or total_punct
+        local count_label = mode_punct and _("含标点") or _("只算文字")
+        local other_label = mode_punct and _("只算文字") or _("含标点")
+        -- 开了「按来源设定口径」就把来源一起标出来，
+        -- 用户一眼能确认「这次用的是哪条规则」，不用去菜单里翻。
+        if SourcePolicy.enabled() then
+            local src_name = SourcePolicy.displayName(SourcePolicy.platformOf(path))
+            if src_name then count_label = count_label .. " · " .. src_name end
+        end
+        local function resultLine()
+            local line = T(_("统计完成：%1 字（%2）"), fmtCount(total), count_label)
+            if tonumber(other_total) and other_total > 0 and other_total ~= total then
+                line = line .. T(_("；%1 %2"), other_label, fmtCount(other_total))
+            end
+            return line
+        end
         -- 完成结果也走对话框，不走弹窗。
         if job.progress_dialog then
             if type(job.progress_dialog.setStatus) == "function" then
@@ -3748,8 +4133,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                         T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 字"),
                             fmtCount(total_pages), fmtCount(total)))
                 else
-                    job.progress_dialog:setStatus(
-                        T(_("统计完成：全书约 %1 字"), fmtCount(total)))
+                    job.progress_dialog:setStatus(resultLine())
                 end
             end
             job.progress_dialog:updateProgress(job.page_count, true)
@@ -3766,7 +4150,7 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
                 notifyUser(T(_("书太大（%1 页），为防卡死改用估算：全书约 %2 字"),
                     fmtCount(total_pages), fmtCount(total)))
             else
-                notifyUser(T(_("统计完成：全书约 %1 字"), fmtCount(total)))
+                notifyUser(resultLine())
             end
         end
         if batch_mode and in_batch then self:_startNextBatch() end

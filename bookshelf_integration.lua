@@ -1,6 +1,8 @@
 local M = {}
 
 local COUNT_KEY = "word_count_total_v1"
+-- 含标点口径的字数（同一次扫描一起存下来的）
+local COUNT_PUNCT_KEY = "word_count_total_punct_v1"
 local COUNT_MTIME_KEY = "word_count_file_mtime_v1"
 local COUNT_SIZE_KEY = "word_count_file_size_v1"
 local READ_STATS_KEY = "word_count_read_stats_v1"
@@ -8,6 +10,18 @@ local CACHE_TTL = 5
 local memo = {}
 local memo_expires_at = 0
 local TOKENS_MARKER = "_word_count_koplugin_expand_wrapper"
+
+-- 由 main.lua 注入：给定书籍路径，返回「这本书该不该含标点」。
+-- 没注入时退回「只算文字」，行为与 1.3.x 一致。
+local punct_resolver = nil
+
+--- 注入口径解析函数。
+-- ★ 为什么用注入而不是在本文件里再读一遍设置：口径规则只应该有一份实现
+--   （main.lua 的 punctIncluded + source_policy.lua），两处各读一遍必然走偏。
+function M.setPunctResolver(fn)
+    punct_resolver = type(fn) == "function" and fn or nil
+    M.clearCache()
+end
 
 local TOKEN_NAMES = { "word_count_read", "word_speed", "word_count" }
 
@@ -94,7 +108,23 @@ local function cachedDataFor(book)
         local saved_mtime = tonumber(ds:readSetting(COUNT_MTIME_KEY))
         local saved_size = tonumber(ds:readSetting(COUNT_SIZE_KEY))
         local data = {}
-        local count = tonumber(ds:readSetting(COUNT_KEY))
+        -- 两种口径的数都在同一个 sidecar 里，按当前口径取一个。
+        -- 含标点口径下这本还没算过（老数据）→ 不显示，别拿纯文字值冒充。
+        local plain = tonumber(ds:readSetting(COUNT_KEY))
+        local punct = tonumber(ds:readSetting(COUNT_PUNCT_KEY))
+        local use_punct = false
+        if punct_resolver then
+            local ok_p, v = pcall(punct_resolver, path)
+            use_punct = (ok_p and v == true)
+        end
+        -- ⚠ 不能用 `use_punct and punct or plain`：含标点口径下 punct 为 nil 时
+        --   那个写法会**悄悄退回 plain**，正好是我们最不想要的「拿纯文字数冒充」。
+        local count
+        if use_punct then
+            count = punct
+        else
+            count = plain
+        end
         if saved_mtime == current_mtime and saved_size == current_size
                 and count and count >= 0 and count % 1 == 0 then
             data.word_count = math.floor(count)

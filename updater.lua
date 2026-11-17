@@ -23,7 +23,7 @@ local RELEASES_PAGE = "https://github.com/" .. REPO .. "/releases"
 
 --- 本模块所在目录（即插件目录，含末尾斜杠）。
 local self_dir = (debug.getinfo(1, "S").source:match("^@(.*/)updater%.lua$") or "./")
-local UA = "KOReader-WordCount/1.3"
+local UA = "KOReader-WordCount/1.4.0"
 
 --===========================================================================
 -- 版本
