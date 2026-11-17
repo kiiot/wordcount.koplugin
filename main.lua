@@ -375,8 +375,15 @@ function LiveProgressDialog:_redraw(force)
     return true
 end
 
-function LiveProgressDialog:configureProgress(total, title)
+-- @param total      本次扫描的上限页数（抽样模式下 = 样本页数）
+-- @param title      标题行文字（nil = 不改）
+-- @param full_pages 全书真实页数；只在抽样时传，用于把「样本 100 页」和
+--                   「全书 N 页」区分开
+function LiveProgressDialog:configureProgress(total, title, full_pages)
     self.progress_max = math.max(1, math.floor(tonumber(total) or 1))
+    self.full_pages = tonumber(full_pages)
+    -- 进度文本里带了全书页数 ⇒ 换书时必须让缓存作废，否则会沿用上一本的文案。
+    self["_last_progress_text"] = nil
     -- 进度条要在 init 时就已经建好；这里不能靠改 progress_max 让 bar 出现，
     -- 所以如果先前没有 bar（progress_max 为 nil 的「正在打开…」对话框），
     -- 就把可见性关掉并只显示文字进度，避免出现半截布局。
@@ -407,6 +414,18 @@ function LiveProgressDialog:_syncProgressBar(progress)
         math.max(0, math.min(1, (tonumber(progress) or 0) / total)))
 end
 
+-- 进度副标题的文本。
+-- ⚠ 抽样时 total 只是**样本页数**（SAMPLE_PAGES = 100），不是全书页数；
+-- 只写「已扫描 3 / 100 页」会让人以为这本书只有 100 页。所以抽样时
+-- 额外把全书页数（self.full_pages）缀在后面，两个数一起给出来。
+local function buildProgressText(done, total, shown, full_pages)
+    local full = tonumber(full_pages)
+    if full and full > total then
+        return T(_("已扫描 %1 / %2 页（%3%）· 全书 %4 页"), done, total, shown, full)
+    end
+    return T(_("已扫描 %1 / %2 页（%3%）"), done, total, shown)
+end
+
 -- 写「已扫描 x / y 页（z%）」这行字，百分比量化以减少无谓的文本变化。
 -- 返回 true 表示文本确实变了。
 function LiveProgressDialog:_pushProgressText(done)
@@ -419,7 +438,7 @@ function LiveProgressDialog:_pushProgressText(done)
     if percent < 100 then
         shown = math.floor(percent / PERCENT_QUANTUM) * PERCENT_QUANTUM
     end
-    local text = T(_("已扫描 %1 / %2 页（%3%）"), done, total, shown)
+    local text = buildProgressText(done, total, shown, self.full_pages)
     if text == self._last_progress_text then return false end
     self._last_progress_text = text
     self:_pushText("subtitle", text)
@@ -1641,6 +1660,8 @@ function WordCount:editDowngradePages()
         -- 「为什么给我放限制」，所以这个入口必须一眼看到怎么取消限制。
         description = T(_("超过这个页数的书，按「大书处理」那条设置处理；"
             .. "填 0 = 不限制（默认，插件不会替你设上限）。\n"
+            .. "这里的页数是统计时那份排版排出来的：在阅读界面统计＝和状态栏一致，"
+            .. "在书架统计＝按默认排版算，可能和翻书时看到的页数不同。\n"
             .. "当前：%1"),
             (cur > 0) and T(_("%1 页"), fmtCount(cur)) or _("不限制")),
         input = tostring(cur),
@@ -3498,7 +3519,22 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
     end
 
     local pages = pageCount(doc)
-    logger.info("WordCount: pageCount=" .. tostring(pages))
+    -- 页数来自**哪一份文档**，直接决定它和用户翻书时看到的页数是否一致：
+    -- · reader     = 正在读的那份 doc，和状态栏「页面 x / y」的 y 同源，必然相同
+    -- · background = 书架/批量时后台重新打开的 doc，只走 setupDefaultView()，
+    --                没有页眉页脚占位、也没套本书已保存的排版 ⇒ 页数可能不同
+    -- 日志里把两个数都打出来，用户说「对不上」时能立刻判断是哪一种。
+    do
+        local live_doc = self.ui and self.ui.document
+        local is_reader_doc = (live_doc ~= nil and live_doc == doc)
+        local live_pages = nil
+        if live_doc and not is_reader_doc then
+            live_pages = pageCount(live_doc)
+        end
+        logger.info("WordCount: pageCount=" .. tostring(pages)
+            .. " source=" .. (is_reader_doc and "reader" or "background")
+            .. " reader_pages=" .. tostring(live_pages or pages))
+    end
     if pages < 1 then
         logger.info("WordCount: EARLY-RETURN pages<1")
         close_preparing()
@@ -3587,7 +3623,9 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         notifyUser(T(_("这本书超过了你设的上限：%1，已按设置取消统计。\n"
             .. "想统计它：到「字数与阅读速度 → 页数 / 大小上限」把上限调大"
             .. "（或输入 0 = 不限制）。\n"
-            .. "也可以把「大书处理」改成「超限改用抽样估算」，先拿一个约数。"),
+            .. "也可以把「大书处理」改成「超限改用抽样估算」，先拿一个约数。\n"
+            .. "注：页数按统计时的排版计算（书架统计走默认排版），"
+            .. "和你翻书时看到的页数可能不同。"),
             limit_desc), 10)
         return
     end
@@ -3676,13 +3714,19 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         batch = self._batch,
     }
     self._job = job
+    -- 全书页数只在**抽样时**才和进度条分母不同，此时把它一并交给对话框，
+    -- 副标题会写成「已扫描 3 / 100 页（3%）· 全书 1200 页」。
+    local full_pages_hint = sampled and total_pages or nil
+    -- 标题里带上全书页数：这样「进度条上的页码」和「翻书时状态栏的页码」
+    -- 即使不一致，用户也能一眼看出进度条用的是哪个数。
+    local scan_title = batch_mode and _("正在批量统计字数")
+        or T(_("正在统计全书字数（%1 页）"), fmtCount(total_pages))
     if preparing_dialog then
         job.progress_dialog = preparing_dialog
         local on_stack = is_widget_on_stack(preparing_dialog)
         logger.info("WordCount: reusing preparing dialog, on_stack=" .. tostring(on_stack)
             .. " has_configureProgress=" .. tostring(type(preparing_dialog.configureProgress) == "function"))
-        job.progress_dialog:configureProgress(scan_pages,
-            batch_mode and _("正在批量统计字数") or _("正在统计全书字数"))
+        job.progress_dialog:configureProgress(scan_pages, scan_title, full_pages_hint)
         -- 保险：确保复用的对话框真的在屏幕上。preparing 是在上一个 tick 里
         -- show() 的，中间只隔了一次 openDocument（它不碰 UI 栈），所以正常
         -- 情况下它还在；万一被别的流程摘掉，这里补 show 一次，避免出现
@@ -3695,9 +3739,10 @@ function WordCount:startCount(doc_override, path_override, batch_mode, preparing
         self._batch_preparing = nil
     else
         job.progress_dialog = LiveProgressDialog:new{
-            title = batch_mode and _("正在批量统计字数") or _("正在统计全书字数"),
-            subtitle = T(_("已扫描 0 / %1 页（0%）"), scan_pages),
+            title = scan_title,
+            subtitle = buildProgressText(0, scan_pages, 0, full_pages_hint),
             progress_max = scan_pages,
+            full_pages = full_pages_hint,
             dismissable = false,
             refresh_time_seconds = 1.5,
             -- 页面扫描进度条上的「取消统计」按钮。
